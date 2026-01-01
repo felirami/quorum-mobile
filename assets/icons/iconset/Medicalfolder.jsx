@@ -1,0 +1,10 @@
+const Medicalfolder = ({ className = "", style = {}, ...props }) => (
+  <svg style={style} className={`inline-block align-text-bottom ${className}`} fill="currentColor" height="1em" id="Medical-Folder--Streamline-Sharp" viewBox="0 0 24 24" width="1em">
+ <g id="medical-folder--medical-folder-report-history-cross">
+  <path clipRule="evenodd" d="M1 2h7.06l4 4H23v17H1V2Zm15.286 11.235 -2.735 0V10.5h-3.103v2.735H7.714v3.103h2.734v2.735h3.104v-2.735h2.734l0 -3.103Z" fill="currentColor" fillRule="evenodd" id="Subtract" strokeWidth="1"/>
+ </g>
+</svg>
+
+);
+
+export default Medicalfolder;

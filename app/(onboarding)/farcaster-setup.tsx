@@ -1,0 +1,337 @@
+/**
+ * Farcaster Setup - Step 2 of Onboarding (Optional)
+ *
+ * Import Farcaster account via recovery phrase (12 or 24 words).
+ * This derives the Ethereum custody address and looks up the FID.
+ */
+
+import React, { useState } from 'react';
+import {
+  View,
+  Text,
+  TextInput,
+  StyleSheet,
+  TouchableOpacity,
+  ScrollView,
+} from 'react-native';
+import { useTheme } from '@/theme';
+import { useOnboarding } from '@/context';
+import { OnboardingLayout, StepNavigation } from '@/components/onboarding';
+import { IconSymbol } from '@/components/ui/IconSymbol';
+import { Button } from '@/components/ui/Button';
+import {
+  deriveFarcasterKeys,
+  lookupFarcasterAccount,
+  validateFarcasterMnemonic,
+} from '@/services/onboarding/farcasterService';
+import {
+  storeFarcasterCustodyKey,
+  storeFarcasterSignerKey,
+  storeFarcasterFid,
+  storeFarcasterAuthToken,
+} from '@/services/onboarding/secureStorage';
+import { fetchImageAsDataUri } from '@/utils/image';
+
+export default function FarcasterSetupScreen() {
+  const { theme } = useTheme();
+  const { state, skipFarcaster, setFarcasterAccount, goBack } = useOnboarding();
+  const styles = createStyles(theme);
+
+  const [wordCount, setWordCount] = useState<12 | 24>(12);
+  const [words, setWords] = useState<string[]>(Array(12).fill(''));
+  const [error, setError] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const filledCount = words.filter(w => w.trim().length > 0).length;
+  const isComplete = filledCount === wordCount;
+
+  const handleWordCountChange = (count: 12 | 24) => {
+    setWordCount(count);
+    if (count > words.length) {
+      setWords([...words, ...Array(count - words.length).fill('')]);
+    } else {
+      setWords(words.slice(0, count));
+    }
+  };
+
+  const handleWordChange = (index: number, value: string) => {
+    // Handle paste of full mnemonic
+    if (value.includes(' ')) {
+      const pastedWords = value.trim().split(/\s+/);
+      const pastedCount = pastedWords.length;
+
+      // Auto-detect 12 or 24 word mnemonic
+      if (pastedCount === 12 || pastedCount === 24) {
+        const newWords = Array(pastedCount).fill('');
+        for (let i = 0; i < pastedCount; i++) {
+          newWords[i] = pastedWords[i]?.toLowerCase() ?? '';
+        }
+        setWordCount(pastedCount as 12 | 24);
+        setWords(newWords);
+        setError(null);
+        return;
+      }
+    }
+
+    const newWords = [...words];
+    newWords[index] = value.toLowerCase().trim();
+    setWords(newWords);
+    setError(null);
+  };
+
+  const handleSubmit = async () => {
+    if (!isComplete || isSubmitting) return;
+
+    setIsSubmitting(true);
+    setError(null);
+
+    try {
+      // Validate mnemonic
+      const cleanWords = words.map(w => w.toLowerCase().trim());
+      if (!validateFarcasterMnemonic(cleanWords)) {
+        setError('Invalid recovery phrase. Please check your words.');
+        setIsSubmitting(false);
+        return;
+      }
+
+      // Derive keys from mnemonic
+      const keys = deriveFarcasterKeys(cleanWords);
+
+      // Look up FID from custody address using official Farcaster API
+      const account = await lookupFarcasterAccount(keys.custodyAddress, keys.custodyPrivateKey);
+
+      if (!account) {
+        setError(`No Farcaster account found for this recovery phrase.`);
+        setIsSubmitting(false);
+        return;
+      }
+
+      // Store Farcaster keys and auth token securely
+      const storePromises = [
+        storeFarcasterCustodyKey(keys.custodyPrivateKey),
+        storeFarcasterSignerKey(keys.signerPrivateKey),
+        storeFarcasterFid(account.fid),
+      ];
+      if (account.authToken) {
+        storePromises.push(storeFarcasterAuthToken(account.authToken));
+      }
+      await Promise.all(storePromises);
+
+      // Fetch profile image as data URI if available
+      let pfpDataUri: string | undefined;
+      if (account.pfpUrl) {
+        const dataUri = await fetchImageAsDataUri(account.pfpUrl);
+        if (dataUri) {
+          pfpDataUri = dataUri;
+        }
+      }
+
+      // Success - set the account and continue (pre-fill profile from Farcaster data)
+      setFarcasterAccount({
+        fid: account.fid,
+        username: account.username,
+        displayName: account.displayName,
+        pfpUrl: pfpDataUri,  // Use data URI instead of remote URL
+        signerPublicKey: keys.signerPublicKey,
+        custodyAddress: keys.custodyAddress,
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to import account');
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <OnboardingLayout currentStep="farcaster-setup">
+      <View style={styles.header}>
+        <View style={styles.iconContainer}>
+          <IconSymbol name="person.2.fill" size={32} color={theme.colors.primary} />
+        </View>
+        <Text style={styles.title}>Import Farcaster</Text>
+        <Text style={styles.subtitle}>
+          Enter your Farcaster recovery phrase to connect your account. This is optional and can be done later in Settings.
+        </Text>
+      </View>
+
+      <View style={styles.wordCountToggle}>
+        <TouchableOpacity
+          style={[styles.wordCountOption, wordCount === 12 && styles.wordCountOptionActive]}
+          onPress={() => handleWordCountChange(12)}
+        >
+          <Text style={[styles.wordCountText, wordCount === 12 && styles.wordCountTextActive]}>
+            12 words
+          </Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.wordCountOption, wordCount === 24 && styles.wordCountOptionActive]}
+          onPress={() => handleWordCountChange(24)}
+        >
+          <Text style={[styles.wordCountText, wordCount === 24 && styles.wordCountTextActive]}>
+            24 words
+          </Text>
+        </TouchableOpacity>
+      </View>
+
+      {error && (
+        <View style={styles.errorContainer}>
+          <IconSymbol name="exclamationmark.circle.fill" size={16} color={theme.colors.danger} />
+          <Text style={styles.errorText}>{error}</Text>
+        </View>
+      )}
+
+      <ScrollView style={styles.scrollView} showsVerticalScrollIndicator={false}>
+        <View style={styles.wordGrid}>
+          {words.map((word, index) => (
+            <View key={index} style={styles.wordInputContainer}>
+              <Text style={styles.wordNumber}>{index + 1}</Text>
+              <TextInput
+                style={styles.wordInput}
+                value={word}
+                onChangeText={text => handleWordChange(index, text)}
+                placeholder="word"
+                placeholderTextColor={theme.colors.textMuted}
+                autoCapitalize="none"
+                autoCorrect={false}
+                editable={!isSubmitting}
+              />
+            </View>
+          ))}
+        </View>
+      </ScrollView>
+
+      <View style={styles.footer}>
+        <Text style={styles.progressText}>
+          {filledCount} of {wordCount} words entered
+        </Text>
+      </View>
+
+      <StepNavigation
+        onBack={goBack}
+        onNext={handleSubmit}
+        onSkip={skipFarcaster}
+        showSkip={true}
+        skipLabel="Skip for now"
+        showBack={true}
+        nextLabel="Import"
+        nextDisabled={!isComplete || isSubmitting}
+        isLoading={isSubmitting}
+      />
+    </OnboardingLayout>
+  );
+}
+
+// ============ Styles ============
+
+const createStyles = (theme: any) =>
+  StyleSheet.create({
+    header: {
+      alignItems: 'center',
+      marginBottom: 24,
+    },
+    iconContainer: {
+      width: 64,
+      height: 64,
+      borderRadius: 32,
+      backgroundColor: theme.colors.primary + '20',
+      alignItems: 'center',
+      justifyContent: 'center',
+      marginBottom: 16,
+    },
+    title: {
+      fontSize: 24,
+      color: theme.colors.textStrong,
+      fontFamily: theme.fonts.bold.fontFamily,
+      fontWeight: theme.fonts.bold.fontWeight,
+      textAlign: 'center',
+      marginBottom: 8,
+    },
+    subtitle: {
+      fontSize: 14,
+      color: theme.colors.textSubtle,
+      fontFamily: theme.fonts.regular.fontFamily,
+      textAlign: 'center',
+      lineHeight: 20,
+      paddingHorizontal: 16,
+    },
+    wordCountToggle: {
+      flexDirection: 'row',
+      backgroundColor: theme.colors.surface3,
+      borderRadius: 10,
+      padding: 4,
+      marginBottom: 16,
+    },
+    wordCountOption: {
+      flex: 1,
+      paddingVertical: 8,
+      paddingHorizontal: 16,
+      borderRadius: 8,
+      alignItems: 'center',
+    },
+    wordCountOptionActive: {
+      backgroundColor: theme.colors.surface1,
+    },
+    wordCountText: {
+      fontSize: 14,
+      color: theme.colors.textMuted,
+      fontFamily: theme.fonts.medium.fontFamily,
+    },
+    wordCountTextActive: {
+      color: theme.colors.textStrong,
+    },
+    scrollView: {
+      flex: 1,
+    },
+    wordGrid: {
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      gap: 8,
+    },
+    wordInputContainer: {
+      width: '31%',
+      flexDirection: 'row',
+      alignItems: 'center',
+      backgroundColor: theme.colors.surface3,
+      borderRadius: 8,
+      paddingHorizontal: 8,
+      paddingVertical: 8,
+    },
+    wordNumber: {
+      fontSize: 10,
+      color: theme.colors.textMuted,
+      fontFamily: theme.fonts.regular.fontFamily,
+      width: 16,
+    },
+    wordInput: {
+      flex: 1,
+      fontSize: 12,
+      color: theme.colors.textStrong,
+      fontFamily: theme.fonts.medium.fontFamily,
+      padding: 0,
+    },
+    errorContainer: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      backgroundColor: theme.colors.danger + '15',
+      borderRadius: 8,
+      padding: 12,
+      marginBottom: 16,
+    },
+    errorText: {
+      color: theme.colors.danger,
+      fontSize: 14,
+      fontFamily: theme.fonts.regular.fontFamily,
+      marginLeft: 8,
+      flex: 1,
+    },
+    footer: {
+      marginTop: 'auto',
+      paddingTop: 16,
+    },
+    progressText: {
+      fontSize: 14,
+      color: theme.colors.textSubtle,
+      fontFamily: theme.fonts.regular.fontFamily,
+      textAlign: 'center',
+      marginBottom: 16,
+    },
+  });

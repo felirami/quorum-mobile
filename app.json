@@ -1,0 +1,92 @@
+{
+  "expo": {
+    "name": "quorum-mobile",
+    "slug": "quorum-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/icon.png",
+    "scheme": "quorummobile",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/images/splash.png",
+      "resizeMode": "cover",
+      "backgroundColor": "#0A0F1C"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.quilibrium.quorum-mobile",
+      "splash": {
+        "image": "./assets/images/splash.png",
+        "resizeMode": "cover",
+        "backgroundColor": "#0A0F1C"
+      },
+      "infoPlist": {
+        "LSApplicationQueriesSchemes": [
+          "farcaster",
+          "farcaster"
+        ],
+        "NSCameraUsageDescription": "Quorum uses the camera to take profile photos.",
+        "NSPhotoLibraryUsageDescription": "Quorum uses your photo library to select profile photos.",
+        "UIBackgroundModes": [
+          "fetch",
+          "processing",
+          "fetch",
+          "processing"
+        ]
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/images/icon.png",
+        "backgroundColor": "#0A0F1C"
+      },
+      "splash": {
+        "image": "./assets/images/splash.png",
+        "resizeMode": "cover",
+        "backgroundColor": "#0A0F1C"
+      },
+      "edgeToEdgeEnabled": true,
+      "package": "com.quilibrium.quorummobile",
+      "permissions": [
+        "RECEIVE_BOOT_COMPLETED",
+        "VIBRATE",
+        "WAKE_LOCK",
+        "RECEIVE_BOOT_COMPLETED",
+        "VIBRATE",
+        "WAKE_LOCK"
+      ]
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "static",
+      "favicon": "./assets/images/favicon.png"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-splash-screen",
+      "expo-font",
+      "expo-web-browser",
+      [
+        "expo-notifications",
+        {
+          "color": "#0A0F1C",
+          "defaultChannel": "messages"
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "5a410554-fd1e-4845-80bb-5f929202f1b2"
+      }
+    },
+    "runtimeVersion": "1.0.0",
+    "updates": {
+      "url": "https://u.expo.dev/5a410554-fd1e-4845-80bb-5f929202f1b2"
+    }
+  }
+}

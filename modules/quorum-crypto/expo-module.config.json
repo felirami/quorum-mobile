@@ -1,0 +1,9 @@
+{
+  "platforms": ["ios", "android"],
+  "ios": {
+    "modules": ["QuorumCryptoModule"]
+  },
+  "android": {
+    "modules": ["expo.modules.quorumcrypto.QuorumCryptoModule"]
+  }
+}

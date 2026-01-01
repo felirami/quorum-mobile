@@ -1,0 +1,10 @@
+const Horizontalslider2 = ({ className = "", style = {}, ...props }) => (
+  <svg style={style} className={`inline-block align-text-bottom ${className}`} fill="currentColor" height="1em" id="Horizontal-Slider-2--Streamline-Sharp" viewBox="0 0 24 24" width="1em">
+ <g id="horizontal-slider-2--adjustment-adjust-controls-fader-horizontal-settings-slider">
+  <path clipRule="evenodd" d="M4 7c1.65685 0 3 -1.34315 3 -3S5.65685 1 4 1 1 2.34315 1 4s1.34315 3 3 3Zm8 8c1.6569 0 3 -1.3431 3 -3s-1.3431 -3 -3 -3 -3 1.3431 -3 3 1.3431 3 3 3Zm11 5c0 1.6569 -1.3431 3 -3 3s-3 -1.3431 -3 -3 1.3431 -3 3 -3 3 1.3431 3 3Zm0 -15H8.38849C8.46147 4.67839 8.5 4.34369 8.5 4c0 -0.34369 -0.03853 -0.67839 -0.11151 -1H23v2Zm0 8h-6.6115c0.073 -0.3216 0.1115 -0.6563 0.1115 -1s-0.0385 -0.6784 -0.1115 -1H23v2ZM7.5 12c0 0.3437 0.03853 0.6784 0.11151 1H1v-2h6.61151c-0.07298 0.3216 -0.11151 0.6563 -0.11151 1Zm8 8c0 -0.3437 0.0385 -0.6784 0.1115 -1H1v2h14.6115c-0.073 -0.3216 -0.1115 -0.6563 -0.1115 -1Z" fill="currentColor" fillRule="evenodd" id="Union" strokeWidth="1"/>
+ </g>
+</svg>
+
+);
+
+export default Horizontalslider2;

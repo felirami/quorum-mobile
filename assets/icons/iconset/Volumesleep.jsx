@@ -1,0 +1,10 @@
+const Volumesleep = ({ className = "", style = {}, ...props }) => (
+  <svg style={style} className={`inline-block align-text-bottom ${className}`} fill="currentColor" height="1em" id="Volume-Sleep--Streamline-Sharp" viewBox="0 0 24 24" width="1em">
+ <g id="volume-sleep--volume-sleep-speaker-music-mute-audio-entertainment">
+  <path clipRule="evenodd" d="M9 15.5h4.5005V1.05664L5.18003 6.99983l-3.68001 0v9.99997l3.68001 0L9 19.7284V15.5Zm7 -6h4.0858L16 13.5858V15.5h7v-2h-4.0858L23 9.41421V7.5h-7v2ZM13.1379 19H10.5v-2h5.9999v1.8017L13.862 21H16.5v2h-6.0001v-1.8017L13.1379 19Z" fill="currentColor" fillRule="evenodd" id="Union" strokeWidth="1"/>
+ </g>
+</svg>
+
+);
+
+export default Volumesleep;

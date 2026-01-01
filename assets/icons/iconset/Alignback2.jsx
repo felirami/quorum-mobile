@@ -1,0 +1,10 @@
+const Alignback2 = ({ className = "", style = {}, ...props }) => (
+  <svg style={style} className={`inline-block align-text-bottom ${className}`} fill="currentColor" height="1em" id="Align-Back-2--Streamline-Sharp" viewBox="0 0 24 24" width="1em">
+ <g id="align-back-2--back-design-layer-layers-pile-stack-arrange-rectangle">
+  <path clipRule="evenodd" d="M18 2.00049v-1h-3.8125v2H16v1.74784l2 0V2.00049ZM1 17.0005v1h3.75l0 -2H3v-1.8098H1v2.8098ZM1 1.00049h3.74784l0 2H3v1.8125l-2 0v-3.8125ZM17 18.0005h1V14.188h-2v1.8125h-1.7478v2H17Zm-16 -6.625V7.62549h2l0 3.75001H1Zm17 0V7.62549h-2v3.75001h2ZM7.625 1.00049h3.75v2h-3.75v-2Zm0 17.00001h3.75v-2h-3.75v2ZM20.5 6.25h-0.75v13.5H6.25v2.9999h16.5V6.25H20.5Z" fill="currentColor" fillRule="evenodd" id="Union" strokeWidth="1"/>
+ </g>
+</svg>
+
+);
+
+export default Alignback2;

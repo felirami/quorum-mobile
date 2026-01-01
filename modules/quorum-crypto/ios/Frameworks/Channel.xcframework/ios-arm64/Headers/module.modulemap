@@ -1,0 +1,5 @@
+framework module Channel {
+    umbrella header "channelFFI.h"
+    export *
+    module * { export * }
+}

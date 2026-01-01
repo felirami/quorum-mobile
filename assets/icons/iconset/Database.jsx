@@ -1,0 +1,10 @@
+const Database = ({ className = "", style = {}, ...props }) => (
+  <svg style={style} className={`inline-block align-text-bottom ${className}`} fill="currentColor" height="1em" id="Database--Streamline-Sharp" viewBox="0 0 24 24" width="1em">
+ <g id="database--raid-storage-code-disk-programming-database-array-hard-disc">
+  <path clipRule="evenodd" d="M22 4.5c0 1.65685 -4.4772 3 -10 3 -5.52285 0 -10 -1.34315 -10 -3s4.47715 -3 10 -3c5.5228 0 10 1.34315 10 3Zm-10 18c5.799 0 10.5 -1.567 10.5 -3.5v-6c0 1.933 -4.701 3.5 -10.5 3.5 -5.79899 0 -10.5 -1.567 -10.5 -3.5v6c0 1.933 4.70101 3.5 10.5 3.5Zm10.5 -11c0 1.933 -4.701 3.5 -10.5 3.5 -5.79899 0 -10.5 -1.567 -10.5 -3.5v-6C1.5 7.433 6.20101 9 12 9c5.799 0 10.5 -1.567 10.5 -3.5v6Z" fill="currentColor" fillRule="evenodd" id="Union" strokeWidth="1"/>
+ </g>
+</svg>
+
+);
+
+export default Database;

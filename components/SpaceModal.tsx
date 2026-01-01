@@ -1,0 +1,632 @@
+/**
+ * SpaceModal - Modal for creating or joining a space
+ *
+ * Two tabs:
+ * - Create: Enter space name, optional description, and create
+ * - Join: Enter invite link to join existing space
+ */
+
+import { logger } from '@quilibrium/quorum-shared';
+import React, { useState, useCallback, useMemo } from 'react';
+import {
+  View,
+  Text,
+  TextInput,
+  StyleSheet,
+  TouchableOpacity,
+  ActivityIndicator,
+  Image,
+} from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { BaseModal } from '@/components/shared';
+import { IconSymbol } from '@/components/ui/IconSymbol';
+import { useTheme } from '@/theme';
+import { useSpaces } from '@/hooks/chat/useSpaces';
+import { useCreateSpace, useJoinSpace, useValidateInvite } from '@/hooks/chat/useSpaceActions';
+import { useWebSocket } from '@/context/WebSocketContext';
+
+interface SpaceModalProps {
+  visible: boolean;
+  onClose: () => void;
+  onSpaceCreated?: (spaceId: string) => void;
+  onSpaceJoined?: (spaceId: string) => void;
+}
+
+type TabType = 'create' | 'join';
+
+// Space name validation - matches desktop
+const MIN_NAME_LENGTH = 2;
+const MAX_NAME_LENGTH = 50;
+const MAX_DESCRIPTION_LENGTH = 300;
+
+function validateSpaceName(name: string): string | null {
+  const trimmed = name.trim();
+  if (!trimmed) return 'Space name is required';
+  if (trimmed.length < MIN_NAME_LENGTH) return `Name must be at least ${MIN_NAME_LENGTH} characters`;
+  if (trimmed.length > MAX_NAME_LENGTH) return `Name must be ${MAX_NAME_LENGTH} characters or less`;
+  return null;
+}
+
+// Invite link validation
+function isValidInviteLink(link: string): boolean {
+  if (!link) return false;
+  const trimmed = link.trim();
+  // Accept various formats:
+  // - Full URL: https://quorummessenger.com/i/...
+  // - Short URL: quorummessenger.com/i/...
+  // - Just the invite code: Qm... or other base58
+  return (
+    trimmed.includes('quorummessenger.com/i/') ||
+    trimmed.includes('/i/') ||
+    /^[123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz]{32,}$/.test(trimmed)
+  );
+}
+
+export default function SpaceModal({
+  visible,
+  onClose,
+  onSpaceCreated,
+  onSpaceJoined,
+}: SpaceModalProps) {
+  const { theme } = useTheme();
+  const insets = useSafeAreaInsets();
+  const styles = createStyles(theme, insets);
+  const { subscribe, enqueueOutbound, triggerSyncRequest } = useWebSocket();
+
+  const [activeTab, setActiveTab] = useState<TabType>('join');
+
+  // Create tab state
+  const [spaceName, setSpaceName] = useState('');
+  const [description, setDescription] = useState('');
+
+  // Join tab state
+  const [inviteLink, setInviteLink] = useState('');
+
+  // Mutations
+  const createSpaceMutation = useCreateSpace();
+  const joinSpaceMutation = useJoinSpace();
+  const { data: validatedSpace, isLoading: isValidating, error: validationError } = useValidateInvite(inviteLink);
+
+  // Check if already a member
+  const { data: spaces } = useSpaces();
+  const isAlreadyMember = useMemo(() => {
+    if (!validatedSpace || !spaces) return false;
+    return spaces.some((s) => s.spaceId === validatedSpace.spaceId);
+  }, [validatedSpace, spaces]);
+
+  // Validation
+  const nameError = validateSpaceName(spaceName);
+  const descriptionError = description.length > MAX_DESCRIPTION_LENGTH
+    ? `Description must be ${MAX_DESCRIPTION_LENGTH} characters or less`
+    : null;
+  const canCreate = !nameError && !descriptionError && !createSpaceMutation.isPending;
+  const canJoin = isValidInviteLink(inviteLink) && validatedSpace && !isAlreadyMember && !joinSpaceMutation.isPending;
+
+  const handleCreate = useCallback(async () => {
+    if (!canCreate) return;
+
+    try {
+      const result = await createSpaceMutation.mutateAsync({
+        name: spaceName.trim(),
+        description: description.trim() || undefined,
+      });
+
+      if (result?.spaceId) {
+        // Subscribe to the new space inbox immediately
+        if (result.inboxAddress) {
+          logger.log('[SpaceModal] Subscribing to new space inbox:', result.inboxAddress.substring(0, 12));
+          await subscribe([result.inboxAddress]);
+        }
+        onClose();
+        onSpaceCreated?.(result.spaceId);
+      }
+    } catch (error) {
+      console.error('[SpaceModal] Create failed:', error);
+    }
+  }, [canCreate, spaceName, description, createSpaceMutation, onClose, onSpaceCreated, subscribe]);
+
+  const handleJoin = useCallback(async () => {
+    if (!canJoin) return;
+
+    try {
+      const result = await joinSpaceMutation.mutateAsync({
+        inviteLink: inviteLink.trim(),
+      });
+
+      if (result?.spaceId) {
+        // Subscribe to the new space inbox immediately
+        if (result.inboxAddress) {
+          logger.log('[SpaceModal] Subscribing to new space inbox:', result.inboxAddress.substring(0, 12));
+          await subscribe([result.inboxAddress]);
+        }
+
+        // Send join control message to announce ourselves to other participants
+        if (result.joinMessageEnvelope) {
+          logger.log('[SpaceModal] Sending join control message to announce participant');
+          enqueueOutbound(async () => [result.joinMessageEnvelope!]);
+        }
+
+        // Trigger sync request to get existing messages from other participants
+        if (result.channelId) {
+          logger.log('[SpaceModal] Triggering sync request for existing messages');
+          triggerSyncRequest(result.spaceId, result.channelId);
+        }
+
+        onClose();
+        onSpaceJoined?.(result.spaceId);
+      }
+    } catch (error) {
+      console.error('[SpaceModal] Join failed:', error);
+    }
+  }, [canJoin, inviteLink, joinSpaceMutation, onClose, onSpaceJoined, subscribe, enqueueOutbound, triggerSyncRequest]);
+
+  const handleClose = useCallback(() => {
+    setSpaceName('');
+    setDescription('');
+    setInviteLink('');
+    onClose();
+  }, [onClose]);
+
+  const renderTabs = () => (
+    <View style={styles.tabContainer}>
+      <TouchableOpacity
+        style={[styles.tab, activeTab === 'join' && styles.tabActive]}
+        onPress={() => setActiveTab('join')}
+      >
+        <Text style={[styles.tabText, activeTab === 'join' && styles.tabTextActive]}>
+          Join
+        </Text>
+      </TouchableOpacity>
+      <TouchableOpacity
+        style={[styles.tab, activeTab === 'create' && styles.tabActive]}
+        onPress={() => setActiveTab('create')}
+      >
+        <Text style={[styles.tabText, activeTab === 'create' && styles.tabTextActive]}>
+          Create
+        </Text>
+      </TouchableOpacity>
+    </View>
+  );
+
+  const renderCreateTab = () => (
+    <View style={styles.tabContent}>
+      {/* Space Name */}
+      <View style={styles.inputSection}>
+        <Text style={styles.label}>Space Name</Text>
+        <View style={styles.inputContainer}>
+          <TextInput
+            style={styles.input}
+            value={spaceName}
+            onChangeText={setSpaceName}
+            placeholder="Enter a name for your Space"
+            placeholderTextColor={theme.colors.textMuted}
+            autoCapitalize="words"
+            autoCorrect={false}
+            editable={!createSpaceMutation.isPending}
+            maxLength={MAX_NAME_LENGTH}
+          />
+          {spaceName.length > 0 && (
+            <TouchableOpacity style={styles.clearButton} onPress={() => setSpaceName('')}>
+              <IconSymbol name="xmark.circle.fill" size={20} color={theme.colors.textMuted} />
+            </TouchableOpacity>
+          )}
+        </View>
+        {spaceName.length > 0 && nameError && (
+          <Text style={styles.errorText}>{nameError}</Text>
+        )}
+      </View>
+
+      {/* Description */}
+      <View style={styles.inputSection}>
+        <Text style={styles.label}>Description (optional)</Text>
+        <View style={[styles.inputContainer, styles.textAreaContainer]}>
+          <TextInput
+            style={[styles.input, styles.textArea]}
+            value={description}
+            onChangeText={setDescription}
+            placeholder="Enter a description for your Space"
+            placeholderTextColor={theme.colors.textMuted}
+            multiline
+            numberOfLines={3}
+            textAlignVertical="top"
+            editable={!createSpaceMutation.isPending}
+            maxLength={MAX_DESCRIPTION_LENGTH + 50} // Allow some overflow for error display
+          />
+        </View>
+        <View style={styles.charCountRow}>
+          {descriptionError && <Text style={styles.errorText}>{descriptionError}</Text>}
+          <Text style={[styles.charCount, descriptionError && styles.charCountError]}>
+            {description.length}/{MAX_DESCRIPTION_LENGTH}
+          </Text>
+        </View>
+      </View>
+
+      {/* Error display */}
+      {createSpaceMutation.error && (
+        <View style={styles.errorBanner}>
+          <IconSymbol name="exclamationmark.triangle.fill" size={16} color={theme.colors.danger} />
+          <Text style={styles.errorBannerText}>
+            {createSpaceMutation.error instanceof Error
+              ? createSpaceMutation.error.message
+              : 'Failed to create space'}
+          </Text>
+        </View>
+      )}
+
+      {/* Actions */}
+      <View style={styles.actions}>
+        <TouchableOpacity
+          style={styles.cancelButton}
+          onPress={handleClose}
+          disabled={createSpaceMutation.isPending}
+        >
+          <Text style={styles.cancelButtonText}>Cancel</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[styles.primaryButton, !canCreate && styles.primaryButtonDisabled]}
+          onPress={handleCreate}
+          disabled={!canCreate}
+        >
+          {createSpaceMutation.isPending ? (
+            <ActivityIndicator size="small" color="#fff" />
+          ) : (
+            <>
+              <IconSymbol name="plus.circle.fill" size={18} color="#fff" />
+              <Text style={styles.primaryButtonText}>Create Space</Text>
+            </>
+          )}
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+
+  const renderJoinTab = () => (
+    <View style={styles.tabContent}>
+      {/* Validated Space Preview */}
+      {validatedSpace && (
+        <View style={styles.spacePreview}>
+          {validatedSpace.iconUrl ? (
+            <Image source={{ uri: validatedSpace.iconUrl }} style={styles.spaceIcon} />
+          ) : (
+            <View style={styles.spaceIconPlaceholder}>
+              <IconSymbol name="person.3.fill" size={24} color={theme.colors.textMuted} />
+            </View>
+          )}
+          <Text style={styles.spaceName}>{validatedSpace.spaceName}</Text>
+          {validatedSpace.description && (
+            <Text style={styles.spaceDescription} numberOfLines={2}>
+              {validatedSpace.description}
+            </Text>
+          )}
+          {isAlreadyMember && (
+            <View style={styles.memberBadge}>
+              <IconSymbol name="checkmark.circle.fill" size={14} color={theme.colors.success ?? '#22c55e'} />
+              <Text style={styles.memberBadgeText}>Already a member</Text>
+            </View>
+          )}
+        </View>
+      )}
+
+      {/* If no validated space, show placeholder */}
+      {!validatedSpace && !isValidating && (
+        <View style={styles.spacePreviewPlaceholder}>
+          <View style={styles.spaceIconPlaceholder}>
+            <IconSymbol name="questionmark" size={24} color={theme.colors.textMuted} />
+          </View>
+          <Text style={styles.placeholderText}>Enter an invite link to preview the space</Text>
+        </View>
+      )}
+
+      {/* Loading state */}
+      {isValidating && (
+        <View style={styles.spacePreviewPlaceholder}>
+          <ActivityIndicator size="large" color={theme.colors.primary} />
+          <Text style={styles.placeholderText}>Validating invite...</Text>
+        </View>
+      )}
+
+      {/* Invite Link Input */}
+      <View style={styles.inputSection}>
+        <Text style={styles.label}>Invite Link</Text>
+        <View style={styles.inputContainer}>
+          <TextInput
+            style={styles.input}
+            value={inviteLink}
+            onChangeText={setInviteLink}
+            placeholder="https://quorummessenger.com/i/..."
+            placeholderTextColor={theme.colors.textMuted}
+            autoCapitalize="none"
+            autoCorrect={false}
+            editable={!joinSpaceMutation.isPending}
+          />
+          {inviteLink.length > 0 && (
+            <TouchableOpacity style={styles.clearButton} onPress={() => setInviteLink('')}>
+              <IconSymbol name="xmark.circle.fill" size={20} color={theme.colors.textMuted} />
+            </TouchableOpacity>
+          )}
+        </View>
+        {validationError && (
+          <Text style={styles.errorText}>
+            {validationError instanceof Error ? validationError.message : 'Invalid invite link'}
+          </Text>
+        )}
+      </View>
+
+      {/* Error display */}
+      {joinSpaceMutation.error && (
+        <View style={styles.errorBanner}>
+          <IconSymbol name="exclamationmark.triangle.fill" size={16} color={theme.colors.danger} />
+          <Text style={styles.errorBannerText}>
+            {joinSpaceMutation.error instanceof Error
+              ? joinSpaceMutation.error.message
+              : 'Failed to join space'}
+          </Text>
+        </View>
+      )}
+
+      {/* Actions */}
+      <View style={styles.actions}>
+        <TouchableOpacity
+          style={styles.cancelButton}
+          onPress={handleClose}
+          disabled={joinSpaceMutation.isPending}
+        >
+          <Text style={styles.cancelButtonText}>Cancel</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[styles.primaryButton, !canJoin && styles.primaryButtonDisabled]}
+          onPress={handleJoin}
+          disabled={!canJoin}
+        >
+          {joinSpaceMutation.isPending ? (
+            <ActivityIndicator size="small" color="#fff" />
+          ) : (
+            <>
+              <IconSymbol name="arrow.right.circle.fill" size={18} color="#fff" />
+              <Text style={styles.primaryButtonText}>
+                {isAlreadyMember ? 'Joined' : 'Join Space'}
+              </Text>
+            </>
+          )}
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+
+  return (
+    <BaseModal visible={visible} onClose={handleClose} height={0.75} avoidKeyboard>
+      <View style={styles.container}>
+        {/* Header */}
+        <View style={styles.header}>
+          <Text style={styles.title}>Add Space</Text>
+        </View>
+
+        {/* Tabs */}
+        {renderTabs()}
+
+        {/* Tab Content */}
+        {activeTab === 'create' ? renderCreateTab() : renderJoinTab()}
+      </View>
+    </BaseModal>
+  );
+}
+
+const createStyles = (theme: any, insets: any) =>
+  StyleSheet.create({
+    container: {
+      flex: 1,
+      paddingHorizontal: 20,
+    },
+    header: {
+      paddingVertical: 16,
+      alignItems: 'center',
+    },
+    title: {
+      fontSize: 20,
+      fontFamily: theme.fonts.bold.fontFamily,
+      fontWeight: theme.fonts.bold.fontWeight,
+      color: theme.colors.textStrong,
+    },
+    tabContainer: {
+      flexDirection: 'row',
+      backgroundColor: theme.colors.surface3,
+      borderRadius: 12,
+      padding: 4,
+      marginBottom: 20,
+    },
+    tab: {
+      flex: 1,
+      paddingVertical: 10,
+      alignItems: 'center',
+      borderRadius: 8,
+    },
+    tabActive: {
+      backgroundColor: theme.colors.surface1,
+    },
+    tabText: {
+      fontSize: 15,
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
+      color: theme.colors.textMuted,
+    },
+    tabTextActive: {
+      color: theme.colors.textStrong,
+    },
+    tabContent: {
+      flex: 1,
+    },
+    inputSection: {
+      marginBottom: 16,
+    },
+    label: {
+      fontSize: 14,
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
+      color: theme.colors.textMain,
+      marginBottom: 8,
+    },
+    inputContainer: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      backgroundColor: theme.colors.surface3,
+      borderRadius: 12,
+      paddingHorizontal: 16,
+    },
+    textAreaContainer: {
+      alignItems: 'flex-start',
+      paddingVertical: 8,
+    },
+    input: {
+      flex: 1,
+      paddingVertical: 14,
+      fontSize: 16,
+      fontFamily: theme.fonts.regular.fontFamily,
+      color: theme.colors.textMain,
+    },
+    textArea: {
+      minHeight: 80,
+      paddingVertical: 8,
+    },
+    clearButton: {
+      padding: 4,
+    },
+    charCountRow: {
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      marginTop: 4,
+    },
+    charCount: {
+      fontSize: 12,
+      fontFamily: theme.fonts.regular.fontFamily,
+      color: theme.colors.textMuted,
+      marginLeft: 'auto',
+    },
+    charCountError: {
+      color: theme.colors.danger,
+    },
+    errorText: {
+      marginTop: 8,
+      fontSize: 13,
+      fontFamily: theme.fonts.regular.fontFamily,
+      color: theme.colors.danger,
+    },
+    errorBanner: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      padding: 12,
+      backgroundColor: theme.colors.danger + '15',
+      borderRadius: 8,
+      marginBottom: 16,
+      gap: 8,
+    },
+    errorBannerText: {
+      flex: 1,
+      fontSize: 14,
+      fontFamily: theme.fonts.regular.fontFamily,
+      color: theme.colors.danger,
+    },
+    spacePreview: {
+      alignItems: 'center',
+      paddingVertical: 24,
+      marginBottom: 16,
+    },
+    spacePreviewPlaceholder: {
+      alignItems: 'center',
+      paddingVertical: 24,
+      marginBottom: 16,
+    },
+    spaceIcon: {
+      width: 64,
+      height: 64,
+      borderRadius: 16,
+      marginBottom: 12,
+    },
+    spaceIconPlaceholder: {
+      width: 64,
+      height: 64,
+      borderRadius: 16,
+      backgroundColor: theme.colors.surface4,
+      alignItems: 'center',
+      justifyContent: 'center',
+      marginBottom: 12,
+    },
+    spaceName: {
+      fontSize: 18,
+      fontFamily: theme.fonts.bold.fontFamily,
+      fontWeight: theme.fonts.bold.fontWeight,
+      color: theme.colors.textStrong,
+      textAlign: 'center',
+    },
+    spaceDescription: {
+      fontSize: 14,
+      fontFamily: theme.fonts.regular.fontFamily,
+      color: theme.colors.textMuted,
+      textAlign: 'center',
+      marginTop: 8,
+      paddingHorizontal: 16,
+    },
+    placeholderText: {
+      fontSize: 14,
+      fontFamily: theme.fonts.regular.fontFamily,
+      color: theme.colors.textMuted,
+      textAlign: 'center',
+      marginTop: 8,
+    },
+    memberBadge: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      marginTop: 12,
+      paddingHorizontal: 12,
+      paddingVertical: 6,
+      backgroundColor: (theme.colors.success ?? '#22c55e') + '15',
+      borderRadius: 16,
+      gap: 6,
+    },
+    memberBadgeText: {
+      fontSize: 13,
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
+      color: theme.colors.success ?? '#22c55e',
+    },
+    actions: {
+      flexDirection: 'row',
+      marginTop: 'auto',
+      paddingTop: 16,
+      gap: 12,
+    },
+    cancelButton: {
+      flex: 1,
+      paddingVertical: 14,
+      alignItems: 'center',
+      justifyContent: 'center',
+      backgroundColor: theme.colors.surface3,
+      borderRadius: 12,
+    },
+    cancelButtonText: {
+      fontSize: 16,
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
+      color: theme.colors.textMain,
+    },
+    primaryButton: {
+      flex: 1,
+      flexDirection: 'row',
+      paddingVertical: 14,
+      alignItems: 'center',
+      justifyContent: 'center',
+      backgroundColor: theme.colors.primary,
+      borderRadius: 12,
+      gap: 8,
+    },
+    primaryButtonDisabled: {
+      opacity: 0.5,
+    },
+    primaryButtonText: {
+      fontSize: 16,
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
+      color: '#fff',
+    },
+  });

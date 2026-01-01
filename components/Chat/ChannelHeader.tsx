@@ -1,0 +1,102 @@
+import { IconSymbol } from '@/components/ui/IconSymbol';
+import React from 'react';
+import { Dimensions, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+
+const { width: SCREEN_WIDTH } = Dimensions.get('window');
+
+interface ChannelHeaderProps {
+  channelName: string;
+  sidebarsVisible: boolean;
+  onShowSidebars: () => void;
+  onInvite?: () => void;
+  onOpenSettings?: () => void;
+  theme: any;
+}
+
+export function ChannelHeader({
+  channelName,
+  sidebarsVisible,
+  onShowSidebars,
+  onInvite,
+  onOpenSettings,
+  theme,
+}: ChannelHeaderProps) {
+  const styles = createStyles(theme);
+
+  return (
+    <View style={styles.container}>
+      <View style={styles.left}>
+        {!sidebarsVisible && (
+          <TouchableOpacity onPress={onShowSidebars} style={styles.menuButton}>
+            <IconSymbol name="line.3.horizontal" color={theme.colors.textMuted} size={20} />
+          </TouchableOpacity>
+        )}
+        <IconSymbol name="number" color={theme.colors.textMuted} size={16} />
+        <Text style={styles.title}>{channelName}</Text>
+      </View>
+      <View style={styles.right}>
+        {onInvite && (
+          <TouchableOpacity style={styles.headerIconButton} onPress={onInvite}>
+            <IconSymbol name="person.badge.plus" color={theme.colors.textMuted} size={18} />
+          </TouchableOpacity>
+        )}
+        {onOpenSettings && (
+          <TouchableOpacity style={styles.headerIconButton} onPress={onOpenSettings}>
+            <IconSymbol name="gearshape" color={theme.colors.textMuted} size={18} />
+          </TouchableOpacity>
+        )}
+      </View>
+    </View>
+  );
+}
+
+const createStyles = (theme: any) => StyleSheet.create({
+  container: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: theme.colors.surface3,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: theme.colors.border,
+    width: SCREEN_WIDTH,
+  },
+  left: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  right: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  menuButton: {
+    marginRight: 12,
+  },
+  title: {
+    color: theme.colors.textMain,
+    fontFamily: theme.fonts.medium.fontFamily,
+    fontWeight: theme.fonts.medium.fontWeight,
+    marginLeft: 8,
+  },
+  headerIconButton: {
+    marginRight: 16,
+  },
+  searchContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: theme.colors.surface5,
+    borderRadius: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+  },
+  searchInput: {
+    color: theme.colors.textMain,
+    fontSize: 14,
+    marginLeft: 8,
+    width: 80,
+    fontFamily: theme.fonts.regular.fontFamily,
+  },
+});
+
+export default ChannelHeader;
