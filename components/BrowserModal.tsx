@@ -1,18 +1,46 @@
 import { BaseModal } from '@/components/shared';
+import { ProfileView } from '@/components/SocialFeed/views/ProfileView';
+import { ThreadDetailView } from '@/components/SocialFeed/views/ThreadDetailView';
 import { Button } from '@/components/ui/Button';
 import { IconSymbol } from '@/components/ui/IconSymbol';
-import { useMiniAppBridge } from '@/services/miniapp';
-import { useTheme } from '@/theme';
+import { useWalletSelection, useActiveWalletKeys } from '@/hooks/useWalletSelection';
+import { useWalletKeys } from '@/hooks/useWallet';
+import { postFarcasterCast } from '@/services/farcasterClient';
+import { useMiniAppBridge, type ComposeCastOptions, type ComposeCastResult } from '@/services/miniapp';
+import {
+  TransactionForApproval,
+  MessageForApproval,
+  TypedDataForApproval,
+  SigningResult,
+} from '@/services/miniapp/ethereumProvider';
+import {
+  signPersonalMessage,
+  signTypedData,
+  signAndSendTransaction,
+  signTransactionOnly,
+} from '@/services/miniapp/secureSigningService';
+import { getFarcasterAuthToken } from '@/services/onboarding/secureStorage';
+import { useTheme, type AppTheme } from '@/theme';
+import type { EdgeInsets } from 'react-native-safe-area-context';
+import { getErrorMessage } from '@/utils/error';
+import MiniAppApprovalModal, { ApprovalRequest } from '@/components/MiniAppApprovalModal';
+import SwapModal from '@/components/wallet/SwapModal';
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Dimensions,
+  KeyboardAvoidingView,
+  Linking,
   Modal,
+  Platform,
+  Pressable,
+  ScrollView,
   Share,
   StyleSheet,
   Text,
+  TextInput,
   TouchableOpacity,
-  View,
+  View
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import WebView from 'react-native-webview';
@@ -25,23 +53,289 @@ interface BrowserModalProps {
   onShowTransactionWarning?: (warningType: 'simulation-failed' | 'no-entitlements' | 'not-declared' | 'ok') => void;
   /** Timestamp for cache busting - pass Date.now() when launching to force refresh */
   timestamp?: number;
+  /** Allow bypassing SSL certificate errors for LAN IP addresses (development only) */
+  allowInsecureLAN?: boolean;
+}
+
+// Check if a URL is a LAN/local IP address
+function isLanUrl(url: string): boolean {
+  try {
+    const hostname = new URL(url).hostname;
+    // Check for localhost
+    if (hostname === 'localhost' || hostname === '127.0.0.1') return true;
+    // Check for private IP ranges
+    // 10.x.x.x
+    if (/^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname)) return true;
+    // 172.16.x.x - 172.31.x.x
+    if (/^172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}$/.test(hostname)) return true;
+    // 192.168.x.x
+    if (/^192\.168\.\d{1,3}\.\d{1,3}$/.test(hostname)) return true;
+    // Link-local 169.254.x.x
+    if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(hostname)) return true;
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 const { height: SCREEN_HEIGHT } = Dimensions.get('window');
 
-export default function BrowserModal({ visible, url, onClose, isQNative = false, onShowTransactionWarning, timestamp = 0 }: BrowserModalProps) {
+export default function BrowserModal({ visible, url, onClose, isQNative = false, onShowTransactionWarning, timestamp = 0, allowInsecureLAN = false }: BrowserModalProps) {
   const { theme, isDark } = useTheme();
   const insets = useSafeAreaInsets();
   const webViewRef = useRef<WebView>(null);
 
+  const shouldBypassSsl = allowInsecureLAN && isLanUrl(url);
+
   const [canGoBack, setCanGoBack] = useState(false);
   const [canGoForward, setCanGoForward] = useState(false);
   const [currentUrl, setCurrentUrl] = useState(url);
+  // Delay source loading for LAN URLs to ensure ignoreSslErrorForLocalNetwork prop is set first
+  const [sourceReady, setSourceReady] = useState(!shouldBypassSsl);
   const [loading, setLoading] = useState(true);
   const [title, setTitle] = useState('');
   const [warningType, setWarningType] = useState<'simulation-failed' | 'no-entitlements' | 'not-declared' | 'ok'>('ok');
   const [showSplash, setShowSplash] = useState(true);
   const [showFarcasterPrompt, setShowFarcasterPrompt] = useState(false);
+
+  // Compose modal state
+  const [composeVisible, setComposeVisible] = useState(false);
+  const [composeText, setComposeText] = useState('');
+  const [composeEmbeds, setComposeEmbeds] = useState<string[]>([]);
+  const [composeParentHash, setComposeParentHash] = useState<string | undefined>(undefined);
+  const [composeChannelKey, setComposeChannelKey] = useState<string | undefined>(undefined);
+  const [composePosting, setComposePosting] = useState(false);
+  const [composeError, setComposeError] = useState<string | null>(null);
+  const composeResolverRef = useRef<((result: ComposeCastResult) => void) | null>(null);
+  const MAX_CAST_LENGTH = 320;
+
+  // Profile/Cast overlay state (for viewProfile/viewCast SDK methods)
+  const [profileOverlay, setProfileOverlay] = useState<{ fid: number } | null>(null);
+  const [castOverlay, setCastOverlay] = useState<{ username: string; castHashPrefix: string } | null>(null);
+  const [likeStates, setLikeStates] = useState<Map<string, { liked: boolean; count: number }>>(new Map());
+  const [followStates, setFollowStates] = useState<Map<number, boolean>>(new Map());
+  const [farcasterToken, setFarcasterToken] = useState<string | undefined>(undefined);
+
+  // Fetch Farcaster token for overlays
+  useEffect(() => {
+    getFarcasterAuthToken().then(token => {
+      if (token) setFarcasterToken(token);
+    });
+  }, []);
+
+  // Delay source loading for LAN URLs to ensure native prop is set before WebView loads
+  useEffect(() => {
+    if (shouldBypassSsl && !sourceReady) {
+      const timer = setTimeout(() => setSourceReady(true), 50);
+      return () => clearTimeout(timer);
+    }
+  }, [shouldBypassSsl, sourceReady]);
+
+  // Wallet state for mini app integration - uses selected wallet (builtin or warpcast)
+  const { activeWallet, activeType, availableWallets, hasWarpcastWallet, switchWallet, isSwitching, isLoading: walletLoading } = useWalletSelection();
+  // Get private key for warpcast wallet (available immediately) or fetch for builtin
+  const { privateKey: warpcastPrivateKey } = useActiveWalletKeys();
+  const { refetch: fetchBuiltinKeys } = useWalletKeys();
+
+  // Helper to get private key on-demand (for signing)
+  const getPrivateKeyForSigning = useCallback(async (): Promise<string | null> => {
+    if (activeType === 'warpcast' && warpcastPrivateKey) {
+      return warpcastPrivateKey;
+    }
+    // For builtin wallet, fetch keys on-demand
+    const result = await fetchBuiltinKeys();
+    return result.data?.ethereum?.privateKey ?? null;
+  }, [activeType, warpcastPrivateKey, fetchBuiltinKeys]);
+
+  const [approvalRequest, setApprovalRequest] = useState<ApprovalRequest | null>(null);
+  const [showApprovalModal, setShowApprovalModal] = useState(false);
+  const [showWalletSelector, setShowWalletSelector] = useState(false);
+  const [showSwapModal, setShowSwapModal] = useState(false);
+  const [swapInitialBuyToken, setSwapInitialBuyToken] = useState<string | undefined>(undefined);
+
+  // Convert active wallet to WalletInfo format for the bridge
+  // SECURITY: Only pass the address, not the private key
+  const walletInfo = useMemo(() => {
+    if (!activeWallet) return null;
+    return {
+      address: activeWallet.address,
+    };
+  }, [activeWallet]);
+
+  // Extract domain from URL for MiniApp bridge (moved up for use in approval handlers)
+  const domain = useMemo(() => {
+    try {
+      return new URL(url || '').hostname;
+    } catch {
+      return url || '';
+    }
+  }, [url]);
+
+  /**
+   * SECURE: Handle send transaction request from mini app
+   * Shows approval UI, then signs and sends if approved
+   */
+  const handleSendTransaction = useCallback((tx: TransactionForApproval): Promise<SigningResult> => {
+    return new Promise((resolve) => {
+      setApprovalRequest({
+        type: 'transaction',
+        transaction: tx,
+        appName: title || domain,
+        resolve: async (approved: boolean) => {
+          if (!approved) {
+            resolve({ success: false, error: 'User rejected the transaction' });
+            return;
+          }
+
+          // Get the private key for signing (fetched on-demand)
+          const privateKey = await getPrivateKeyForSigning();
+          if (!privateKey) {
+            resolve({ success: false, error: 'Wallet not available' });
+            return;
+          }
+
+          try {
+            // Sign and send via SecureSigningService
+            const hash = await signAndSendTransaction(privateKey, {
+              to: tx.to,
+              value: tx.value,
+              data: tx.data,
+              gas: tx.gas,
+              gasPrice: tx.gasPrice,
+              maxFeePerGas: tx.maxFeePerGas,
+              maxPriorityFeePerGas: tx.maxPriorityFeePerGas,
+              nonce: tx.nonce,
+              chainId: tx.chainId,
+            });
+            resolve({ success: true, hash });
+          } catch (error: unknown) {
+            resolve({ success: false, error: getErrorMessage(error) || 'Transaction failed' });
+          }
+        },
+      });
+      setShowApprovalModal(true);
+    });
+  }, [title, domain, activeWallet]);
+
+  /**
+   * SECURE: Handle sign transaction (without sending) request from mini app
+   */
+  const handleSignTransaction = useCallback((tx: TransactionForApproval): Promise<SigningResult> => {
+    return new Promise((resolve) => {
+      setApprovalRequest({
+        type: 'transaction',
+        transaction: tx,
+        appName: title || domain,
+        resolve: async (approved: boolean) => {
+          if (!approved) {
+            resolve({ success: false, error: 'User rejected the transaction' });
+            return;
+          }
+
+          const privateKey = await getPrivateKeyForSigning();
+          if (!privateKey) {
+            resolve({ success: false, error: 'Wallet not available' });
+            return;
+          }
+
+          try {
+            const signature = await signTransactionOnly(privateKey, {
+              to: tx.to,
+              value: tx.value,
+              data: tx.data,
+              gas: tx.gas,
+              gasPrice: tx.gasPrice,
+              maxFeePerGas: tx.maxFeePerGas,
+              maxPriorityFeePerGas: tx.maxPriorityFeePerGas,
+              nonce: tx.nonce,
+              chainId: tx.chainId,
+            });
+            resolve({ success: true, signature });
+          } catch (error: unknown) {
+            resolve({ success: false, error: getErrorMessage(error) || 'Signing failed' });
+          }
+        },
+      });
+      setShowApprovalModal(true);
+    });
+  }, [title, domain, activeWallet]);
+
+  /**
+   * SECURE: Handle message signing request from mini app
+   */
+  const handleSignMessage = useCallback((msg: MessageForApproval): Promise<SigningResult> => {
+    return new Promise((resolve) => {
+      setApprovalRequest({
+        type: 'message',
+        message: msg,
+        appName: title || domain,
+        resolve: async (approved: boolean) => {
+          if (!approved) {
+            resolve({ success: false, error: 'User rejected the signature request' });
+            return;
+          }
+
+          const privateKey = await getPrivateKeyForSigning();
+          if (!privateKey) {
+            resolve({ success: false, error: 'Wallet not available' });
+            return;
+          }
+
+          try {
+            const signature = await signPersonalMessage(privateKey, msg.rawMessage);
+            resolve({ success: true, signature });
+          } catch (error: unknown) {
+            resolve({ success: false, error: getErrorMessage(error) || 'Signing failed' });
+          }
+        },
+      });
+      setShowApprovalModal(true);
+    });
+  }, [title, domain, activeWallet]);
+
+  /**
+   * SECURE: Handle typed data signing request from mini app
+   */
+  const handleSignTypedData = useCallback((data: TypedDataForApproval): Promise<SigningResult> => {
+    return new Promise((resolve) => {
+      setApprovalRequest({
+        type: 'typedData',
+        typedData: data,
+        appName: title || domain,
+        resolve: async (approved: boolean) => {
+          if (!approved) {
+            resolve({ success: false, error: 'User rejected the signature request' });
+            return;
+          }
+
+          const privateKey = await getPrivateKeyForSigning();
+          if (!privateKey) {
+            resolve({ success: false, error: 'Wallet not available' });
+            return;
+          }
+
+          try {
+            const signature = await signTypedData(privateKey, {
+              domain: data.domain,
+              types: data.types,
+              primaryType: data.primaryType,
+              message: data.message,
+            });
+            resolve({ success: true, signature });
+          } catch (error: unknown) {
+            resolve({ success: false, error: getErrorMessage(error) || 'Signing failed' });
+          }
+        },
+      });
+      setShowApprovalModal(true);
+    });
+  }, [title, domain, activeWallet]);
+
+  // Close approval modal
+  const handleApprovalModalClose = useCallback(() => {
+    setShowApprovalModal(false);
+    setApprovalRequest(null);
+  }, []);
 
   // Cache busting: increment revision when same URL is launched again with new timestamp
   const [revision, setRevision] = useState(0);
@@ -67,15 +361,6 @@ export default function BrowserModal({ visible, url, onClose, isQNative = false,
     }
   }, [visible, url]);
 
-  // Extract domain from URL for MiniApp bridge
-  const domain = useMemo(() => {
-    try {
-      return new URL(url || '').hostname;
-    } catch {
-      return url || '';
-    }
-  }, [url]);
-
   // Handle mini app close
   const handleMiniAppClose = useCallback(() => {
     onClose();
@@ -91,7 +376,163 @@ export default function BrowserModal({ visible, url, onClose, isQNative = false,
     setShowFarcasterPrompt(true);
   }, []);
 
+  // Handle compose cast request from mini app
+  const handleComposeCast = useCallback((options: ComposeCastOptions): Promise<ComposeCastResult> => {
+    // Always show local compose overlay (works within the same modal context)
+    return new Promise((resolve) => {
+      // Store the resolver to call when compose is complete
+      composeResolverRef.current = resolve;
+
+      // Set initial compose state from options
+      setComposeText(options.text ?? '');
+      setComposeEmbeds(options.embeds ?? []);
+      setComposeParentHash(options.parent?.hash);
+      setComposeChannelKey(options.channelKey);
+      setComposeError(null);
+      setComposePosting(false);
+
+      // Show compose overlay
+      setComposeVisible(true);
+    });
+  }, []);
+
+  // Handle compose cancel
+  const handleComposeCancel = useCallback(() => {
+    setComposeVisible(false);
+    setComposeText('');
+    setComposeEmbeds([]);
+    setComposeParentHash(undefined);
+    setComposeChannelKey(undefined);
+    setComposeError(null);
+
+    // Resolve with dismissed result
+    if (composeResolverRef.current) {
+      composeResolverRef.current({ error: { type: 'rejected_by_user', message: 'User cancelled' } });
+      composeResolverRef.current = null;
+    }
+  }, []);
+
+  // Handle compose post
+  const handleComposePost = useCallback(async () => {
+    if (composePosting) return;
+    if (composeText.trim().length === 0 && composeEmbeds.length === 0) return;
+
+    setComposePosting(true);
+    setComposeError(null);
+
+    try {
+      const token = await getFarcasterAuthToken();
+      if (!token) {
+        throw new Error('Not authenticated with Farcaster');
+      }
+
+      // Build embeds array with URLs
+      const embeds = composeEmbeds.map(url => url);
+
+      const result = await postFarcasterCast({
+        token,
+        text: composeText.trim(),
+        embeds,
+        parentHash: composeParentHash,
+      });
+
+      // Close compose modal
+      setComposeVisible(false);
+      setComposeText('');
+      setComposeEmbeds([]);
+      setComposeParentHash(undefined);
+      setComposeChannelKey(undefined);
+
+      // Resolve with success
+      if (composeResolverRef.current) {
+        composeResolverRef.current({ hash: result.hash });
+        composeResolverRef.current = null;
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to post';
+      setComposeError(message);
+
+      // Don't resolve here - let user retry or cancel
+    } finally {
+      setComposePosting(false);
+    }
+  }, [composeText, composeEmbeds, composeParentHash, composeChannelKey, composePosting]);
+
+  // Handle viewProfile from mini app SDK
+  const handleViewProfile = useCallback((opts: { fid?: number; username?: string }) => {
+    if (opts.fid) {
+      setProfileOverlay({ fid: opts.fid });
+    }
+    // TODO: Handle username-only case by looking up FID
+  }, []);
+
+  // Handle viewCast from mini app SDK
+  const handleViewCast = useCallback((opts: { hash: string }) => {
+    // Cast hash format: we need username and hash prefix for ThreadDetailView
+    // For now, we'll use a placeholder username and the hash as prefix
+    // The ThreadDetailView will fetch the actual cast data
+    setCastOverlay({ username: '', castHashPrefix: opts.hash });
+  }, []);
+
+  // Handle like toggle in overlays
+  const handleLikeToggle = useCallback((castHash: string, currentlyLiked: boolean, currentCount: number) => {
+    setLikeStates(prev => {
+      const next = new Map(prev);
+      next.set(castHash, { liked: !currentlyLiked, count: currentlyLiked ? currentCount - 1 : currentCount + 1 });
+      return next;
+    });
+    // TODO: Actually call the like/unlike API
+  }, []);
+
+  // Handle follow toggle in overlays
+  const handleFollow = useCallback((fid: number) => {
+    setFollowStates(prev => {
+      const next = new Map(prev);
+      const isFollowing = prev.get(fid) ?? false;
+      next.set(fid, !isFollowing);
+      return next;
+    });
+    // TODO: Actually call the follow/unfollow API
+  }, []);
+
+  // Handle navigation within overlays (profile -> thread, thread -> profile, etc.)
+  const handleOverlayOpenThread = useCallback((username: string, hashPrefix: string) => {
+    setCastOverlay({ username, castHashPrefix: hashPrefix });
+  }, []);
+
+  const handleOverlayOpenProfile = useCallback((fid: number, _username?: string) => {
+    setProfileOverlay({ fid });
+  }, []);
+
+  const handleOverlayOpenMiniApp = useCallback((miniAppUrl: string) => {
+    // For now, just log - could open nested mini app or navigate
+  }, []);
+
+  const handleOverlayOpenChannel = useCallback((channelKey: string) => {
+    // For now, just log - could open channel view
+  }, []);
+
+  // Handle swapToken from mini app SDK
+  const handleSwapToken = useCallback((opts: { sellToken?: string; buyToken?: string; sellAmount?: string; chain?: string }) => {
+    // Parse CAIP-19 token format: eip155:8453/erc20:0x... -> extract chain and contract address
+    if (opts.buyToken) {
+      // Parse format like "eip155:8453/erc20:0x..."
+      const caipMatch = opts.buyToken.match(/eip155:(\d+)\/erc20:(.+)$/);
+      if (caipMatch) {
+        const chainId = parseInt(caipMatch[1], 10);
+        const address = caipMatch[2];
+        setSwapInitialBuyToken(JSON.stringify({ address, chainId }));
+      } else {
+        // Fallback: just an address, assume Base
+        setSwapInitialBuyToken(JSON.stringify({ address: opts.buyToken, chainId: 8453 }));
+      }
+    }
+    setShowSwapModal(true);
+  }, []);
+
   // MiniApp bridge - uses Comlink to expose SDK to mini apps
+  // SECURITY: Only passes walletInfo (address), not private key.
+  // Signing is performed via secure callbacks after user approval.
   const {
     onMessage,
     primaryButton,
@@ -105,9 +546,20 @@ export default function BrowserModal({ visible, url, onClose, isQNative = false,
     webViewRef,
     domain,
     url: currentUrl,
+    visible,
+    walletInfo,
     onReady: handleMiniAppReady,
     onClose: handleMiniAppClose,
     onFarcasterRequired: handleFarcasterRequired,
+    onComposeCast: handleComposeCast,
+    onViewProfile: handleViewProfile,
+    onViewCast: handleViewCast,
+    // SECURE signing callbacks - perform signing after user approval
+    onSendTransaction: handleSendTransaction,
+    onSignTransaction: handleSignTransaction,
+    onSignMessage: handleSignMessage,
+    onSignTypedData: handleSignTypedData,
+    onSwapToken: handleSwapToken,
   });
 
   // Fallback timeout: hide splash after 2 seconds if ready() hasn't been called
@@ -128,8 +580,46 @@ export default function BrowserModal({ visible, url, onClose, isQNative = false,
     emit('primary_button_clicked');
   }, [emit]);
 
+  // JavaScript to inject for console logging
+  const injectedJavaScript = `
+    (function() {
+      function sendToRN(level, args) {
+        try {
+          const message = args.map(arg => {
+            if (typeof arg === 'object') {
+              try {
+                return JSON.stringify(arg);
+              } catch (e) {
+                return String(arg);
+              }
+            }
+            return String(arg);
+          }).join(' ');
+
+          window.ReactNativeWebView.postMessage(JSON.stringify({
+            type: '__CONSOLE__',
+            level: level,
+            message: message
+          }));
+        } catch (e) {}
+      }
+
+      // Also capture uncaught errors
+      window.onerror = function(message, source, lineno, colno, error) {
+        sendToRN('error', ['Uncaught Error:', message, 'at', source + ':' + lineno + ':' + colno]);
+        return false;
+      };
+
+      // Capture unhandled promise rejections
+      window.onunhandledrejection = function(event) {
+        sendToRN('error', ['Unhandled Promise Rejection:', event.reason]);
+      };
+    })();
+    true;
+  `;
+
   // Handle WebView messages (Comlink)
-  const handleWebViewMessage = useCallback((e: any) => {
+  const handleWebViewMessage = useCallback((e: { nativeEvent: { data: string } }) => {
     try {
       const data = JSON.parse(e.nativeEvent.data);
       if (data.type === '__CONSOLE__') {
@@ -143,7 +633,7 @@ export default function BrowserModal({ visible, url, onClose, isQNative = false,
     onMessage(e);
   }, [onMessage]);
 
-  const handleNavigationStateChange = (navState: any) => {
+  const handleNavigationStateChange = (navState: { canGoBack: boolean; canGoForward: boolean; url: string; title?: string; loading?: boolean }) => {
     setCanGoBack(navState.canGoBack);
     setCanGoForward(navState.canGoForward);
     setCurrentUrl(navState.url);
@@ -181,11 +671,18 @@ export default function BrowserModal({ visible, url, onClose, isQNative = false,
         title: title,
       });
     } catch (error) {
-      console.error('Error sharing:', error);
     }
   };
 
-  const handleOpenInBrowser = () => {
+  const handleOpenInBrowser = async () => {
+    try {
+      const canOpen = await Linking.canOpenURL(currentUrl);
+      if (canOpen) {
+        await Linking.openURL(currentUrl);
+      }
+    } catch {
+      // Ignore open failures
+    }
     onClose();
   };
 
@@ -194,7 +691,7 @@ export default function BrowserModal({ visible, url, onClose, isQNative = false,
   const getDomain = (url: string, isQNative: boolean) => {
     try {
       const domain = new URL(url).hostname;
-      return isQNative ? domain.replace('www.', '').replace('swap.cow.fi', 'cowswap.q') : domain.replace('www.', '');
+      return domain.replace('www.', '');
     } catch {
       return url;
     }
@@ -229,6 +726,15 @@ export default function BrowserModal({ visible, url, onClose, isQNative = false,
               </Text>
             )}
           </View>
+          {/* Wallet Indicator - shows which wallet is connected to the mini app */}
+          {activeWallet && (
+            <TouchableOpacity style={styles.walletIndicator} onPress={() => setShowWalletSelector(true)}>
+              <View style={[styles.walletDot, activeType === 'warpcast' && styles.walletDotWarpcast]} />
+              <Text style={styles.walletIndicatorText}>
+                {activeWallet.address.slice(0, 4)}...{activeWallet.address.slice(-3)}
+              </Text>
+            </TouchableOpacity>
+          )}
           <TouchableOpacity onPress={onClose} style={styles.closeButton}>
             <IconSymbol name="xmark.circle.fill" size={24} color={theme.colors.textMuted} />
           </TouchableOpacity>
@@ -244,17 +750,33 @@ export default function BrowserModal({ visible, url, onClose, isQNative = false,
 
       {/* WebView - only render when bridge is ready to ensure SDK is exposed before page loads */}
       <View style={styles.webViewContainer}>
-        {bridgeReady && (
+        {bridgeReady && sourceReady && (
           <WebView
             key={revision}
             ref={webViewRef}
             source={{ uri: currentUrl }}
             onNavigationStateChange={handleNavigationStateChange}
             onMessage={handleWebViewMessage}
+            injectedJavaScript={injectedJavaScript}
             startInLoadingState
             renderLoading={() => (
               <View style={styles.loadingContainer}>
                 <ActivityIndicator size="large" color={theme.colors.primary} />
+              </View>
+            )}
+            renderError={(errorDomain, errorCode, errorDesc) => (
+              <View style={styles.errorContainer}>
+                <IconSymbol name="exclamationmark.triangle.fill" size={48} color={theme.colors.warning} />
+                <Text style={styles.errorTitle}>Failed to Load</Text>
+                <Text style={styles.errorDescription}>
+                  {errorDesc || `Error ${errorCode}`}
+                </Text>
+                <TouchableOpacity
+                  style={styles.retryButton}
+                  onPress={handleRefresh}
+                >
+                  <Text style={styles.retryButtonText}>Retry</Text>
+                </TouchableOpacity>
               </View>
             )}
             style={styles.webView}
@@ -266,6 +788,8 @@ export default function BrowserModal({ visible, url, onClose, isQNative = false,
             javaScriptEnabled
             domStorageEnabled
             mixedContentMode="compatibility"
+            // Allow bypassing SSL errors for LAN IPs when enabled
+            ignoreSslErrorForLocalNetwork={allowInsecureLAN && isLanUrl(url)}
             allowsInlineMediaPlayback
             mediaPlaybackRequiresUserAction={false}
             // Performance
@@ -339,6 +863,23 @@ export default function BrowserModal({ visible, url, onClose, isQNative = false,
         <TouchableOpacity onPress={handleRefresh} style={styles.navButton}>
           <IconSymbol name="arrow.clockwise" size={20} color={theme.colors.textMain} />
         </TouchableOpacity>
+{/* 
+        <TouchableOpacity
+          onPress={() => {
+            if (onShowTransactionWarning) {
+              const types: ('simulation-failed' | 'no-entitlements' | 'not-declared' | 'ok')[] =
+                ['simulation-failed', 'no-entitlements', 'not-declared', 'ok'];
+              const currentIndex = types.indexOf(warningType);
+              const nextIndex = (currentIndex + 1) % types.length;
+              const nextType = types[nextIndex];
+              setWarningType(nextType);
+              onShowTransactionWarning(nextType);
+            }
+          }}
+          style={styles.navButton}
+        >
+          <IconSymbol name="exclamationmark.shield.fill" size={20} color={theme.colors.warning} />
+        </TouchableOpacity> */}
 
         <TouchableOpacity onPress={handleShare} style={styles.navButton}>
           <IconSymbol name="square.and.arrow.up" size={20} color={theme.colors.textMain} />
@@ -405,11 +946,198 @@ export default function BrowserModal({ visible, url, onClose, isQNative = false,
           </View>
         </TouchableOpacity>
       </Modal>
+
+      {/* Compose Cast Overlay - renders inside BaseModal to avoid modal stacking issues */}
+      {composeVisible && (
+        <KeyboardAvoidingView
+          style={styles.composeOverlay}
+          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+          pointerEvents="box-none"
+        >
+          <Pressable style={styles.composeBackdrop} onPress={handleComposeCancel} />
+          <View style={styles.composeModal}>
+            {/* Header */}
+            <View style={styles.composeHeader}>
+              <TouchableOpacity onPress={handleComposeCancel} disabled={composePosting}>
+                <Text style={[styles.composeCancel, composePosting && { opacity: 0.5 }]}>Cancel</Text>
+              </TouchableOpacity>
+              <Text style={styles.composeTitle}>
+                {composeParentHash ? 'Reply' : 'New Cast'}
+              </Text>
+              <TouchableOpacity
+                onPress={handleComposePost}
+                disabled={composePosting || (composeText.trim().length === 0 && composeEmbeds.length === 0) || composeText.length > MAX_CAST_LENGTH}
+                style={[
+                  styles.composePostButton,
+                  (composePosting || (composeText.trim().length === 0 && composeEmbeds.length === 0) || composeText.length > MAX_CAST_LENGTH) && styles.composePostButtonDisabled
+                ]}
+              >
+                {composePosting ? (
+                  <ActivityIndicator color="#fff" size="small" />
+                ) : (
+                  <Text style={[
+                    styles.composePostText,
+                    (composeText.trim().length === 0 && composeEmbeds.length === 0) && styles.composePostTextDisabled
+                  ]}>Post</Text>
+                )}
+              </TouchableOpacity>
+            </View>
+
+            {/* Text Input */}
+            <TextInput
+              multiline
+              autoFocus
+              placeholder={composeParentHash ? "Write your reply..." : "What's happening?"}
+              placeholderTextColor={theme.colors.textMuted}
+              style={styles.composeInput}
+              value={composeText}
+              editable={!composePosting}
+              onChangeText={setComposeText}
+              maxLength={MAX_CAST_LENGTH + 50}
+            />
+
+            {/* Embeds Preview */}
+            {composeEmbeds.length > 0 && (
+              <ScrollView horizontal style={styles.embedsContainer} showsHorizontalScrollIndicator={false}>
+                {composeEmbeds.map((embedUrl, index) => (
+                  <View key={index} style={styles.embedPreview}>
+                    <IconSymbol name="link" size={14} color={theme.colors.textMuted} />
+                    <Text style={styles.embedText} numberOfLines={1}>{embedUrl}</Text>
+                  </View>
+                ))}
+              </ScrollView>
+            )}
+
+            {/* Channel indicator */}
+            {composeChannelKey && (
+              <View style={styles.channelIndicator}>
+                <IconSymbol name="number" size={14} color={theme.colors.accent} />
+                <Text style={styles.channelText}>{composeChannelKey}</Text>
+              </View>
+            )}
+
+            {/* Footer */}
+            <View style={styles.composeFooter}>
+              <Text style={[
+                styles.composeCharCount,
+                composeText.length > MAX_CAST_LENGTH && { color: theme.colors.danger }
+              ]}>
+                {composeText.length}/{MAX_CAST_LENGTH}
+              </Text>
+            </View>
+
+            {/* Error */}
+            {composeError && (
+              <Text style={styles.composeError}>{composeError}</Text>
+            )}
+          </View>
+        </KeyboardAvoidingView>
+      )}
+
+      {/* Profile Overlay - shows when viewProfile is called from mini app */}
+      {profileOverlay && (
+        <View style={styles.overlayContainer}>
+          <ProfileView
+            fid={profileOverlay.fid}
+            token={farcasterToken}
+            theme={theme}
+            onClose={() => setProfileOverlay(null)}
+            onOpenThread={handleOverlayOpenThread}
+            onOpenMiniApp={handleOverlayOpenMiniApp}
+            onOpenProfile={handleOverlayOpenProfile}
+            onOpenChannel={handleOverlayOpenChannel}
+            likeStates={likeStates}
+            onLikeToggle={handleLikeToggle}
+          />
+        </View>
+      )}
+
+      {/* Cast/Thread Overlay - shows when viewCast is called from mini app */}
+      {castOverlay && (
+        <View style={styles.overlayContainer}>
+          <ThreadDetailView
+            username={castOverlay.username}
+            castHashPrefix={castOverlay.castHashPrefix}
+            token={farcasterToken}
+            theme={theme}
+            onClose={() => setCastOverlay(null)}
+            onOpenMiniApp={handleOverlayOpenMiniApp}
+            onOpenProfile={handleOverlayOpenProfile}
+            onOpenChannel={handleOverlayOpenChannel}
+            likeStates={likeStates}
+            onLikeToggle={handleLikeToggle}
+            followStates={followStates}
+            onFollow={handleFollow}
+          />
+        </View>
+      )}
+
+      {/* Wallet Selector Sheet */}
+      {showWalletSelector && (
+        <TouchableOpacity
+          style={styles.walletSelectorBackdrop}
+          activeOpacity={1}
+          onPress={() => setShowWalletSelector(false)}
+        >
+          <View style={styles.walletSelectorSheet}>
+            <View style={styles.walletSelectorHandle} />
+            <Text style={styles.walletSelectorTitle}>Select Wallet</Text>
+            <Text style={styles.walletSelectorSubtitle}>Choose which wallet to use with this app</Text>
+
+            {availableWallets.map((wallet) => {
+              const isActive = wallet.type === activeType;
+              return (
+                <TouchableOpacity
+                  key={wallet.type}
+                  style={[styles.walletOption, isActive && styles.walletOptionActive]}
+                  onPress={() => {
+                    if (!isActive) {
+                      switchWallet(wallet.type);
+                    }
+                    setShowWalletSelector(false);
+                  }}
+                  disabled={isSwitching}
+                >
+                  <View style={[styles.walletOptionDot, wallet.type === 'warpcast' && styles.walletDotWarpcast]} />
+                  <View style={styles.walletOptionInfo}>
+                    <Text style={styles.walletOptionName}>
+                      {wallet.type === 'warpcast' ? 'Warpcast Wallet' : 'Quorum Wallet'}
+                    </Text>
+                    <Text style={styles.walletOptionAddress}>
+                      {wallet.address.slice(0, 8)}...{wallet.address.slice(-6)}
+                    </Text>
+                  </View>
+                  {isActive && (
+                    <IconSymbol name="checkmark.circle.fill" size={20} color={theme.colors.primary} />
+                  )}
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+        </TouchableOpacity>
+      )}
+
+      {/* Mini App Approval Modal - for wallet transaction/signing approvals */}
+      <MiniAppApprovalModal
+        visible={showApprovalModal}
+        request={approvalRequest}
+        onClose={handleApprovalModalClose}
+      />
+
+      {/* Swap Modal - opened by mini apps requesting token swap */}
+      <SwapModal
+        visible={showSwapModal}
+        onClose={() => {
+          setShowSwapModal(false);
+          setSwapInitialBuyToken(undefined);
+        }}
+        initialBuyToken={swapInitialBuyToken}
+      />
     </BaseModal>
   );
 }
 
-const createStyles = (theme: any, isDark: boolean, insets: any, isQNative: boolean) =>
+const createStyles = (theme: AppTheme, isDark: boolean, insets: EdgeInsets, isQNative: boolean) =>
   StyleSheet.create({
     handleQNative: {
       backgroundColor: theme.colors.info,
@@ -478,6 +1206,39 @@ const createStyles = (theme: any, isDark: boolean, insets: any, isQNative: boole
       alignItems: 'center',
       justifyContent: 'center',
       backgroundColor: theme.colors.background,
+    },
+    errorContainer: {
+      flex: 1,
+      alignItems: 'center',
+      justifyContent: 'center',
+      backgroundColor: theme.colors.background,
+      padding: 24,
+    },
+    errorTitle: {
+      fontSize: 18,
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
+      color: theme.colors.textMain,
+      marginTop: 16,
+      marginBottom: 8,
+    },
+    errorDescription: {
+      fontSize: 14,
+      color: theme.colors.textMuted,
+      textAlign: 'center',
+      lineHeight: 20,
+      marginBottom: 24,
+    },
+    retryButton: {
+      marginTop: 12,
+      paddingHorizontal: 20,
+      paddingVertical: 12,
+    },
+    retryButtonText: {
+      color: theme.colors.primary,
+      fontSize: 14,
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
     },
     splashOverlay: {
       position: 'absolute',
@@ -577,5 +1338,218 @@ const createStyles = (theme: any, isDark: boolean, insets: any, isQNative: boole
       fontSize: 14,
       color: theme.colors.textMuted,
       textDecorationLine: 'underline',
+    },
+    // Compose modal styles
+    composeOverlay: {
+      ...StyleSheet.absoluteFillObject,
+      zIndex: 1000,
+      justifyContent: 'flex-end',
+    },
+    composeBackdrop: {
+      ...StyleSheet.absoluteFillObject,
+      backgroundColor: 'rgba(0,0,0,0.5)',
+    },
+    composeModal: {
+      backgroundColor: theme.colors.surface1,
+      borderTopLeftRadius: 20,
+      borderTopRightRadius: 20,
+      paddingHorizontal: 20,
+      paddingBottom: insets.bottom + 20,
+      minHeight: 220,
+    },
+    composeHeader: {
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      paddingVertical: 16,
+    },
+    composeCancel: {
+      color: theme.colors.textMuted,
+      fontSize: 16,
+      fontFamily: theme.fonts.regular.fontFamily,
+    },
+    composeTitle: {
+      color: theme.colors.textMain,
+      fontSize: 16,
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
+    },
+    composePostButton: {
+      backgroundColor: theme.colors.accent,
+      paddingHorizontal: 20,
+      paddingVertical: 8,
+      borderRadius: 999,
+      minWidth: 60,
+      alignItems: 'center',
+    },
+    composePostButtonDisabled: {
+      backgroundColor: theme.colors.surface4,
+    },
+    composePostText: {
+      color: '#fff',
+      fontSize: 15,
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
+    },
+    composePostTextDisabled: {
+      color: theme.colors.textMuted,
+    },
+    composeInput: {
+      color: theme.colors.textMain,
+      fontSize: 18,
+      fontFamily: theme.fonts.regular.fontFamily,
+      lineHeight: 24,
+      minHeight: 80,
+      textAlignVertical: 'top',
+    },
+    embedsContainer: {
+      marginTop: 12,
+      marginBottom: 8,
+    },
+    embedPreview: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      backgroundColor: theme.colors.surface3,
+      borderRadius: 8,
+      paddingHorizontal: 10,
+      paddingVertical: 6,
+      marginRight: 8,
+      gap: 6,
+      maxWidth: 200,
+    },
+    embedText: {
+      color: theme.colors.textMuted,
+      fontSize: 12,
+      flex: 1,
+    },
+    channelIndicator: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 4,
+      marginTop: 8,
+    },
+    channelText: {
+      color: theme.colors.accent,
+      fontSize: 14,
+      fontFamily: theme.fonts.medium.fontFamily,
+    },
+    composeFooter: {
+      flexDirection: 'row',
+      justifyContent: 'flex-end',
+      alignItems: 'center',
+      paddingTop: 12,
+      borderTopWidth: 1,
+      borderTopColor: theme.colors.surface3,
+      marginTop: 12,
+    },
+    composeCharCount: {
+      color: theme.colors.textMuted,
+      fontSize: 13,
+    },
+    composeError: {
+      color: theme.colors.danger,
+      fontSize: 13,
+      marginTop: 8,
+    },
+    // Profile/Cast overlay styles
+    overlayContainer: {
+      ...StyleSheet.absoluteFillObject,
+      zIndex: 1001,
+      backgroundColor: theme.colors.background,
+    },
+    // Wallet indicator in header
+    walletIndicator: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      backgroundColor: theme.colors.surface3,
+      borderRadius: 8,
+      paddingHorizontal: 8,
+      paddingVertical: 4,
+      marginLeft: 8,
+      gap: 6,
+    },
+    walletDot: {
+      width: 8,
+      height: 8,
+      borderRadius: 4,
+      backgroundColor: theme.colors.primary,
+    },
+    walletDotWarpcast: {
+      backgroundColor: '#8B5CF6', // Purple for Warpcast
+    },
+    walletIndicatorText: {
+      fontSize: 11,
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
+      color: theme.colors.textMain,
+    },
+    // Wallet selector sheet
+    walletSelectorBackdrop: {
+      ...StyleSheet.absoluteFillObject,
+      backgroundColor: 'rgba(0,0,0,0.5)',
+      justifyContent: 'flex-end',
+      zIndex: 1002,
+    },
+    walletSelectorSheet: {
+      backgroundColor: theme.colors.surface1,
+      borderTopLeftRadius: 20,
+      borderTopRightRadius: 20,
+      padding: 20,
+      paddingBottom: insets.bottom + 20,
+    },
+    walletSelectorHandle: {
+      width: 36,
+      height: 4,
+      backgroundColor: theme.colors.surface4,
+      borderRadius: 2,
+      alignSelf: 'center',
+      marginBottom: 16,
+    },
+    walletSelectorTitle: {
+      fontSize: 18,
+      fontFamily: theme.fonts.bold.fontFamily,
+      fontWeight: theme.fonts.bold.fontWeight,
+      color: theme.colors.textMain,
+      textAlign: 'center',
+      marginBottom: 4,
+    },
+    walletSelectorSubtitle: {
+      fontSize: 14,
+      color: theme.colors.textMuted,
+      textAlign: 'center',
+      marginBottom: 20,
+    },
+    walletOption: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      backgroundColor: theme.colors.surface2,
+      borderRadius: 12,
+      padding: 16,
+      marginBottom: 12,
+      gap: 12,
+    },
+    walletOptionActive: {
+      borderWidth: 1,
+      borderColor: theme.colors.primary,
+    },
+    walletOptionDot: {
+      width: 12,
+      height: 12,
+      borderRadius: 6,
+      backgroundColor: theme.colors.primary,
+    },
+    walletOptionInfo: {
+      flex: 1,
+    },
+    walletOptionName: {
+      fontSize: 15,
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
+      color: theme.colors.textMain,
+    },
+    walletOptionAddress: {
+      fontSize: 12,
+      color: theme.colors.textMuted,
+      marginTop: 2,
     },
   });

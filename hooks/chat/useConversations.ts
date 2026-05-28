@@ -4,10 +4,24 @@
 
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query';
 import { useStorageAdapter } from '@/context/StorageContext';
-import { queryKeys } from '@quilibrium/quorum-shared';
+import { queryKeys, Conversation as BaseConversation, logger } from '@quilibrium/quorum-shared';
 
-// Re-export types from shared (they come from storage adapter)
-export type { Conversation } from '@quilibrium/quorum-shared';
+const log = logger.scope('[Conversations]');
+
+// Extended Conversation type with mobile-specific fields
+export type Conversation = BaseConversation & {
+  // Message preview fields
+  lastMessagePreview?: string;
+  lastMessageSenderName?: string;
+  // Source indicator (farcaster vs quorum)
+  source?: 'quorum' | 'farcaster';
+  // Farcaster-specific fields
+  farcasterConversationId?: string;
+  farcasterFid?: number;
+  farcasterUsername?: string;
+  farcasterParticipantFids?: number[];
+  unreadCount?: number;
+};
 
 export interface ConversationWithPreview {
   conversationId: string;
@@ -28,11 +42,13 @@ export function useConversations(options?: { type?: 'direct' | 'group'; enabled?
   return useInfiniteQuery({
     queryKey: queryKeys.conversations.all(type),
     queryFn: async ({ pageParam }) => {
+      log.log('Fetching conversations', { type, pageParam });
       const result = await storage.getConversations({
         type,
         cursor: pageParam,
         limit: 50,
       });
+      log.log('Fetched conversations', { type, count: result.conversations?.length ?? 0 });
       return result;
     },
     initialPageParam: undefined as number | undefined,
@@ -52,5 +68,6 @@ export function useConversation(conversationId: string | undefined, options?: { 
       return storage.getConversation(conversationId);
     },
     enabled: (options?.enabled ?? true) && !!conversationId,
+    staleTime: 30000, // 30 seconds - match list query
   });
 }

@@ -1,26 +1,28 @@
-import React, { useState } from 'react';
+import type { AppTheme } from '@/theme';
+import React, { useMemo, useState } from 'react';
 import {
   ActivityIndicator,
-  FlatList,
-  Image,
   Pressable,
+  StyleSheet,
   Text,
   TouchableOpacity,
   View,
 } from 'react-native';
+import { Image } from 'expo-image';
+import { FlashList } from '@shopify/flash-list';
+import { CachedAvatar } from '@/components/ui/CachedAvatar';
 import { IconSymbol } from '@/components/ui/IconSymbol';
 import { useFarcasterProfile, type ProfileCast } from '@/hooks/useFarcasterProfile';
 import type { EmbeddedCast } from '@/hooks/useFarcasterFeed';
 import { ImageViewer, AutoHeightImage, ImageCarousel, VideoPlayer } from '../media';
-import { CastText, LinkPreview, QuoteCast, FrameEmbed } from '../content';
+import { CastText, LinkPreview, QuoteCast, FrameEmbed, LikeIcon, getLikeIconType } from '../content';
+import { QuorumIdentityBadge } from '../content/QuorumIdentityBadge';
 import { SCREEN_WIDTH, SCREEN_HEIGHT, formatTimestamp, lookupUserByUsername } from '../utils';
-
-const AVATAR_FALLBACK = require('@/assets/images/quorum-symbol-bg-blue.png');
 
 interface ProfileViewProps {
   fid: number;
   token?: string;
-  theme: any;
+  theme: AppTheme;
   onClose: () => void;
   onOpenThread: (username: string, hashPrefix: string) => void;
   onOpenMiniApp: (url: string) => void;
@@ -54,7 +56,9 @@ export function ProfileView({
     fetchNextPage,
   } = useFarcasterProfile({ fid, token });
 
-  const [viewerImage, setViewerImage] = useState<string | null>(null);
+  const [viewerState, setViewerState] = useState<{ images: string[]; index: number } | null>(null);
+
+  const styles = useMemo(() => createStyles(theme), [theme]);
 
   const handleMentionPress = async (username: string) => {
     const userFid = await lookupUserByUsername(username);
@@ -67,95 +71,90 @@ export function ProfileView({
     if (!author) return null;
 
     return (
-      <View style={{ backgroundColor: theme.colors.background }}>
+      <View style={styles.headerBackground}>
         {/* Banner */}
         <TouchableOpacity
           activeOpacity={author.profile?.bannerImageUrl ? 0.8 : 1}
-          onPress={() => author.profile?.bannerImageUrl && setViewerImage(author.profile.bannerImageUrl)}
-          style={{ width: SCREEN_WIDTH, height: 120 }}
+          onPress={() => author.profile?.bannerImageUrl && setViewerState({ images: [author.profile.bannerImageUrl], index: 0 })}
+          style={staticStyles.banner}
         >
           {author.profile?.bannerImageUrl ? (
             <Image
               source={{ uri: author.profile.bannerImageUrl }}
-              style={{ width: '100%', height: '100%', backgroundColor: theme.colors.surface3 }}
-              resizeMode="cover"
+              style={styles.bannerImage}
+              contentFit="cover"
+              cachePolicy="disk"
             />
           ) : (
-            <View style={{ width: '100%', height: '100%', backgroundColor: theme.colors.accent, opacity: 0.3 }} />
+            <View style={styles.bannerPlaceholder} />
           )}
         </TouchableOpacity>
 
         {/* Avatar */}
-        <View style={{ paddingHorizontal: 16, marginTop: -40 }}>
-          <View style={{ flexDirection: 'row', alignItems: 'flex-end', justifyContent: 'space-between' }}>
+        <View style={staticStyles.avatarSection}>
+          <View style={staticStyles.avatarRow}>
             <TouchableOpacity
               activeOpacity={0.8}
-              onPress={() => author.pfp?.url && setViewerImage(author.pfp.url)}
+              onPress={() => author.pfp?.url && setViewerState({ images: [author.pfp.url], index: 0 })}
             >
-              <Image
-                source={author.pfp?.url ? { uri: author.pfp.url } : AVATAR_FALLBACK}
-                style={{
-                  width: 80,
-                  height: 80,
-                  borderRadius: 40,
-                  borderWidth: 4,
-                  borderColor: theme.colors.background,
-                  backgroundColor: theme.colors.surface3,
-                }}
+              <CachedAvatar
+                source={author.pfp?.url ? { uri: author.pfp.url } : null}
+                style={styles.avatar}
               />
             </TouchableOpacity>
           </View>
 
           {/* Name and username */}
-          <View style={{ marginTop: 12 }}>
-            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-              <Text style={{ color: theme.colors.textStrong, fontSize: 22, fontWeight: '700' }}>
+          <View style={staticStyles.nameSection}>
+            <View style={staticStyles.nameRow}>
+              <Text style={styles.displayName}>
                 {author.displayName}
               </Text>
               {author.profile?.accountLevel === 'pro' && (
                 <IconSymbol name="star.fill" color={theme.colors.warning} size={16} />
               )}
             </View>
-            <Text style={{ color: theme.colors.textMuted, fontSize: 15, marginTop: 2 }}>
+            <Text style={styles.username}>
               @{author.username}
             </Text>
+            <QuorumIdentityBadge fid={author.fid} theme={theme} />
           </View>
 
           {/* Bio */}
           {author.profile?.bio?.text && (
-            <Text style={{ color: theme.colors.textMain, fontSize: 15, lineHeight: 21, marginTop: 12 }}>
+            <Text style={styles.bio}>
               {author.profile.bio.text}
             </Text>
           )}
 
           {/* Location */}
           {author.profile?.location?.description && (
-            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4, marginTop: 8 }}>
+            <View style={staticStyles.locationRow}>
               <IconSymbol name="mappin" color={theme.colors.textMuted} size={14} />
-              <Text style={{ color: theme.colors.textMuted, fontSize: 13 }}>
+              <Text style={styles.locationText}>
                 {author.profile.location.description}
               </Text>
             </View>
           )}
 
           {/* Follower/Following counts */}
-          <View style={{ flexDirection: 'row', gap: 16, marginTop: 12 }}>
-            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
-              <Text style={{ color: theme.colors.textStrong, fontWeight: '600', fontSize: 15 }}>
+          <View style={staticStyles.statsRow}>
+            <View style={staticStyles.statItem}>
+              <Text style={styles.statCount}>
                 {(author.followingCount ?? 0).toLocaleString()}
               </Text>
-              <Text style={{ color: theme.colors.textMuted, fontSize: 14 }}>Following</Text>
+              <Text style={styles.statLabel}>Following</Text>
             </View>
-            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
-              <Text style={{ color: theme.colors.textStrong, fontWeight: '600', fontSize: 15 }}>
+            <View style={staticStyles.statItem}>
+              <Text style={styles.statCount}>
                 {(author.followerCount ?? 0).toLocaleString()}
               </Text>
-              <Text style={{ color: theme.colors.textMuted, fontSize: 14 }}>Followers</Text>
+              <Text style={styles.statLabel}>Followers</Text>
             </View>
           </View>
         </View>
 
-        <View style={{ height: 1, backgroundColor: theme.colors.surface3, marginTop: 16 }} />
+        <View style={styles.headerDivider} />
       </View>
     );
   };
@@ -195,45 +194,33 @@ export function ProfileView({
     return (
       <View
         key={cast.hash}
-        style={{
-          borderBottomWidth: 1,
-          borderBottomColor: theme.colors.surface3,
-          paddingTop: 12,
-          paddingBottom: 14,
-          paddingHorizontal: 12,
-          gap: 10,
-        }}
+        style={styles.castContainer}
       >
         <Pressable onPress={navigateToThread}>
-          <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+          <View style={staticStyles.castHeaderRow}>
             <TouchableOpacity onPress={() => onOpenProfile(cast.author.fid, cast.author.username)}>
-              <Image
-                source={cast.author.pfp?.url ? { uri: cast.author.pfp.url } : AVATAR_FALLBACK}
-                style={{
-                  width: 44,
-                  height: 44,
-                  borderRadius: 22,
-                  marginRight: 12,
-                  backgroundColor: theme.colors.surface3,
-                }}
+              <CachedAvatar
+                source={cast.author.pfp?.url ? { uri: cast.author.pfp.url } : null}
+                style={styles.castAvatar}
               />
             </TouchableOpacity>
-            <View style={{ flex: 1 }}>
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+            <View style={staticStyles.flex1}>
+              <View style={staticStyles.nameRow}>
                 <TouchableOpacity onPress={() => onOpenProfile(cast.author.fid, cast.author.username)}>
-                  <Text style={{ color: theme.colors.textStrong, fontWeight: '600', fontSize: 15 }}>
+                  <Text style={styles.castAuthorName}>
                     {cast.author.displayName}
                   </Text>
                 </TouchableOpacity>
                 {cast.channel?.key && (
                   <TouchableOpacity onPress={() => onOpenChannel(cast.channel!.key!)}>
-                    <Text style={{ color: theme.colors.accent, fontSize: 13 }}>/{cast.channel.key}</Text>
+                    <Text style={styles.channelLink}>/{cast.channel.key}</Text>
                   </TouchableOpacity>
                 )}
               </View>
-              <Text style={{ color: theme.colors.textMuted, fontSize: 13, marginTop: 2 }}>
+              <Text style={styles.castMeta}>
                 @{cast.author.username} • {formatTimestamp(cast.timestamp)}
               </Text>
+              <QuorumIdentityBadge fid={cast.author.fid} theme={theme} compact />
             </View>
           </View>
         </Pressable>
@@ -242,7 +229,7 @@ export function ProfileView({
           {cast.text.length > 0 && (
             <CastText
               text={cast.text}
-              style={{ color: theme.colors.textMain, fontSize: 15, lineHeight: 20 }}
+              style={styles.castText}
               theme={theme}
               onMentionPress={handleMentionPress}
               onChannelPress={onOpenChannel}
@@ -251,27 +238,27 @@ export function ProfileView({
         </Pressable>
 
         {hasImages && (
-          <View style={{ marginHorizontal: -12 }}>
+          <View style={staticStyles.mediaContainer}>
             {imageUrls.length === 1 ? (
               <AutoHeightImage
                 uri={imageUrls[0]}
                 maxHeight={SCREEN_HEIGHT * 0.8}
-                style={{ backgroundColor: theme.colors.surface3 }}
-                onPress={() => setViewerImage(imageUrls[0])}
+                style={styles.imagePlaceholder}
+                onPress={() => setViewerState({ images: imageUrls, index: 0 })}
               />
             ) : (
               <ImageCarousel
                 urls={imageUrls}
                 maxHeight={SCREEN_HEIGHT * 0.8}
                 theme={theme}
-                onImagePress={setViewerImage}
+                onImagePress={(_, index) => setViewerState({ images: imageUrls, index })}
               />
             )}
           </View>
         )}
 
         {hasVideos && (
-          <View style={{ marginHorizontal: -12 }}>
+          <View style={staticStyles.mediaContainer}>
             {videos.map((video, index) => (
               <VideoPlayer
                 key={index}
@@ -287,7 +274,7 @@ export function ProfileView({
         )}
 
         {frameEmbeds.length > 0 && (
-          <View style={{ marginHorizontal: -12, gap: 8 }}>
+          <View style={staticStyles.frameEmbedsContainer}>
             {frameEmbeds.map((frame, index) => (
               <FrameEmbed
                 key={index}
@@ -302,7 +289,7 @@ export function ProfileView({
         )}
 
         {urlPreviews.length > 0 && (
-          <View style={{ gap: 8 }}>
+          <View style={staticStyles.embedGap}>
             {urlPreviews.map((urlEmbed, index) => {
               const linkUrl = urlEmbed.openGraph?.url || urlEmbed.openGraph?.sourceUrl;
               return (
@@ -323,7 +310,7 @@ export function ProfileView({
         )}
 
         {quoteCasts.length > 0 && (
-          <View style={{ gap: 8 }}>
+          <View style={staticStyles.embedGap}>
             {quoteCasts.map((embeddedCast, index) => (
               <QuoteCast
                 key={index}
@@ -335,37 +322,39 @@ export function ProfileView({
           </View>
         )}
 
-        <View style={{ flexDirection: 'row', gap: 16, marginTop: 4 }}>
+        <View style={staticStyles.actionsRow}>
           <TouchableOpacity
-            style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}
+            style={staticStyles.actionButton}
             onPress={() => onLikeToggle(cast.hash, isLiked, likeCount)}
           >
-            <IconSymbol
-              name={isLiked ? 'heart.fill' : 'heart'}
-              color={isLiked ? theme.colors.danger : theme.colors.textMuted}
+            <LikeIcon
+              type={getLikeIconType(cast.text)}
+              isLiked={isLiked}
+              color={theme.colors.textMuted}
+              activeColor={theme.colors.danger}
               size={16}
             />
             {likeCount > 0 && (
-              <Text style={{ color: theme.colors.textMuted, fontSize: 13 }}>{likeCount}</Text>
+              <Text style={styles.actionCount}>{likeCount}</Text>
             )}
           </TouchableOpacity>
           <TouchableOpacity
-            style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}
+            style={staticStyles.actionButton}
             onPress={navigateToThread}
           >
             <IconSymbol name="bubble.left" color={theme.colors.textMuted} size={16} />
             {(cast.replies?.count ?? 0) > 0 && (
-              <Text style={{ color: theme.colors.textMuted, fontSize: 13 }}>{cast.replies?.count}</Text>
+              <Text style={styles.actionCount}>{cast.replies?.count}</Text>
             )}
           </TouchableOpacity>
-          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+          <View style={staticStyles.actionButton}>
             <IconSymbol
               name={cast.viewerContext?.recast ? 'arrowshape.turn.up.right.fill' : 'arrowshape.turn.up.right'}
               color={cast.viewerContext?.recast ? theme.colors.success : theme.colors.textMuted}
               size={16}
             />
             {(cast.recasts?.count ?? 0) > 0 && (
-              <Text style={{ color: theme.colors.textMuted, fontSize: 13 }}>{cast.recasts?.count}</Text>
+              <Text style={styles.actionCount}>{cast.recasts?.count}</Text>
             )}
           </View>
         </View>
@@ -374,20 +363,20 @@ export function ProfileView({
   };
 
   return (
-    <View style={{ flex: 1, backgroundColor: theme.colors.background }}>
+    <View style={styles.container}>
       {isLoading && casts.length === 0 && (
-        <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
+        <View style={staticStyles.centeredLoader}>
           <ActivityIndicator color={theme.colors.accent} />
         </View>
       )}
 
       {error && (
-        <View style={{ padding: 20 }}>
-          <Text style={{ color: theme.colors.danger }}>{error}</Text>
+        <View style={staticStyles.errorContainer}>
+          <Text style={styles.errorText}>{error}</Text>
         </View>
       )}
 
-      <FlatList
+      <FlashList
         data={casts}
         keyExtractor={(item) => item.hash}
         ListHeaderComponent={renderProfileHeader}
@@ -402,7 +391,7 @@ export function ProfileView({
         onEndReachedThreshold={0.5}
         ListFooterComponent={
           isFetchingNextPage ? (
-            <View style={{ paddingVertical: 20, alignItems: 'center' }}>
+            <View style={staticStyles.footerLoader}>
               <ActivityIndicator color={theme.colors.accent} />
             </View>
           ) : null
@@ -412,26 +401,216 @@ export function ProfileView({
       {/* Back button */}
       <TouchableOpacity
         onPress={onClose}
-        style={{
-          position: 'absolute',
-          top: 12,
-          left: 12,
-          backgroundColor: 'rgba(0,0,0,0.5)',
-          borderRadius: 20,
-          padding: 8,
-          zIndex: 10,
-        }}
+        style={staticStyles.backButton}
       >
         <IconSymbol name="chevron.left" color="#fff" size={20} />
       </TouchableOpacity>
 
       <ImageViewer
-        visible={viewerImage !== null}
-        imageUrl={viewerImage}
-        onClose={() => setViewerImage(null)}
+        visible={viewerState !== null}
+        images={viewerState?.images}
+        initialIndex={viewerState?.index}
+        onClose={() => setViewerState(null)}
       />
     </View>
   );
+}
+
+const staticStyles = StyleSheet.create({
+  banner: {
+    width: SCREEN_WIDTH,
+    height: 120,
+  },
+  avatarSection: {
+    paddingHorizontal: 16,
+    marginTop: -40,
+  },
+  avatarRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    justifyContent: 'space-between',
+  },
+  nameSection: {
+    marginTop: 12,
+  },
+  nameRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  locationRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    marginTop: 8,
+  },
+  statsRow: {
+    flexDirection: 'row',
+    gap: 16,
+    marginTop: 12,
+  },
+  statItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+  },
+  castHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  flex1: {
+    flex: 1,
+  },
+  mediaContainer: {
+    marginHorizontal: -12,
+  },
+  frameEmbedsContainer: {
+    marginHorizontal: -12,
+    gap: 8,
+  },
+  embedGap: {
+    gap: 8,
+  },
+  actionsRow: {
+    flexDirection: 'row',
+    gap: 16,
+    marginTop: 4,
+  },
+  actionButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  centeredLoader: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  errorContainer: {
+    padding: 20,
+  },
+  footerLoader: {
+    paddingVertical: 20,
+    alignItems: 'center',
+  },
+  backButton: {
+    position: 'absolute',
+    top: 12,
+    left: 12,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    borderRadius: 20,
+    padding: 8,
+    zIndex: 10,
+  },
+});
+
+function createStyles(theme: AppTheme) {
+  return StyleSheet.create({
+    container: {
+      flex: 1,
+      backgroundColor: theme.colors.background,
+    },
+    headerBackground: {
+      backgroundColor: theme.colors.background,
+    },
+    bannerImage: {
+      width: '100%',
+      height: '100%',
+      backgroundColor: theme.colors.surface3,
+    },
+    bannerPlaceholder: {
+      width: '100%',
+      height: '100%',
+      backgroundColor: theme.colors.accent,
+      opacity: 0.3,
+    },
+    avatar: {
+      width: 80,
+      height: 80,
+      borderRadius: 40,
+      borderWidth: 4,
+      borderColor: theme.colors.background,
+      backgroundColor: theme.colors.surface3,
+    },
+    displayName: {
+      color: theme.colors.textStrong,
+      fontSize: 22,
+      fontWeight: '700',
+    },
+    username: {
+      color: theme.colors.textMuted,
+      fontSize: 15,
+      marginTop: 2,
+    },
+    bio: {
+      color: theme.colors.textMain,
+      fontSize: 15,
+      lineHeight: 21,
+      marginTop: 12,
+    },
+    locationText: {
+      color: theme.colors.textMuted,
+      fontSize: 13,
+    },
+    statCount: {
+      color: theme.colors.textStrong,
+      fontWeight: '600',
+      fontSize: 15,
+    },
+    statLabel: {
+      color: theme.colors.textMuted,
+      fontSize: 14,
+    },
+    headerDivider: {
+      height: 1,
+      backgroundColor: theme.colors.surface3,
+      marginTop: 16,
+    },
+    castContainer: {
+      borderBottomWidth: 1,
+      borderBottomColor: theme.colors.surface3,
+      paddingTop: 12,
+      paddingBottom: 14,
+      paddingHorizontal: 12,
+      gap: 10,
+    },
+    castAvatar: {
+      width: 44,
+      height: 44,
+      borderRadius: 22,
+      marginRight: 12,
+      backgroundColor: theme.colors.surface3,
+    },
+    castAuthorName: {
+      color: theme.colors.textStrong,
+      fontWeight: '600',
+      fontSize: 15,
+    },
+    channelLink: {
+      color: theme.colors.accent,
+      fontSize: 13,
+    },
+    castMeta: {
+      color: theme.colors.textMuted,
+      fontSize: 13,
+      marginTop: 2,
+    },
+    castText: {
+      color: theme.colors.textMain,
+      fontSize: 15,
+      lineHeight: 20,
+    },
+    imagePlaceholder: {
+      backgroundColor: theme.colors.surface3,
+    },
+    actionCount: {
+      color: theme.colors.textMuted,
+      fontSize: 13,
+    },
+    errorText: {
+      color: theme.colors.danger,
+    },
+  });
 }
 
 export default ProfileView;

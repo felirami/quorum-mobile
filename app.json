@@ -1,8 +1,8 @@
 {
   "expo": {
-    "name": "quorum-mobile",
+    "name": "Quorum",
     "slug": "quorum-mobile",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "quorummobile",
@@ -16,6 +16,11 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.quilibrium.quorum-mobile",
+      "entitlements": {
+        "com.apple.security.application-groups": [
+          "group.com.quilibrium.quorum-mobile.shared"
+        ]
+      },
       "splash": {
         "image": "./assets/images/splash.png",
         "resizeMode": "cover",
@@ -23,38 +28,55 @@
       },
       "infoPlist": {
         "LSApplicationQueriesSchemes": [
-          "farcaster",
           "farcaster"
         ],
-        "NSCameraUsageDescription": "Quorum uses the camera to take profile photos.",
+        "NSCameraUsageDescription": "Quorum uses the camera to take profile photos and video calls.",
+        "NSMicrophoneUsageDescription": "Quorum uses the microphone for voice and video calls.",
         "NSPhotoLibraryUsageDescription": "Quorum uses your photo library to select profile photos.",
+        "NSPhotoLibraryAddUsageDescription": "Quorum saves photos and videos from chats and feeds to your photo library.",
         "UIBackgroundModes": [
           "fetch",
           "processing",
-          "fetch",
-          "processing"
+          "voip",
+          "audio"
+        ],
+        "BGTaskSchedulerPermittedIdentifiers": [
+          "com.expo.modules.backgroundtask.processing"
         ]
       }
     },
     "android": {
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/icon.png",
-        "backgroundColor": "#0A0F1C"
+        "backgroundColor": "#0a0a0b"
       },
       "splash": {
-        "image": "./assets/images/splash.png",
-        "resizeMode": "cover",
-        "backgroundColor": "#0A0F1C"
+        "image": "./assets/images/qlogo.png",
+        "resizeMode": "contain",
+        "backgroundColor": "#ffffff",
+        "dark": {
+          "image": "./assets/images/qlogo.png",
+          "resizeMode": "contain",
+          "backgroundColor": "#0a0a0b"
+        }
       },
       "edgeToEdgeEnabled": true,
+      "windowSoftInputMode": "adjustResize",
+      "statusBar": {
+        "translucent": true
+      },
+      "navigationBar": {
+        "backgroundColor": "#0a0a0b"
+      },
       "package": "com.quilibrium.quorummobile",
       "permissions": [
         "RECEIVE_BOOT_COMPLETED",
         "VIBRATE",
         "WAKE_LOCK",
-        "RECEIVE_BOOT_COMPLETED",
-        "VIBRATE",
-        "WAKE_LOCK"
+        "RECORD_AUDIO",
+        "CAMERA",
+        "MODIFY_AUDIO_SETTINGS",
+        "POST_NOTIFICATIONS"
       ]
     },
     "web": {
@@ -64,7 +86,6 @@
     },
     "plugins": [
       "expo-router",
-      "expo-splash-screen",
       "expo-font",
       "expo-web-browser",
       [
@@ -84,7 +105,7 @@
         "projectId": "5a410554-fd1e-4845-80bb-5f929202f1b2"
       }
     },
-    "runtimeVersion": "1.0.0",
+    "runtimeVersion": "1.0.1",
     "updates": {
       "url": "https://u.expo.dev/5a410554-fd1e-4845-80bb-5f929202f1b2"
     }

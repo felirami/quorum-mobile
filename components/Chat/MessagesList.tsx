@@ -1,43 +1,54 @@
-import React, { useCallback, useState, useRef, useMemo, forwardRef, useImperativeHandle } from 'react';
+import type { AppTheme } from '@/theme';
+import React, { useCallback, useState, useRef, useMemo, forwardRef, useImperativeHandle, useEffect } from 'react';
 import {
-  Dimensions,
   Image,
   Text,
   View,
   StyleSheet,
   ImageSourcePropType,
   ActivityIndicator,
-  RefreshControl,
   TouchableOpacity,
   Pressable,
+  useWindowDimensions,
 } from 'react-native';
-import { FlatList } from 'react-native-gesture-handler';
+import { FlashList, type FlashListRef } from '@shopify/flash-list';
+import Animated, { useSharedValue, useAnimatedStyle, withTiming, withDelay, withSequence } from 'react-native-reanimated';
 import BrowserLink from '@/components/BrowserLink';
+import { haptics } from '@/utils/haptics';
 import { IconSymbol } from '@/components/ui/IconSymbol';
 import { DefaultAvatar } from '@/components/ui/DefaultAvatar';
+import { CachedAvatar } from '@/components/ui/CachedAvatar';
 import { AutoHeightImage } from '@/components/SocialFeed/media/AutoHeightImage';
 import { ImageViewer } from '@/components/SocialFeed/media/ImageViewer';
 import { InviteLinkCard, containsInviteLink, extractInviteLink, stripInviteLink } from './InviteLinkCard';
 import { FarcasterCastCard, containsFarcasterLink, extractFarcasterLink, stripFarcasterLink } from './FarcasterCastCard';
 import { EmojiPicker } from './EmojiPicker';
 import { MessageActionSheet } from './MessageActionSheet';
+import { MentionableText } from './MentionableText';
+import { EditHistoryModal } from './EditHistoryModal';
+import { ReactionDetailsModal } from './ReactionDetailsModal';
+import { SpaceCallBubble } from './SpaceCallBubble';
 import type { DisplayMessage, DisplayReaction } from './types';
-import type { Emoji, Sticker } from '@quilibrium/quorum-shared';
-
-const { width: SCREEN_WIDTH } = Dimensions.get('window');
-// Message content width: padding (16) + avatar (40) + marginRight (12) + padding (16) = 84
-const MESSAGE_IMAGE_MAX_WIDTH = SCREEN_WIDTH - 84;
+import { logger, type Emoji, type Sticker, type SpaceMember, type Channel } from '@quilibrium/quorum-shared';
+// MESSAGE_IMAGE_MAX_WIDTH computed inside the component via useWindowDimensions
 
 // User info for profile display
 export interface MessageUserInfo {
   userId: string;
   userName: string;
   userAvatar?: string;
+  bio?: string;
+  /** Optional Farcaster linkage carried on the SpaceMember when the
+   *  user advertised it in their per-space profile broadcast. The
+   *  channel screen passes these straight through to UserProfileModal
+   *  so the linked-Farcaster row can render. */
+  farcasterFid?: number;
+  farcasterUsername?: string;
 }
 
 interface MessagesListProps {
   messages: DisplayMessage[];
-  theme: any;
+  theme: AppTheme;
   isLoading?: boolean;
   isRefreshing?: boolean;
   isLoadingMore?: boolean;
@@ -55,6 +66,45 @@ interface MessagesListProps {
   onUserPress?: (user: MessageUserInfo) => void;
   onReply?: (message: DisplayMessage) => void;
   onScrollToMessage?: (messageId: string) => void;
+  onDelete?: (messageId: string) => void;
+  canDeleteMessage?: (message: DisplayMessage) => boolean;
+  /** Members for @mention rendering */
+  members?: SpaceMember[];
+  /** Channels for #channel links */
+  channels?: Channel[];
+  /** Current user ID for highlighting self-mentions */
+  currentUserId?: string;
+  /** Callback when user taps a #channel link */
+  onChannelLinkPress?: (channelId: string) => void;
+  /** Callback when user taps a URL link */
+  onLinkPress?: (url: string) => void;
+  /** Callback to edit a message */
+  onEdit?: (message: DisplayMessage) => void;
+  /** Check if user can edit a message (own message within 15-min window) */
+  canEditMessage?: (message: DisplayMessage) => boolean;
+  /** Callback to pin a message */
+  onPin?: (messageId: string) => void;
+  /** Callback to unpin a message */
+  onUnpin?: (messageId: string) => void;
+  /** Check if user can pin/unpin messages */
+  canPinMessage?: boolean;
+  /** Callback to toggle bookmark */
+  onBookmark?: (message: DisplayMessage) => void;
+  /** Check if a message is bookmarked */
+  isBookmarked?: (messageId: string) => boolean;
+  /** Callback to report a message or cast. Caller decides whether to show
+   *  Report (e.g. don't offer it for own messages). When undefined the
+   *  action is hidden. */
+  onReport?: (message: DisplayMessage) => void;
+  /** Space ID for space call join (passed to SpaceCallBubble) */
+  spaceId?: string;
+  /** Channel ID for space call join (passed to SpaceCallBubble) */
+  channelId?: string;
+  /** Padding to apply at the top of the list, used to clear a translucent
+   *  navigation header on iOS. Without this, the topmost messages sit
+   *  *under* the header and the user can't scroll-to-top — which both
+   *  hides content and prevents `onStartReached` from firing. */
+  topInset?: number;
 }
 
 export interface MessagesListHandle {
@@ -100,31 +150,106 @@ export const MessagesList = forwardRef<MessagesListHandle, MessagesListProps>(fu
   onOpenFarcasterCast,
   onUserPress,
   onReply,
+  onDelete,
+  canDeleteMessage,
+  members = [],
+  channels = [],
+  currentUserId,
+  onChannelLinkPress,
+  onLinkPress,
+  onEdit,
+  canEditMessage,
+  onPin,
+  onUnpin,
+  canPinMessage = false,
+  onBookmark,
+  isBookmarked,
+  onReport,
+  spaceId,
+  channelId,
+  topInset = 0,
 }, ref) {
-  const styles = createStyles(theme);
+  const { width: screenWidth } = useWindowDimensions();
+  const MESSAGE_IMAGE_MAX_WIDTH = screenWidth - 84;
+  const styles = useMemo(() => createStyles(theme), [theme]);
   const [viewerImage, setViewerImage] = useState<string | null>(null);
   const [reactionPickerMessageId, setReactionPickerMessageId] = useState<string | null>(null);
   const [actionSheetMessageId, setActionSheetMessageId] = useState<string | null>(null);
-  const flatListRef = useRef<FlatList<DisplayMessage>>(null);
+  const [editHistoryMessage, setEditHistoryMessage] = useState<DisplayMessage | null>(null);
+  // Long-press on a reaction badge opens this modal with pill-filterable
+  // reactor list. Holding the messageId rather than the reactions array
+  // lets the modal pick up reactions added/removed while it's open
+  // (since it reads from the same messagesRef snapshot).
+  const [reactionDetailsMessageId, setReactionDetailsMessageId] = useState<string | null>(null);
+  const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
+  const highlightOpacity = useSharedValue(0);
+  const flatListRef = useRef<FlashListRef<DisplayMessage>>(null);
 
-  // Reverse messages for inverted FlatList - newest messages first in array
-  // so they appear at the bottom (visual top in inverted list)
-  const invertedMessages = useMemo(() => [...messages].reverse(), [messages]);
+  // Ref to hold latest messages — used inside callbacks to avoid re-creating them when messages change
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
+
+  // Messages are ordered oldest-first; FlashList's startRenderingFromBottom
+  // renders from the bottom without needing an inverted array.
+  const orderedMessages = messages;
+
+  // FlashList's `maintainVisibleContentPosition.autoscrollToBottomThreshold`
+  // also fires when an existing cell GROWS at the bottom (e.g. adding a
+  // reaction adds a reactions row). That scrolled the user to the bottom on
+  // every reaction tap. We replace it with explicit "scroll on new bottom
+  // message id" logic so only genuine new messages trigger autoscroll.
+  const lastMessageIdRef = useRef<string | null>(null);
+  const distanceFromBottomRef = useRef<number>(0);
+  useEffect(() => {
+    const newLast = orderedMessages.length > 0 ? orderedMessages[orderedMessages.length - 1].id : null;
+    const prevLast = lastMessageIdRef.current;
+    lastMessageIdRef.current = newLast;
+    if (prevLast === null || newLast === prevLast) return;
+    if (distanceFromBottomRef.current <= 80) {
+      flatListRef.current?.scrollToEnd({ animated: true });
+    }
+  }, [orderedMessages]);
+
+  // Animate highlight when message is highlighted (runs on UI thread via Reanimated)
+  useEffect(() => {
+    if (highlightedMessageId) {
+      highlightOpacity.value = withSequence(
+        withTiming(1, { duration: 0 }),
+        withDelay(200, withTiming(0, { duration: 1500 })),
+      );
+      // Clear highlight state after animation completes
+      const timer = setTimeout(() => setHighlightedMessageId(null), 1700);
+      return () => clearTimeout(timer);
+    }
+  }, [highlightedMessageId]);
+
+  // Reanimated animated style for highlight background
+  const highlightAnimStyle = useAnimatedStyle(() => ({
+    backgroundColor: `rgba(88, 101, 242, ${highlightOpacity.value * 0.19})`,
+  }));
+
+  // Helper to scroll to message with highlight
+  const scrollToMessageWithHighlight = useCallback((messageId: string) => {
+    const index = messagesRef.current.findIndex((m) => m.id === messageId);
+    if (index !== -1) {
+      flatListRef.current?.scrollToIndex({ index, animated: true, viewPosition: 0.5 });
+      // Set highlight after a brief delay for scroll to complete
+      setTimeout(() => {
+        setHighlightedMessageId(messageId);
+      }, 300);
+    }
+  }, []);
 
   // Expose scroll methods to parent
-  // For inverted list, scrollToEnd means scroll to index 0 (newest message at bottom)
   useImperativeHandle(ref, () => ({
     scrollToEnd: (animated = true) => {
-      flatListRef.current?.scrollToOffset({ offset: 0, animated });
+      flatListRef.current?.scrollToEnd({ animated });
     },
     scrollToMessage: (messageId: string, animated = true) => {
-      // Find the index in the inverted array
-      const index = invertedMessages.findIndex((m) => m.id === messageId);
-      if (index !== -1) {
-        flatListRef.current?.scrollToIndex({ index, animated, viewPosition: 0.5 });
-      }
+      // Scroll to message with highlight effect
+      scrollToMessageWithHighlight(messageId);
     },
-  }), [invertedMessages]);
+  }), [scrollToMessageWithHighlight]);
 
   // Create a lookup map for custom emojis by ID
   const customEmojiMap = React.useMemo(() => {
@@ -144,22 +269,61 @@ export const MessagesList = forwardRef<MessagesListHandle, MessagesListProps>(fu
     return map;
   }, [stickers]);
 
+  // Create a lookup map for members by address for fast mention lookups
+  const memberMap = useMemo(() => {
+    const map: Record<string, SpaceMember> = {};
+    members.forEach((m) => {
+      map[m.address] = m;
+    });
+    return map;
+  }, [members]);
+
+  // Memoized callback for mention press to avoid inline function creation
+  const handleMentionPress = useCallback((userId: string) => {
+    if (!onUserPress) return;
+    const member = memberMap[userId] as (typeof memberMap[string] & {
+      farcasterFid?: number;
+      farcasterUsername?: string;
+    }) | undefined;
+    if (member) {
+      onUserPress({
+        userId,
+        userName: member.display_name || member.name || userId,
+        userAvatar: member.profile_image,
+        bio: member.bio,
+        farcasterFid: member.farcasterFid,
+        farcasterUsername: member.farcasterUsername,
+      });
+    }
+  }, [memberMap, onUserPress]);
+
   // Helper to render tappable avatar
   const renderAvatar = useCallback(
     (item: DisplayMessage) => {
       const avatarSource = getAvatarSource(item);
       const handlePress = onUserPress
         ? () => {
+            // Enrich with whatever extra fields the SpaceMember record
+            // carries (bio, farcasterFid/Username) — DisplayMessage
+            // only has the basics. Type assertion handles fields the
+            // shared SpaceMember type doesn't declare.
+            const member = memberMap[item.userId] as (typeof memberMap[string] & {
+              farcasterFid?: number;
+              farcasterUsername?: string;
+            }) | undefined;
             onUserPress({
               userId: item.userId,
               userName: item.userName,
               userAvatar: typeof item.userAvatar === 'string' ? item.userAvatar : undefined,
+              bio: member?.bio,
+              farcasterFid: member?.farcasterFid,
+              farcasterUsername: member?.farcasterUsername,
             });
           }
         : undefined;
 
       const avatarContent = avatarSource ? (
-        <Image source={avatarSource} style={styles.messageAvatar} />
+        <CachedAvatar source={avatarSource} style={styles.messageAvatar} />
       ) : (
         <DefaultAvatar address={item.userId} size={40} style={styles.messageAvatar} />
       );
@@ -174,11 +338,10 @@ export const MessagesList = forwardRef<MessagesListHandle, MessagesListProps>(fu
 
       return avatarContent;
     },
-    [styles.messageAvatar, onUserPress]
+    [styles.messageAvatar, onUserPress, memberMap]
   );
 
-  // For inverted list, onEndReached fires when scrolling toward the visual top
-  // (older messages), which is exactly when we want to load more
+  // onStartReached fires when scrolling toward the top (older messages)
   const handleEndReached = useCallback(() => {
     if (hasMore && !isLoadingMore && onLoadMore) {
       onLoadMore();
@@ -198,8 +361,8 @@ export const MessagesList = forwardRef<MessagesListHandle, MessagesListProps>(fu
   // Get the message being acted on for reply
   const actionSheetMessage = useMemo(() => {
     if (!actionSheetMessageId) return null;
-    return messages.find((m) => m.id === actionSheetMessageId) ?? null;
-  }, [actionSheetMessageId, messages]);
+    return messagesRef.current.find((m) => m.id === actionSheetMessageId) ?? null;
+  }, [actionSheetMessageId]);
 
   const handleReplyFromActionSheet = useCallback(() => {
     if (actionSheetMessage && onReply) {
@@ -213,6 +376,55 @@ export const MessagesList = forwardRef<MessagesListHandle, MessagesListProps>(fu
     setReactionPickerMessageId(actionSheetMessageId);
     setActionSheetMessageId(null);
   }, [actionSheetMessageId]);
+
+  const handleQuickReactFromActionSheet = useCallback((emoji: string) => {
+    if (actionSheetMessageId && onReaction) {
+      onReaction(actionSheetMessageId, emoji);
+    }
+    setActionSheetMessageId(null);
+  }, [actionSheetMessageId, onReaction]);
+
+  const handleEditFromActionSheet = useCallback(() => {
+    if (actionSheetMessage && onEdit) {
+      onEdit(actionSheetMessage);
+    }
+    setActionSheetMessageId(null);
+  }, [actionSheetMessage, onEdit]);
+
+  const handlePinFromActionSheet = useCallback(() => {
+    if (actionSheetMessageId && onPin) {
+      onPin(actionSheetMessageId);
+    }
+    setActionSheetMessageId(null);
+  }, [actionSheetMessageId, onPin]);
+
+  const handleUnpinFromActionSheet = useCallback(() => {
+    if (actionSheetMessageId && onUnpin) {
+      onUnpin(actionSheetMessageId);
+    }
+    setActionSheetMessageId(null);
+  }, [actionSheetMessageId, onUnpin]);
+
+  const handleBookmarkFromActionSheet = useCallback(() => {
+    if (actionSheetMessage && onBookmark) {
+      onBookmark(actionSheetMessage);
+    }
+    setActionSheetMessageId(null);
+  }, [actionSheetMessage, onBookmark]);
+
+  const handleReportFromActionSheet = useCallback(() => {
+    if (actionSheetMessage && onReport) {
+      onReport(actionSheetMessage);
+    }
+    setActionSheetMessageId(null);
+  }, [actionSheetMessage, onReport]);
+
+  const handleViewEditHistory = useCallback(() => {
+    if (actionSheetMessage) {
+      setEditHistoryMessage(actionSheetMessage);
+    }
+    setActionSheetMessageId(null);
+  }, [actionSheetMessage]);
 
   // Render reactions row
   const renderReactions = useCallback(
@@ -238,6 +450,15 @@ export const MessagesList = forwardRef<MessagesListHandle, MessagesListProps>(fu
                     onReaction?.(messageId, reaction.emoji);
                   }
                 }}
+                // Long-press any badge opens the reactor-detail modal.
+                // We don't preselect the touched emoji per the spec — the
+                // modal opens with no pill selected so the user sees the
+                // full reactor list, then can drill down via the pills.
+                onLongPress={() => {
+                  haptics.selection();
+                  setReactionDetailsMessageId(messageId);
+                }}
+                delayLongPress={300}
               >
                 {customEmoji ? (
                   <Image
@@ -292,6 +513,67 @@ export const MessagesList = forwardRef<MessagesListHandle, MessagesListProps>(fu
     [styles, theme]
   );
 
+  // Render call event (voice/video call summary)
+  const renderCallEvent = useCallback(
+    (item: DisplayMessage) => {
+      const c = item.originalMessage?.content as any;
+      const isMissed = c?.event === 'missed';
+      const iconName = c?.mediaType === 'video' ? 'video.fill' : 'phone.fill';
+      const iconColor = isMissed
+        ? (theme.colors.danger ?? '#ff3b30')
+        : (theme.colors.success ?? '#34c759');
+
+      return (
+        <View style={styles.systemMessage}>
+          <IconSymbol name={iconName} size={16} color={iconColor} />
+          <Text style={styles.systemMessageText}>{item.content}</Text>
+          <Text style={styles.systemMessageTime}>{item.timeString}</Text>
+        </View>
+      );
+    },
+    [styles, theme]
+  );
+
+  // Build a lookup of ended space call IDs: callId -> endedAt timestamp
+  const endedSpaceCalls = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const msg of messages) {
+      if (msg.originalMessage?.content.type === 'space-call-end') {
+        const c = msg.originalMessage.content;
+        map.set(c.callId, msg.timestamp);
+      }
+    }
+    return map;
+  }, [messages]);
+
+  // Render space call bubble (joinable inline element)
+  const renderSpaceCall = useCallback(
+    (item: DisplayMessage) => {
+      logger.debug('[SpaceCall] rendering bubble:', item.renderType, item.spaceCallId);
+      // For space-call-end messages, don't render a separate bubble — the
+      // corresponding space-call-start bubble already reflects the ended state.
+      if (item.originalMessage?.content.type === 'space-call-end') {
+        return <View />;
+      }
+
+      const callId = item.spaceCallId;
+      const isEnded = callId ? endedSpaceCalls.has(callId) : false;
+      const endedAt = callId ? endedSpaceCalls.get(callId) : undefined;
+
+      return (
+        <SpaceCallBubble
+          message={item}
+          isEnded={isEnded}
+          endedAt={endedAt}
+          spaceId={spaceId}
+          channelId={channelId}
+          theme={theme}
+        />
+      );
+    },
+    [endedSpaceCalls, spaceId, channelId, theme]
+  );
+
   // Render deleted message placeholder
   const renderDeletedMessage = useCallback(
     (item: DisplayMessage) => {
@@ -309,42 +591,95 @@ export const MessagesList = forwardRef<MessagesListHandle, MessagesListProps>(fu
     [styles, theme]
   );
 
+  // Render malformed-message placeholder. Surfaces the error inline so
+  // production users can screenshot it; we don't have logs to fall back
+  // on. Tap-to-copy isn't wired but the text is `selectable` so a long
+  // press lets the user grab it for support.
+  const renderErrorMessage = useCallback(
+    (item: DisplayMessage) => {
+      return (
+        <View style={styles.deletedMessage}>
+          <IconSymbol
+            name="exclamationmark.triangle.fill"
+            size={14}
+            color={theme.colors.warning ?? '#f59e0b'}
+          />
+          <Text style={styles.deletedMessageText} selectable>
+            {item.errorDetail ?? 'Could not render message'}
+          </Text>
+        </View>
+      );
+    },
+    [styles, theme]
+  );
+
   // Render embed/media message
   const renderEmbedMessage = useCallback(
     (item: DisplayMessage) => {
       const imageUrl = item.imageUrl || item.thumbnailUrl;
 
+      const handleLongPress = () => {
+        haptics.medium();
+        if (onReply || onDelete) {
+          setActionSheetMessageId(item.id);
+        } else {
+          setReactionPickerMessageId(item.id);
+        }
+      };
+
+      const isHighlighted = highlightedMessageId === item.id;
+
       return (
-        <View style={styles.message}>
-          {renderAvatar(item)}
-          <View style={styles.messageContent}>
-            <View style={styles.messageHeader}>
-              <Text style={styles.messageUser}>{item.userName}</Text>
-              <Text style={styles.messageTime}>{item.timeString}</Text>
-            </View>
-            {imageUrl && (
-              <View style={styles.embedImageContainer}>
-                <AutoHeightImage
-                  uri={imageUrl}
-                  maxHeight={400}
-                  maxWidth={MESSAGE_IMAGE_MAX_WIDTH}
-                  style={styles.embedImage}
-                  onPress={() => setViewerImage(imageUrl)}
+        <Pressable onLongPress={handleLongPress} delayLongPress={300}>
+          <Animated.View style={[styles.message, isHighlighted && highlightAnimStyle]}>
+            {renderAvatar(item)}
+            <View style={styles.messageContent}>
+              <View style={styles.messageHeader}>
+                <Text style={styles.messageUser} numberOfLines={1}>{item.userName}</Text>
+                <Text style={styles.messageTime}>{item.timeString}</Text>
+              </View>
+              {imageUrl && (
+                <View style={styles.embedImageContainer}>
+                  <AutoHeightImage
+                    uri={imageUrl}
+                    maxHeight={400}
+                    maxWidth={MESSAGE_IMAGE_MAX_WIDTH}
+                    style={styles.embedImage}
+                    onPress={() => setViewerImage(imageUrl)}
+                    onLongPress={handleLongPress}
+                  />
+                </View>
+              )}
+              {item.videoUrl && (
+                <View style={styles.videoPlaceholder}>
+                  <IconSymbol name="play.circle.fill" size={40} color="#fff" />
+                  <Text style={styles.videoPlaceholderText}>Video</Text>
+                </View>
+              )}
+              {/* Caption — embeds can carry text alongside the image.
+                  Rendered after the media so the visual order is the same
+                  as desktop. */}
+              {item.content ? (
+                <MentionableText
+                  text={item.content}
+                  customEmojis={customEmojis}
+                  members={members}
+                  channels={channels}
+                  currentUserId={currentUserId}
+                  style={styles.messageText}
+                  theme={theme}
+                  onMentionPress={onUserPress ? handleMentionPress : undefined}
+                  onChannelPress={onChannelLinkPress}
+                  onLinkPress={onLinkPress}
                 />
-              </View>
-            )}
-            {item.videoUrl && (
-              <View style={styles.videoPlaceholder}>
-                <IconSymbol name="play.circle.fill" size={40} color="#fff" />
-                <Text style={styles.videoPlaceholderText}>Video</Text>
-              </View>
-            )}
-            {renderReactions(item.reactions || [], item.id)}
-          </View>
-        </View>
+              ) : null}
+              {renderReactions(item.reactions || [], item.id)}
+            </View>
+          </Animated.View>
+        </Pressable>
       );
     },
-    [styles, renderReactions, renderAvatar]
+    [styles, renderReactions, renderAvatar, onReply, onDelete, highlightedMessageId, highlightAnimStyle]
   );
 
   // Render sticker message
@@ -352,34 +687,57 @@ export const MessagesList = forwardRef<MessagesListHandle, MessagesListProps>(fu
     (item: DisplayMessage) => {
       const sticker = item.stickerId ? stickerMap[item.stickerId] : null;
 
+      const handleLongPress = () => {
+        haptics.medium();
+        if (onReply || onDelete) {
+          setActionSheetMessageId(item.id);
+        } else {
+          setReactionPickerMessageId(item.id);
+        }
+      };
+
+      const isHighlighted = highlightedMessageId === item.id;
+
       return (
-        <View style={styles.message}>
-          {renderAvatar(item)}
-          <View style={styles.messageContent}>
-            <View style={styles.messageHeader}>
-              <Text style={styles.messageUser}>{item.userName}</Text>
-              <Text style={styles.messageTime}>{item.timeString}</Text>
+        <Pressable onLongPress={handleLongPress} delayLongPress={300}>
+          <Animated.View style={[styles.message, isHighlighted && highlightAnimStyle]}>
+            {renderAvatar(item)}
+            <View style={styles.messageContent}>
+              <View style={styles.messageHeader}>
+                <Text style={styles.messageUser} numberOfLines={1}>{item.userName}</Text>
+                <Text style={styles.messageTime}>{item.timeString}</Text>
+              </View>
+              {sticker ? (
+                <View style={styles.stickerContainer}>
+                  <Image
+                    source={{ uri: sticker.imgUrl }}
+                    style={styles.stickerImage}
+                    resizeMode="contain"
+                  />
+                </View>
+              ) : (
+                <View style={styles.stickerPlaceholder}>
+                  <Text style={styles.stickerPlaceholderText}>[Sticker]</Text>
+                </View>
+              )}
+              {renderReactions(item.reactions || [], item.id)}
             </View>
-            {sticker ? (
-              <View style={styles.stickerContainer}>
-                <Image
-                  source={{ uri: sticker.imgUrl }}
-                  style={styles.stickerImage}
-                  resizeMode="contain"
-                />
-              </View>
-            ) : (
-              <View style={styles.stickerPlaceholder}>
-                <Text style={styles.stickerPlaceholderText}>[Sticker]</Text>
-              </View>
-            )}
-            {renderReactions(item.reactions || [], item.id)}
-          </View>
-        </View>
+          </Animated.View>
+        </Pressable>
       );
     },
-    [styles, renderReactions, stickerMap, renderAvatar]
+    [styles, renderReactions, stickerMap, renderAvatar, onReply, onDelete, highlightedMessageId, highlightAnimStyle]
   );
+
+  // Helper to get reply preview from parent message
+  const getReplyPreview = useCallback((replyToMessageId: string | undefined): string | undefined => {
+    if (!replyToMessageId) return undefined;
+    const parentMessage = messagesRef.current.find((m) => m.id === replyToMessageId);
+    if (!parentMessage) return undefined;
+    const preview = parentMessage.content || '';
+    // Truncate to ~50 chars
+    return preview.length > 50 ? preview.slice(0, 50) + '...' : preview;
+  }, []);
 
   // Render regular post message
   const renderPostMessage = useCallback(
@@ -410,24 +768,33 @@ export const MessagesList = forwardRef<MessagesListHandle, MessagesListProps>(fu
 
       // Show action sheet if reply is available, otherwise go straight to emoji picker
       const handleLongPress = () => {
-        if (onReply) {
+        haptics.medium();
+        if (onReply || onDelete) {
           setActionSheetMessageId(item.id);
         } else {
           setReactionPickerMessageId(item.id);
         }
       };
 
+      const isHighlighted = highlightedMessageId === item.id;
+
+      // Get reply preview
+      const replyPreview = item.replyToPreview || getReplyPreview(item.replyToMessageId);
+
       return (
         <Pressable
           onLongPress={handleLongPress}
           delayLongPress={300}
         >
-          <View style={[styles.message, isSending && styles.messageSending]}>
+          <Animated.View style={[styles.message, isSending && styles.messageSending, isHighlighted && highlightAnimStyle]}>
             {renderAvatar(item)}
             <View style={styles.messageContent}>
               <View style={styles.messageHeader}>
-                <Text style={styles.messageUser}>{item.userName}</Text>
+                <Text style={styles.messageUser} numberOfLines={1}>{item.userName}</Text>
                 <Text style={styles.messageTime}>{item.timeString}</Text>
+                {item.originalMessage?.isPinned && (
+                  <IconSymbol name="pin.fill" size={10} color={theme.colors.textMuted} style={{ marginLeft: 4 }} />
+                )}
                 {item.isEdited && (
                   <Text style={styles.editedIndicator}>(edited)</Text>
                 )}
@@ -444,11 +811,7 @@ export const MessagesList = forwardRef<MessagesListHandle, MessagesListProps>(fu
                 <TouchableOpacity
                   style={styles.replyIndicator}
                   onPress={() => {
-                    // Find the index in the inverted array and scroll to it
-                    const index = invertedMessages.findIndex((m) => m.id === item.replyToMessageId);
-                    if (index !== -1) {
-                      flatListRef.current?.scrollToIndex({ index, animated: true, viewPosition: 0.5 });
-                    }
+                    scrollToMessageWithHighlight(item.replyToMessageId!);
                   }}
                   activeOpacity={0.7}
                 >
@@ -457,20 +820,42 @@ export const MessagesList = forwardRef<MessagesListHandle, MessagesListProps>(fu
                     size={12}
                     color={theme.colors.textMuted}
                   />
-                  <Text style={styles.replyIndicatorText}>
-                    Replying to {item.replyToAuthor}
+                  <Text style={styles.replyIndicatorText} numberOfLines={1}>
+                    {item.replyToAuthor}: {replyPreview || '...'}
                   </Text>
                 </TouchableOpacity>
               )}
               {item.hasLink && item.link ? (
                 <View style={styles.messageWithLink}>
-                  <Text style={styles.messageText}>{item.content}</Text>
+                  <MentionableText
+                    text={item.content}
+                    customEmojis={customEmojis}
+                    members={members}
+                    channels={channels}
+                    currentUserId={currentUserId}
+                    style={styles.messageText}
+                    theme={theme}
+                    onMentionPress={onUserPress ? handleMentionPress : undefined}
+                    onChannelPress={onChannelLinkPress}
+                    onLinkPress={onLinkPress}
+                  />
                   <BrowserLink url={item.link} textStyle={styles.linkText}>
                     {item.linkText}
                   </BrowserLink>
                 </View>
               ) : messageTextWithoutLink ? (
-                <Text style={styles.messageText}>{messageTextWithoutLink}</Text>
+                <MentionableText
+                  text={messageTextWithoutLink}
+                  customEmojis={customEmojis}
+                  members={members}
+                  channels={channels}
+                  currentUserId={currentUserId}
+                  style={styles.messageText}
+                  theme={theme}
+                  onMentionPress={onUserPress ? handleMentionPress : undefined}
+                  onChannelPress={onChannelLinkPress}
+                  onLinkPress={onLinkPress}
+                />
               ) : null}
               {/* Render invite link card if detected */}
               {inviteLink && (
@@ -507,11 +892,33 @@ export const MessagesList = forwardRef<MessagesListHandle, MessagesListProps>(fu
                 </View>
               )}
             </View>
-          </View>
+          </Animated.View>
         </Pressable>
       );
     },
-    [styles, theme, onRetryMessage, onJoinSpace, onOpenFarcasterCast, renderReactions, renderAvatar, invertedMessages]
+    [styles, theme, onRetryMessage, onJoinSpace, onOpenFarcasterCast, renderReactions, renderAvatar, scrollToMessageWithHighlight, customEmojis, members, channels, currentUserId, onUserPress, onChannelLinkPress, onLinkPress, highlightedMessageId, highlightAnimStyle, getReplyPreview, onReply, onDelete]
+  );
+
+  const renderCast = useCallback(
+    (item: DisplayMessage) => {
+      if (!item.cast) return null;
+      const handleLongPress = () => {
+        haptics.medium();
+        setActionSheetMessageId(item.id);
+      };
+      return (
+        <View style={{ paddingHorizontal: 12, paddingVertical: 4 }}>
+          <FarcasterCastCard
+            cast={item.cast}
+            channelKey={item.castChannelKey}
+            fullWidth
+            onPress={onOpenFarcasterCast}
+            onLongPress={handleLongPress}
+          />
+        </View>
+      );
+    },
+    [onOpenFarcasterCast],
   );
 
   const renderItem = useCallback(
@@ -520,18 +927,26 @@ export const MessagesList = forwardRef<MessagesListHandle, MessagesListProps>(fu
       switch (item.renderType) {
         case 'system':
           return renderSystemMessage(item);
+        case 'call-event':
+          return renderCallEvent(item);
+        case 'space-call':
+          return renderSpaceCall(item);
         case 'deleted':
           return renderDeletedMessage(item);
         case 'embed':
           return renderEmbedMessage(item);
         case 'sticker':
           return renderStickerMessage(item);
+        case 'cast':
+          return renderCast(item);
+        case 'error':
+          return renderErrorMessage(item);
         case 'post':
         default:
           return renderPostMessage(item);
       }
     },
-    [renderSystemMessage, renderDeletedMessage, renderEmbedMessage, renderStickerMessage, renderPostMessage]
+    [renderSystemMessage, renderCallEvent, renderSpaceCall, renderDeletedMessage, renderEmbedMessage, renderStickerMessage, renderCast, renderErrorMessage, renderPostMessage]
   );
 
   // Loading state
@@ -566,23 +981,52 @@ export const MessagesList = forwardRef<MessagesListHandle, MessagesListProps>(fu
 
   return (
     <>
-    <FlatList
-      ref={flatListRef}
-      data={invertedMessages}
-      keyExtractor={(item) => item.id}
-      renderItem={renderItem}
-      style={styles.container}
-      inverted={true}
-      onEndReached={handleEndReached}
-      onEndReachedThreshold={0.5}
-      ListFooterComponent={
-        isLoadingMore ? (
-          <View style={styles.loadingMore}>
-            <ActivityIndicator size="small" color={theme.colors.primary} />
-          </View>
-        ) : null
-      }
-    />
+    <View style={styles.container}>
+      <FlashList
+        ref={flatListRef}
+        data={orderedMessages}
+        keyExtractor={(item) => item.id}
+        renderItem={renderItem}
+        getItemType={(item) => item.renderType}
+        // Push the first row down past the translucent header so the
+        // topmost messages aren't hidden under it AND `onStartReached`
+        // can actually fire when the user scrolls back to the top.
+        contentContainerStyle={topInset > 0 ? { paddingTop: topInset } : undefined}
+        maintainVisibleContentPosition={{
+          startRenderingFromBottom: true,
+          // autoscrollToBottomThreshold removed — it also triggered on cell
+          // growth (e.g. reaction added to last message), which yanked the
+          // user to the bottom unexpectedly. Replaced by the lastMessageId
+          // effect above which only scrolls on genuine new bottom messages.
+        }}
+        onScroll={(e) => {
+          const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
+          distanceFromBottomRef.current = Math.max(
+            0,
+            contentSize.height - (contentOffset.y + layoutMeasurement.height),
+          );
+        }}
+        scrollEventThrottle={64}
+        onStartReached={handleEndReached}
+        onStartReachedThreshold={0.5}
+        // Message rows are highly variable (text wrap, embeds, reactions). Using
+        // a realistic average prevents FlashList from aggressively unmounting
+        // cells that end up taller than expected, which caused the "first few
+        // messages vanishing on scroll" quirk.
+        estimatedItemSize={110}
+        // Keep a larger window of rendered cells alive so that scrolling back
+        // toward the top doesn't briefly render empty space before the older
+        // cells remount.
+        drawDistance={1000}
+        ListHeaderComponent={
+          isLoadingMore ? (
+            <View style={styles.loadingMore}>
+              <ActivityIndicator size="small" color={theme.colors.primary} />
+            </View>
+          ) : null
+        }
+      />
+    </View>
     <ImageViewer
       visible={!!viewerImage}
       imageUrl={viewerImage}
@@ -598,18 +1042,78 @@ export const MessagesList = forwardRef<MessagesListHandle, MessagesListProps>(fu
     <MessageActionSheet
       visible={!!actionSheetMessageId}
       onClose={() => setActionSheetMessageId(null)}
-      onReply={handleReplyFromActionSheet}
-      onReact={handleReactFromActionSheet}
+      onReply={onReply ? handleReplyFromActionSheet : undefined}
+      // Reactions, edits, pins, deletes, bookmarks all act on Quorum messages.
+      // Casts in the stream only support Reply (which writes to the local chat
+      // and may optionally also post a Farcaster reply via the composer toggle).
+      onReact={actionSheetMessage?.renderType === 'cast' ? () => {} : handleReactFromActionSheet}
+      onQuickReact={actionSheetMessage?.renderType === 'cast' ? undefined : (onReaction ? handleQuickReactFromActionSheet : undefined)}
+      onDelete={actionSheetMessage && onDelete && actionSheetMessage.renderType !== 'cast' ? () => onDelete(actionSheetMessage.id) : undefined}
+      canDelete={actionSheetMessage && actionSheetMessage.renderType !== 'cast' && canDeleteMessage ? canDeleteMessage(actionSheetMessage) : false}
+      onEdit={actionSheetMessage?.renderType === 'cast' ? undefined : (onEdit ? handleEditFromActionSheet : undefined)}
+      canEdit={actionSheetMessage && actionSheetMessage.renderType !== 'cast' && canEditMessage ? canEditMessage(actionSheetMessage) : false}
+      onPin={actionSheetMessage?.renderType === 'cast' ? undefined : (onPin ? handlePinFromActionSheet : undefined)}
+      onUnpin={actionSheetMessage?.renderType === 'cast' ? undefined : (onUnpin ? handleUnpinFromActionSheet : undefined)}
+      isPinned={actionSheetMessage?.originalMessage?.isPinned ?? false}
+      canPin={actionSheetMessage?.renderType === 'cast' ? false : canPinMessage}
+      onBookmark={actionSheetMessage?.renderType === 'cast' ? undefined : (onBookmark ? handleBookmarkFromActionSheet : undefined)}
+      isBookmarked={actionSheetMessage && actionSheetMessage.renderType !== 'cast' && isBookmarked ? isBookmarked(actionSheetMessage.id) : false}
+      onViewEditHistory={actionSheetMessage?.renderType === 'cast' ? undefined : handleViewEditHistory}
+      hasEditHistory={actionSheetMessage?.renderType !== 'cast' && (actionSheetMessage?.isEdited ?? false)}
+      messageText={actionSheetMessage?.content}
+      onReport={onReport ? handleReportFromActionSheet : undefined}
       theme={theme}
+    />
+    <EditHistoryModal
+      visible={!!editHistoryMessage}
+      onClose={() => setEditHistoryMessage(null)}
+      originalText={editHistoryMessage?.content ?? ''}
+      originalDate={editHistoryMessage?.timestamp ?? 0}
+      edits={editHistoryMessage?.originalMessage?.edits ?? []}
+      theme={theme}
+    />
+    <ReactionDetailsModal
+      visible={!!reactionDetailsMessageId}
+      onClose={() => setReactionDetailsMessageId(null)}
+      reactions={
+        (reactionDetailsMessageId
+          ? messagesRef.current.find((m) => m.id === reactionDetailsMessageId)?.reactions
+          : null) ?? []
+      }
+      members={members}
+      customEmojis={customEmojis}
+      onUserPress={
+        onUserPress
+          ? (address) => {
+              const member = memberMap[address] as
+                | (typeof memberMap[string] & {
+                    farcasterFid?: number;
+                    farcasterUsername?: string;
+                  })
+                | undefined;
+              if (member) {
+                onUserPress({
+                  userId: address,
+                  userName: member.display_name || member.name || address,
+                  userAvatar: member.profile_image,
+                  bio: member.bio,
+                  farcasterFid: member.farcasterFid,
+                  farcasterUsername: member.farcasterUsername,
+                });
+                setReactionDetailsMessageId(null);
+              }
+            }
+          : undefined
+      }
     />
     </>
   );
 });
 
-const createStyles = (theme: any) => StyleSheet.create({
+const createStyles = (theme: AppTheme) => StyleSheet.create({
   container: {
     flex: 1,
-    width: SCREEN_WIDTH,
+    width: '100%',
   },
   centerContent: {
     justifyContent: 'center',
@@ -619,7 +1123,7 @@ const createStyles = (theme: any) => StyleSheet.create({
   message: {
     flexDirection: 'row',
     padding: 16,
-    width: SCREEN_WIDTH,
+    width: '100%',
   },
   messageAvatar: {
     width: 40,
@@ -633,13 +1137,13 @@ const createStyles = (theme: any) => StyleSheet.create({
   messageHeader: {
     flexDirection: 'row',
     alignItems: 'baseline',
-    flexWrap: 'wrap',
   },
   messageUser: {
     color: theme.colors.textStrong,
     fontFamily: theme.fonts.medium.fontFamily,
     fontWeight: theme.fonts.medium.fontWeight,
     marginRight: 8,
+    flexShrink: 1,
   },
   messageTime: {
     color: theme.colors.textMuted,

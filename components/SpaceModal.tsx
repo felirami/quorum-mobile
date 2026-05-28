@@ -6,8 +6,7 @@
  * - Join: Enter invite link to join existing space
  */
 
-import { logger } from '@quilibrium/quorum-shared';
-import React, { useState, useCallback, useMemo } from 'react';
+import React, { useState, useCallback, useMemo, useEffect, useRef } from 'react';
 import {
   View,
   Text,
@@ -20,16 +19,20 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { BaseModal } from '@/components/shared';
 import { IconSymbol } from '@/components/ui/IconSymbol';
-import { useTheme } from '@/theme';
+import { useTheme, type AppTheme } from '@/theme';
+import type { EdgeInsets } from 'react-native-safe-area-context';
 import { useSpaces } from '@/hooks/chat/useSpaces';
 import { useCreateSpace, useJoinSpace, useValidateInvite } from '@/hooks/chat/useSpaceActions';
 import { useWebSocket } from '@/context/WebSocketContext';
+import { useToast } from '@/context/ToastContext';
+import { haptics } from '@/utils/haptics';
 
 interface SpaceModalProps {
   visible: boolean;
   onClose: () => void;
   onSpaceCreated?: (spaceId: string) => void;
   onSpaceJoined?: (spaceId: string) => void;
+  initialTab?: 'create' | 'join';
 }
 
 type TabType = 'create' | 'join';
@@ -54,10 +57,14 @@ function isValidInviteLink(link: string): boolean {
   // Accept various formats:
   // - Full URL: https://quorummessenger.com/i/...
   // - Short URL: quorummessenger.com/i/...
+  // - qm.one URLs: https://qm.one/#... or https://qm.one/invite/#...
   // - Just the invite code: Qm... or other base58
+  // - Any URL with hash fragment containing spaceId parameter
   return (
     trimmed.includes('quorummessenger.com/i/') ||
+    trimmed.includes('qm.one/') ||
     trimmed.includes('/i/') ||
+    (trimmed.includes('#') && trimmed.includes('spaceId=')) ||
     /^[123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz]{32,}$/.test(trimmed)
   );
 }
@@ -67,13 +74,14 @@ export default function SpaceModal({
   onClose,
   onSpaceCreated,
   onSpaceJoined,
+  initialTab,
 }: SpaceModalProps) {
   const { theme } = useTheme();
   const insets = useSafeAreaInsets();
   const styles = createStyles(theme, insets);
-  const { subscribe, enqueueOutbound, triggerSyncRequest } = useWebSocket();
+  const { subscribe, enqueueOutbound } = useWebSocket();
 
-  const [activeTab, setActiveTab] = useState<TabType>('join');
+  const [activeTab, setActiveTab] = useState<TabType>(initialTab ?? 'join');
 
   // Create tab state
   const [spaceName, setSpaceName] = useState('');
@@ -86,6 +94,35 @@ export default function SpaceModal({
   const createSpaceMutation = useCreateSpace();
   const joinSpaceMutation = useJoinSpace();
   const { data: validatedSpace, isLoading: isValidating, error: validationError } = useValidateInvite(inviteLink);
+  const { showToast } = useToast();
+
+  // Surface validation errors as a toast that appears AFTER the modal
+  // dismisses — the modal's overlay otherwise covers the toast at the
+  // top of the screen. The dedupe ref prevents firing twice for the
+  // same error (React Query re-emits while debouncing).
+  const lastReportedErrorRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!validationError) {
+      lastReportedErrorRef.current = null;
+      return;
+    }
+    const message = validationError instanceof Error
+      ? validationError.message
+      : 'Invalid invite link';
+    if (lastReportedErrorRef.current === message) return;
+    lastReportedErrorRef.current = message;
+    // Close the modal first; show toast on a delay so the modal
+    // overlay has time to dismiss.
+    onClose();
+    setTimeout(() => {
+      showToast({
+        type: 'error',
+        title: "Couldn't validate invite",
+        message,
+        duration: 6000,
+      });
+    }, 200);
+  }, [validationError, onClose, showToast]);
 
   // Check if already a member
   const { data: spaces } = useSpaces();
@@ -106,6 +143,7 @@ export default function SpaceModal({
     if (!canCreate) return;
 
     try {
+      haptics.light();
       const result = await createSpaceMutation.mutateAsync({
         name: spaceName.trim(),
         description: description.trim() || undefined,
@@ -114,14 +152,14 @@ export default function SpaceModal({
       if (result?.spaceId) {
         // Subscribe to the new space inbox immediately
         if (result.inboxAddress) {
-          logger.log('[SpaceModal] Subscribing to new space inbox:', result.inboxAddress.substring(0, 12));
           await subscribe([result.inboxAddress]);
         }
         onClose();
+        haptics.success();
         onSpaceCreated?.(result.spaceId);
       }
     } catch (error) {
-      console.error('[SpaceModal] Create failed:', error);
+      haptics.error();
     }
   }, [canCreate, spaceName, description, createSpaceMutation, onClose, onSpaceCreated, subscribe]);
 
@@ -129,6 +167,7 @@ export default function SpaceModal({
     if (!canJoin) return;
 
     try {
+      haptics.light();
       const result = await joinSpaceMutation.mutateAsync({
         inviteLink: inviteLink.trim(),
       });
@@ -136,29 +175,29 @@ export default function SpaceModal({
       if (result?.spaceId) {
         // Subscribe to the new space inbox immediately
         if (result.inboxAddress) {
-          logger.log('[SpaceModal] Subscribing to new space inbox:', result.inboxAddress.substring(0, 12));
           await subscribe([result.inboxAddress]);
         }
 
         // Send join control message to announce ourselves to other participants
         if (result.joinMessageEnvelope) {
-          logger.log('[SpaceModal] Sending join control message to announce participant');
           enqueueOutbound(async () => [result.joinMessageEnvelope!]);
         }
 
-        // Trigger sync request to get existing messages from other participants
-        if (result.channelId) {
-          logger.log('[SpaceModal] Triggering sync request for existing messages');
-          triggerSyncRequest(result.spaceId, result.channelId);
-        }
+        // Hook the new space into the per-hub log transport. The
+        // on-connect orchestrator only registers spaces it knew about at
+        // start, so a freshly joined space wouldn't get listen-hub or
+        // log-since until reconnect without this call.
+        const { subscribeAndCatchUpHubLog } = await import('@/services/space/hubLogSync');
+        void subscribeAndCatchUpHubLog(result.spaceId, enqueueOutbound);
 
         onClose();
+        haptics.success();
         onSpaceJoined?.(result.spaceId);
       }
     } catch (error) {
-      console.error('[SpaceModal] Join failed:', error);
+      haptics.error();
     }
-  }, [canJoin, inviteLink, joinSpaceMutation, onClose, onSpaceJoined, subscribe, enqueueOutbound, triggerSyncRequest]);
+  }, [canJoin, inviteLink, joinSpaceMutation, onClose, onSpaceJoined, subscribe, enqueueOutbound]);
 
   const handleClose = useCallback(() => {
     setSpaceName('');
@@ -413,7 +452,7 @@ export default function SpaceModal({
   );
 }
 
-const createStyles = (theme: any, insets: any) =>
+const createStyles = (theme: AppTheme, insets: EdgeInsets) =>
   StyleSheet.create({
     container: {
       flex: 1,

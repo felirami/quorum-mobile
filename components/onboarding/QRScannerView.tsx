@@ -14,7 +14,7 @@ import {
   ActivityIndicator,
 } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
-import { useTheme } from '@/theme';
+import { useTheme, type AppTheme } from '@/theme';
 import { IconSymbol } from '@/components/ui/IconSymbol';
 
 interface QRScannerViewProps {
@@ -151,7 +151,7 @@ export default function QRScannerView({
   );
 }
 
-const createStyles = (theme: any) =>
+const createStyles = (theme: AppTheme) =>
   StyleSheet.create({
     container: {
       flex: 1,
@@ -163,7 +163,7 @@ const createStyles = (theme: any) =>
       left: 0,
       right: 0,
       zIndex: 10,
-      paddingTop: 20,
+      paddingTop: 60,
       paddingHorizontal: 16,
     },
     backButton: {

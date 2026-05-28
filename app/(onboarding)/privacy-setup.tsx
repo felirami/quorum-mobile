@@ -12,7 +12,7 @@ import { Card } from '@/components/ui/Card';
 import { IconSymbol, type IconSymbolName } from '@/components/ui/IconSymbol';
 import { useOnboarding } from '@/context';
 import type { PrivacyLevel } from '@/context/OnboardingContext';
-import { useTheme } from '@/theme';
+import { useTheme, type AppTheme } from '@/theme';
 import React, { useCallback, useState } from 'react';
 import { ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 
@@ -181,7 +181,7 @@ export default function PrivacySetupScreen() {
   );
 }
 
-const createStyles = (theme: any) =>
+const createStyles = (theme: AppTheme) =>
   StyleSheet.create({
     header: {
       alignItems: 'center',

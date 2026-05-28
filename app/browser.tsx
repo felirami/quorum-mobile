@@ -1,10 +1,10 @@
-import { logger } from '@quilibrium/quorum-shared';
-import TransactionWarningModal from '@/components/TransactionWarningModal';
 import { IconSymbol } from '@/components/ui/IconSymbol';
-import { useTheme } from '@/theme';
 import { useMiniAppBridge } from '@/services/miniapp';
+import { useTheme, type AppTheme } from '@/theme';
+import type { EdgeInsets } from 'react-native-safe-area-context';
+import { getErrorMessage } from '@/utils/error';
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import React, { useCallback, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Share,
@@ -15,6 +15,21 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import WebView from 'react-native-webview';
+import { useWalletSelection, useActiveWalletKeys } from '@/hooks/useWalletSelection';
+import { useWalletKeys } from '@/hooks/useWallet';
+import MiniAppApprovalModal, { ApprovalRequest } from '@/components/MiniAppApprovalModal';
+import {
+  TransactionForApproval,
+  MessageForApproval,
+  TypedDataForApproval,
+  SigningResult,
+} from '@/services/miniapp/ethereumProvider';
+import {
+  signPersonalMessage,
+  signTypedData,
+  signAndSendTransaction,
+  signTransactionOnly,
+} from '@/services/miniapp/secureSigningService';
 
 export default function BrowserScreen() {
   const { url, isQNative, name } = useLocalSearchParams<{
@@ -36,6 +51,38 @@ export default function BrowserScreen() {
   const [warningType, setWarningType] = useState<'simulation-failed' | 'no-entitlements' | 'not-declared' | 'ok'>('simulation-failed');
   const [showSplash, setShowSplash] = useState(true);
 
+  // Wallet state for mini app integration - uses selected wallet (builtin or warpcast)
+  const { activeWallet, activeType, isLoading: walletLoading } = useWalletSelection();
+  // Get private key for warpcast wallet (available immediately) or fetch for builtin
+  const { privateKey: warpcastPrivateKey } = useActiveWalletKeys();
+  const { refetch: fetchBuiltinKeys } = useWalletKeys();
+
+  // Helper to get private key on-demand (for signing)
+  const getPrivateKeyForSigning = useCallback(async (): Promise<string | null> => {
+    if (activeType === 'warpcast' && warpcastPrivateKey) {
+      return warpcastPrivateKey;
+    }
+    // For builtin wallet, fetch keys on-demand
+    const result = await fetchBuiltinKeys();
+    return result.data?.ethereum?.privateKey ?? null;
+  }, [activeType, warpcastPrivateKey, fetchBuiltinKeys]);
+
+  const [approvalRequest, setApprovalRequest] = useState<ApprovalRequest | null>(null);
+  const [showApprovalModal, setShowApprovalModal] = useState(false);
+
+  // Convert active wallet to WalletInfo format for the bridge
+  // SECURITY: Only pass the address, not the private key
+  const walletInfo = useMemo(() => {
+    if (!activeWallet) return null;
+    return {
+      address: activeWallet.address,
+    };
+  }, [activeWallet]);
+
+  // Wallet is ready when we have wallet info
+  const walletReady = !!walletInfo;
+
+  // Debug wallet state
   const isQNativeMode = isQNative === 'true';
 
   // Extract domain from URL
@@ -54,12 +101,176 @@ export default function BrowserScreen() {
 
   // Handle mini app ready
   const handleMiniAppReady = useCallback(() => {
-    logger.log('[Browser] Mini app ready');
     setShowSplash(false);
   }, []);
 
+  /**
+   * SECURE: Handle send transaction request from mini app
+   * Shows approval UI, then signs and sends if approved
+   */
+  const handleSendTransaction = useCallback((tx: TransactionForApproval): Promise<SigningResult> => {
+    return new Promise((resolve) => {
+      setApprovalRequest({
+        type: 'transaction',
+        transaction: tx,
+        appName: title || domain,
+        resolve: async (approved: boolean) => {
+          if (!approved) {
+            resolve({ success: false, error: 'User rejected the transaction' });
+            return;
+          }
+
+          const privateKey = await getPrivateKeyForSigning();
+          if (!privateKey) {
+            resolve({ success: false, error: 'Wallet not available' });
+            return;
+          }
+
+          try {
+            const hash = await signAndSendTransaction(privateKey, {
+              to: tx.to,
+              value: tx.value,
+              data: tx.data,
+              gas: tx.gas,
+              gasPrice: tx.gasPrice,
+              maxFeePerGas: tx.maxFeePerGas,
+              maxPriorityFeePerGas: tx.maxPriorityFeePerGas,
+              nonce: tx.nonce,
+              chainId: tx.chainId,
+            });
+            resolve({ success: true, hash });
+          } catch (error: unknown) {
+            resolve({ success: false, error: getErrorMessage(error) || 'Transaction failed' });
+          }
+        },
+      });
+      setShowApprovalModal(true);
+    });
+  }, [title, domain, activeWallet]);
+
+  /**
+   * SECURE: Handle sign transaction (without sending) request from mini app
+   */
+  const handleSignTransaction = useCallback((tx: TransactionForApproval): Promise<SigningResult> => {
+    return new Promise((resolve) => {
+      setApprovalRequest({
+        type: 'transaction',
+        transaction: tx,
+        appName: title || domain,
+        resolve: async (approved: boolean) => {
+          if (!approved) {
+            resolve({ success: false, error: 'User rejected the transaction' });
+            return;
+          }
+
+          const privateKey = await getPrivateKeyForSigning();
+          if (!privateKey) {
+            resolve({ success: false, error: 'Wallet not available' });
+            return;
+          }
+
+          try {
+            const signature = await signTransactionOnly(privateKey, {
+              to: tx.to,
+              value: tx.value,
+              data: tx.data,
+              gas: tx.gas,
+              gasPrice: tx.gasPrice,
+              maxFeePerGas: tx.maxFeePerGas,
+              maxPriorityFeePerGas: tx.maxPriorityFeePerGas,
+              nonce: tx.nonce,
+              chainId: tx.chainId,
+            });
+            resolve({ success: true, signature });
+          } catch (error: unknown) {
+            resolve({ success: false, error: getErrorMessage(error) || 'Signing failed' });
+          }
+        },
+      });
+      setShowApprovalModal(true);
+    });
+  }, [title, domain, activeWallet]);
+
+  /**
+   * SECURE: Handle message signing request from mini app
+   */
+  const handleSignMessage = useCallback((msg: MessageForApproval): Promise<SigningResult> => {
+    return new Promise((resolve) => {
+      setApprovalRequest({
+        type: 'message',
+        message: msg,
+        appName: title || domain,
+        resolve: async (approved: boolean) => {
+          if (!approved) {
+            resolve({ success: false, error: 'User rejected the signature request' });
+            return;
+          }
+
+          const privateKey = await getPrivateKeyForSigning();
+          if (!privateKey) {
+            resolve({ success: false, error: 'Wallet not available' });
+            return;
+          }
+
+          try {
+            const signature = await signPersonalMessage(privateKey, msg.rawMessage);
+            resolve({ success: true, signature });
+          } catch (error: unknown) {
+            resolve({ success: false, error: getErrorMessage(error) || 'Signing failed' });
+          }
+        },
+      });
+      setShowApprovalModal(true);
+    });
+  }, [title, domain, activeWallet]);
+
+  /**
+   * SECURE: Handle typed data signing request from mini app
+   */
+  const handleSignTypedData = useCallback((data: TypedDataForApproval): Promise<SigningResult> => {
+    return new Promise((resolve) => {
+      setApprovalRequest({
+        type: 'typedData',
+        typedData: data,
+        appName: title || domain,
+        resolve: async (approved: boolean) => {
+          if (!approved) {
+            resolve({ success: false, error: 'User rejected the signature request' });
+            return;
+          }
+
+          const privateKey = await getPrivateKeyForSigning();
+          if (!privateKey) {
+            resolve({ success: false, error: 'Wallet not available' });
+            return;
+          }
+
+          try {
+            const signature = await signTypedData(privateKey, {
+              domain: data.domain,
+              types: data.types,
+              primaryType: data.primaryType,
+              message: data.message,
+            });
+            resolve({ success: true, signature });
+          } catch (error: unknown) {
+            resolve({ success: false, error: getErrorMessage(error) || 'Signing failed' });
+          }
+        },
+      });
+      setShowApprovalModal(true);
+    });
+  }, [title, domain, activeWallet]);
+
+  // Close approval modal
+  const handleApprovalModalClose = useCallback(() => {
+    setShowApprovalModal(false);
+    setApprovalRequest(null);
+  }, []);
+
   // MiniApp bridge - uses Comlink to expose SDK to mini apps
-  logger.log('[Browser] Setting up MiniApp bridge for domain:', domain);
+  // SECURITY: Only passes walletInfo (address), not private key.
+  // Signing is performed via secure callbacks after user approval.
   const {
     onMessage,
     primaryButton,
@@ -71,12 +282,17 @@ export default function BrowserScreen() {
     webViewRef,
     domain,
     url: currentUrl,
+    walletInfo,
     onReady: handleMiniAppReady,
     onClose: handleMiniAppClose,
+    // SECURE signing callbacks - perform signing after user approval
+    onSendTransaction: handleSendTransaction,
+    onSignTransaction: handleSignTransaction,
+    onSignMessage: handleSignMessage,
+    onSignTypedData: handleSignTypedData,
   });
-  logger.log('[Browser] MiniApp bridge setup complete');
 
-  const handleNavigationStateChange = (navState: any) => {
+  const handleNavigationStateChange = (navState: { canGoBack: boolean; canGoForward: boolean; url: string; title?: string; loading?: boolean }) => {
     setCanGoBack(navState.canGoBack);
     setCanGoForward(navState.canGoForward);
     setCurrentUrl(navState.url);
@@ -115,8 +331,8 @@ export default function BrowserScreen() {
         message: currentUrl,
         title: title,
       });
-    } catch (error) {
-      console.error('Error sharing:', error);
+    } catch {
+      // User cancelled share or share sheet failed — no action needed
     }
   };
 
@@ -124,6 +340,17 @@ export default function BrowserScreen() {
     // In a real app, you would use Linking.openURL(currentUrl)
     // For now, we'll just go back
     router.back();
+  };
+
+  const handleShowTransactionWarning = () => {
+    // Cycle through warning types for demo
+    const types: ('simulation-failed' | 'no-entitlements' | 'not-declared' | 'ok')[] =
+      ['simulation-failed', 'no-entitlements', 'not-declared', 'ok'];
+    const currentIndex = types.indexOf(warningType);
+    const nextIndex = (currentIndex + 1) % types.length;
+    const nextType = types[nextIndex];
+    setWarningType(nextType);
+    setShowTransactionWarning(true);
   };
 
   // Handle primary button press
@@ -137,7 +364,7 @@ export default function BrowserScreen() {
   const getDomain = (url: string, isQNative: boolean) => {
     try {
       const domain = new URL(url).hostname;
-      return domain.replace('www.', '');
+      return isQNative ? domain.replace('www.', '').replace('swap.cow.fi', 'cowswap.q') : domain.replace('www.', '');
     } catch {
       return url;
     }
@@ -194,13 +421,26 @@ export default function BrowserScreen() {
         </View>
       )}
 
-      {/* WebView */}
+      {/* WebView - only render when wallet is ready to ensure provider is available */}
       <View style={styles.webViewContainer}>
+        {walletReady ? (
         <WebView
           ref={webViewRef}
           source={{ uri: currentUrl }}
           onNavigationStateChange={handleNavigationStateChange}
           onMessage={(e) => {
+            // Handle incoming messages from WebView
+            try {
+              const data = JSON.parse(e.nativeEvent.data);
+              if (data.type === '__CONSOLE__') {
+                return; // Don't pass console messages to Comlink
+              }
+              if (data.type === '__NETWORK__') {
+                return; // Don't pass network messages to Comlink
+              }
+            } catch {
+              // Not JSON, pass through to Comlink
+            }
             onMessage(e);
           }}
           startInLoadingState
@@ -210,6 +450,95 @@ export default function BrowserScreen() {
             </View>
           )}
           style={styles.webView}
+          // Inject console log interceptor and network request logger
+          injectedJavaScript={`
+            (function() {
+              if (window.__interceptorsInitialized) return;
+              window.__interceptorsInitialized = true;
+
+              function sendToRN(type, data) {
+                try {
+                  window.ReactNativeWebView.postMessage(JSON.stringify({ type, ...data }));
+                } catch (e) {}
+              }
+
+              // Fetch interception
+              const originalFetch = window.fetch;
+              window.fetch = async function(input, init) {
+                const url = typeof input === 'string' ? input : input.url;
+                const method = init?.method || 'GET';
+                const body = init?.body;
+
+                sendToRN('__NETWORK__', {
+                  direction: 'request',
+                  method,
+                  url,
+                  body: body ? (typeof body === 'string' ? body.substring(0, 1000) : '[non-string body]') : null,
+                });
+
+                try {
+                  const response = await originalFetch.apply(this, arguments);
+                  const clonedResponse = response.clone();
+
+                  clonedResponse.text().then(text => {
+                    sendToRN('__NETWORK__', {
+                      direction: 'response',
+                      method,
+                      url,
+                      status: response.status,
+                      body: text.substring(0, 2000),
+                    });
+                  }).catch(() => {});
+
+                  return response;
+                } catch (error) {
+                  sendToRN('__NETWORK__', {
+                    direction: 'error',
+                    method,
+                    url,
+                    error: getErrorMessage(error),
+                  });
+                  throw error;
+                }
+              };
+
+              // XMLHttpRequest interception
+              const originalXHR = window.XMLHttpRequest;
+              window.XMLHttpRequest = function() {
+                const xhr = new originalXHR();
+                const originalOpen = xhr.open;
+                const originalSend = xhr.send;
+                let method, url;
+
+                xhr.open = function(m, u) {
+                  method = m;
+                  url = u;
+                  sendToRN('__NETWORK__', { direction: 'request', method, url, type: 'xhr' });
+                  return originalOpen.apply(this, arguments);
+                };
+
+                xhr.send = function(body) {
+                  xhr.addEventListener('load', function() {
+                    sendToRN('__NETWORK__', {
+                      direction: 'response',
+                      method,
+                      url,
+                      status: xhr.status,
+                      body: xhr.responseText.substring(0, 2000),
+                      type: 'xhr',
+                    });
+                  });
+                  xhr.addEventListener('error', function() {
+                    sendToRN('__NETWORK__', { direction: 'error', method, url, type: 'xhr' });
+                  });
+                  return originalSend.apply(this, arguments);
+                };
+
+                return xhr;
+              };
+            })();
+            true;
+          `}
           // Enable back/forward gestures based on mini app state
           allowsBackForwardNavigationGestures={!backEnabled}
           // Security settings
@@ -227,9 +556,15 @@ export default function BrowserScreen() {
           // Set user agent for mini app detection
           userAgent="quorum-mobile"
         />
+        ) : (
+          <View style={styles.splashOverlay}>
+            <ActivityIndicator size="large" color={theme.colors.primary} />
+            <Text style={styles.splashText}>Preparing wallet...</Text>
+          </View>
+        )}
 
         {/* Splash Screen Overlay */}
-        {showSplash && (
+        {walletReady && showSplash && (
           <View style={styles.splashOverlay}>
             <ActivityIndicator size="large" color={theme.colors.primary} />
             <Text style={styles.splashText}>Loading {name || 'app'}...</Text>
@@ -282,6 +617,10 @@ export default function BrowserScreen() {
             color={canGoForward ? theme.colors.textMain : theme.colors.textMuted}
           />
         </TouchableOpacity>
+{/* 
+        <TouchableOpacity onPress={handleShowTransactionWarning} style={styles.navButton}>
+          <IconSymbol name="exclamationmark.shield.fill" size={20} color={theme.colors.warning} />
+        </TouchableOpacity> */}
 
         <TouchableOpacity onPress={handleShare} style={styles.navButton}>
           <IconSymbol name="square.and.arrow.up" size={20} color={theme.colors.textMain} />
@@ -292,11 +631,33 @@ export default function BrowserScreen() {
         </TouchableOpacity>
       </View>
 
+      {/* Transaction Warning Modal
+      <TransactionWarningModal
+        visible={showTransactionWarning}
+        onClose={() => setShowTransactionWarning(false)}
+        onProceed={() => {
+          setShowTransactionWarning(false);
+        }}
+        warningType={warningType}
+        transactionData={{
+          to: '0xCe4Eb76664210426e900C20D4A3741A6b0f64855',
+          value: '0.1 ETH',
+          gas: '21,000',
+          function: 'transfer(address,uint256)',
+        }}
+      /> */}
+
+      {/* Mini App Approval Modal for wallet transactions and signing */}
+      <MiniAppApprovalModal
+        visible={showApprovalModal}
+        request={approvalRequest}
+        onClose={handleApprovalModalClose}
+      />
     </View>
   );
 }
 
-const createStyles = (theme: any, isDark: boolean, insets: any, isQNative: boolean) =>
+const createStyles = (theme: AppTheme, isDark: boolean, insets: EdgeInsets, isQNative: boolean) =>
   StyleSheet.create({
     container: {
       flex: 1,

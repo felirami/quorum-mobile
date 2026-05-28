@@ -7,7 +7,6 @@
  * - Handle errors with rollback
  */
 
-import { logger } from '@quilibrium/quorum-shared';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { useAuth, useWebSocket } from '@/context';
 import {
@@ -23,6 +22,7 @@ export interface UseSendSpaceMessageParams {
   channelId: string;
   text: string;
   repliesToMessageId?: string;
+  replyToAuthorAddress?: string;
 }
 
 export function useSendSpaceMessage() {
@@ -32,36 +32,28 @@ export function useSendSpaceMessage() {
 
   return useMutation({
     mutationFn: async (params: UseSendSpaceMessageParams) => {
-      logger.log('[useSendSpaceMessage] mutationFn called with:', params);
-      logger.log('[useSendSpaceMessage] user?.address:', user?.address);
-      logger.log('[useSendSpaceMessage] WebSocket connected:', isConnected);
-
       if (!user?.address) {
-        console.error('[useSendSpaceMessage] No user address!');
         throw new Error('User must be logged in to send messages');
       }
 
       if (!isConnected) {
-        console.error('[useSendSpaceMessage] WebSocket not connected!');
         throw new Error('Not connected to server. Please wait for connection.');
       }
 
-      logger.log('[useSendSpaceMessage] Calling sendSpaceMessage...');
       const result = await sendSpaceMessage({
         spaceId: params.spaceId,
         channelId: params.channelId,
         text: params.text,
         senderAddress: user.address,
         repliesToMessageId: params.repliesToMessageId,
+        replyToAuthorAddress: params.replyToAuthorAddress,
       });
 
       // Send via WebSocket
-      logger.log('[useSendSpaceMessage] Sending via WebSocket...');
       enqueueOutbound(async () => {
         return [result.wsEnvelope];
       });
 
-      logger.log('[useSendSpaceMessage] Message queued successfully:', result.message.messageId);
       return result.message;
     },
 
@@ -85,6 +77,7 @@ export function useSendSpaceMessage() {
           text: params.text,
           senderAddress: user.address,
           repliesToMessageId: params.repliesToMessageId,
+          replyToAuthorAddress: params.replyToAuthorAddress,
         },
         tempId
       );
@@ -114,8 +107,6 @@ export function useSendSpaceMessage() {
     },
 
     onError: (err, params, context) => {
-      console.error('[useSendSpaceMessage] Error:', err);
-
       // Rollback on error
       if (context?.previousData) {
         const key = ['messages', 'infinite', params.spaceId, params.channelId];
@@ -161,11 +152,7 @@ export function useSendSpaceMessage() {
       );
     },
 
-    onSettled: (data, err, params) => {
-      // Always refetch after mutation settles
-      queryClient.invalidateQueries({
-        queryKey: ['messages', 'infinite', params.spaceId, params.channelId],
-      });
-    },
+    // No onSettled invalidate — refetching can race a transiently-empty
+    // SQLite (cold cipher cache, migration in flight) and wipe the cache.
   });
 }

@@ -12,8 +12,8 @@
  * Matches desktop SpaceService behavior for full compatibility.
  */
 
-import { logger } from '@quilibrium/quorum-shared';
-import { sha256 } from '@noble/hashes/sha2';
+import { base64ToHex, numberArrayToBase64 } from '@/utils/encoding';
+import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex, int64ToBytes, type KickMessage, type Message, type NavItem, type Space } from '@quilibrium/quorum-shared';
 import bs58 from 'bs58';
 import * as multihashes from 'multihashes';
@@ -65,38 +65,12 @@ function deriveAddress(publicKeyBytes: Uint8Array): string {
 }
 
 /**
- * Convert number array to base64 string
- */
-function numberArrayToBase64(arr: number[]): string {
-  const uint8 = new Uint8Array(arr);
-  let binary = '';
-  for (let i = 0; i < uint8.length; i++) {
-    binary += String.fromCharCode(uint8[i]);
-  }
-  return btoa(binary);
-}
-
-/**
- * Convert base64 string to hex
- */
-function base64ToHex(base64: string): string {
-  const binary = atob(base64);
-  let hex = '';
-  for (let i = 0; i < binary.length; i++) {
-    hex += binary.charCodeAt(i).toString(16).padStart(2, '0');
-  }
-  return hex;
-}
-
-/**
  * Create a new space with full API registration
  */
 export async function createSpace(params: CreateSpaceParams): Promise<CreateSpaceResult> {
   const client = getQuorumClient();
   const cryptoProvider = new NativeCryptoProvider();
   const timestamp = Date.now();
-
-  logger.log('[SpaceService] Creating space:', params.name);
 
   // 1. Generate all required keypairs
   // Space key (Ed448) - for signing space operations
@@ -133,8 +107,6 @@ export async function createSpace(params: CreateSpaceParams): Promise<CreateSpac
   const ownerPublicKeyHex = bytesToHex(new Uint8Array(ownerKeypair.public_key));
   const ownerPrivateKeyHex = bytesToHex(new Uint8Array(ownerKeypair.private_key));
 
-  logger.log('[SpaceService] Generated keypairs, spaceAddress:', spaceAddress);
-
   // 2. Build and sign payloads for space registration
   // Payload: space_public_key + config_public_key + owner_public_key + timestamp
   const timestampBytes = int64ToBytes(timestamp);
@@ -156,8 +128,6 @@ export async function createSpace(params: CreateSpaceParams): Promise<CreateSpac
   const ownerSignatureBase64 = await cryptoProvider.signEd448(ownerPrivateKeyBase64, payloadBase64);
   const ownerSignatureHex = base64ToHex(ownerSignatureBase64);
 
-  logger.log('[SpaceService] Signed payloads, registering with API');
-
   // 3. Register space with API
   try {
     await client.postSpace(spaceAddress, {
@@ -169,9 +139,7 @@ export async function createSpace(params: CreateSpaceParams): Promise<CreateSpac
       owner_signatures: [ownerSignatureHex],
       timestamp,
     });
-    logger.log('[SpaceService] Space registered with API');
   } catch (error) {
-    logger.log('[SpaceService] Failed to register space:', error);
     throw new Error(`Failed to register space: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
 
@@ -231,20 +199,16 @@ export async function createSpace(params: CreateSpaceParams): Promise<CreateSpac
   const manifestSignatureBase64 = await cryptoProvider.signEd448(ownerPrivateKeyBase64, manifestPayloadBase64);
   const manifestSignatureHex = base64ToHex(manifestSignatureBase64);
 
-  try {
-    await client.postSpaceManifest(spaceAddress, {
-      space_address: spaceAddress,
-      space_manifest: ciphertext,
-      ephemeral_public_key: bytesToHex(new Uint8Array(ephemeralKeypair.public_key)),
-      timestamp,
-      owner_public_key: ownerPublicKeyHex,
-      owner_signature: manifestSignatureHex,
-    });
-    logger.log('[SpaceService] Space manifest uploaded');
-  } catch (error) {
-    logger.log('[SpaceService] Failed to upload manifest:', error);
-    // Continue - the space is registered, just won't have manifest
-  }
+  // Manifest upload — fail loudly. A silent swallow here used to leave
+  // spaces in a state where every invite would 404 against the server.
+  await client.postSpaceManifest(spaceAddress, {
+    space_address: spaceAddress,
+    space_manifest: ciphertext,
+    ephemeral_public_key: bytesToHex(new Uint8Array(ephemeralKeypair.public_key)),
+    timestamp,
+    owner_public_key: ownerPublicKeyHex,
+    owner_signature: manifestSignatureHex,
+  });
 
   // 6. Register inbox with hub
   // Hub signature: sign("add" + inbox_public_key_hex)
@@ -271,9 +235,7 @@ export async function createSpace(params: CreateSpaceParams): Promise<CreateSpac
       inbox_public_key: inboxPublicKeyHex,
       inbox_signature: inboxSignatureHex,
     });
-    logger.log('[SpaceService] Inbox registered with hub');
   } catch (error) {
-    logger.log('[SpaceService] Failed to register with hub:', error);
     // Continue - space is created, just won't receive real-time updates
   }
 
@@ -285,7 +247,6 @@ export async function createSpace(params: CreateSpaceParams): Promise<CreateSpac
     privateKey: configPrivateKeyHex,
   });
 
-  logger.log('[SpaceService] Saving hub key for space:', spaceAddress, 'address:', hubAddress);
   saveSpaceKey({
     spaceId: spaceAddress,
     keyId: 'hub',
@@ -293,18 +254,6 @@ export async function createSpace(params: CreateSpaceParams): Promise<CreateSpac
     publicKey: hubPublicKeyHex,
     privateKey: hubPrivateKeyHex,
   });
-
-  // Verify the key was saved
-  const savedHubKey = getSpaceKey(spaceAddress, 'hub');
-  if (!savedHubKey) {
-    logger.log('[SpaceService] Hub key was not saved correctly!');
-  } else {
-    logger.log('[SpaceService] Hub key verified:', {
-      hasAddress: !!savedHubKey.address,
-      hasPublicKey: !!savedHubKey.publicKey,
-      hasPrivateKey: !!savedHubKey.privateKey,
-    });
-  }
 
   saveSpaceKey({
     spaceId: spaceAddress,
@@ -340,7 +289,6 @@ export async function createSpace(params: CreateSpaceParams): Promise<CreateSpac
   // Also save to mmkvAdapter so useSpaces hook can find it
   const adapter = getMMKVAdapter();
   await adapter.saveSpace(space);
-  logger.log('[SpaceService] Space saved locally');
 
   // 8.1 Save creator as a member of the space
   await adapter.saveSpaceMember(spaceAddress, {
@@ -349,7 +297,6 @@ export async function createSpace(params: CreateSpaceParams): Promise<CreateSpac
     profile_image: params.userIcon,
     inbox_address: inboxAddress,
   });
-  logger.log('[SpaceService] Creator saved as space member');
 
   // 9. Establish Triple Ratchet session for space messaging with invite pool
   const conversationId = `${spaceAddress}/${spaceAddress}`;
@@ -385,7 +332,6 @@ export async function createSpace(params: CreateSpaceParams): Promise<CreateSpac
 
     // Establish the Triple Ratchet session with invite pool generation
     // This runs a 4-party DKG and generates the evals pool for invites
-    logger.log('[SpaceService] Establishing Triple Ratchet session with invite pool...');
     const sessionResult = await establishTripleRatchetSessionForSpace(
       userKeyset,
       deviceKeyset,
@@ -402,27 +348,12 @@ export async function createSpace(params: CreateSpaceParams): Promise<CreateSpac
       evals: sessionResult.evals,
     });
 
-    // DEBUG: Verify structure before saving
-    const debugParsed = JSON.parse(stateToSave);
-    logger.log('[SpaceService] DEBUG - About to save state with keys:', Object.keys(debugParsed));
-    logger.log('[SpaceService] DEBUG - Has template:', !!debugParsed.template);
-    logger.log('[SpaceService] DEBUG - Has evals:', !!debugParsed.evals, 'count:', debugParsed.evals?.length);
-
     encryptionStateStorage.saveEncryptionState({
       conversationId,
       inboxId: inboxAddress,
       state: stateToSave,
       timestamp,
     });
-
-    // DEBUG: Verify state was saved correctly
-    const savedStates = encryptionStateStorage.getEncryptionStates(conversationId);
-    if (savedStates.length > 0) {
-      const savedParsed = JSON.parse(savedStates[0].state);
-      logger.log('[SpaceService] DEBUG - Saved state has keys:', Object.keys(savedParsed));
-      logger.log('[SpaceService] DEBUG - Saved has template:', !!savedParsed.template);
-      logger.log('[SpaceService] DEBUG - Saved has evals:', !!savedParsed.evals, 'count:', savedParsed.evals?.length);
-    }
 
     // Also save as fallback state - critical for mobile-to-mobile messaging
     // When a joiner sends a message and the creator decrypts it, the creator's state evolves.
@@ -435,10 +366,7 @@ export async function createSpace(params: CreateSpaceParams): Promise<CreateSpac
       timestamp,
     });
 
-    logger.log('[SpaceService] Triple Ratchet session established with', sessionResult.evals.length, 'invite slots');
-    logger.log('[SpaceService] Saved fallback state for creator to match desktop behavior');
   } catch (trError) {
-    logger.log('[SpaceService] Failed to establish Triple Ratchet session:', trError);
     // Save a placeholder state so we know the space exists
     // Invites won't work but messaging might still function
     encryptionStateStorage.saveEncryptionState({
@@ -464,14 +392,10 @@ export async function createSpace(params: CreateSpaceParams): Promise<CreateSpac
         items: [...(config.items || []), newSpaceItem],
       };
       await saveConfig(updatedConfig);
-      logger.log('[SpaceService] User config updated');
     }
   } catch (error) {
-    logger.log('[SpaceService] Failed to update config:', error);
     // Non-fatal - space is created
   }
-
-  logger.log('[SpaceService] Space created successfully:', spaceAddress);
 
   return {
     spaceId: spaceAddress,
@@ -479,6 +403,101 @@ export async function createSpace(params: CreateSpaceParams): Promise<CreateSpac
     hubAddress,
     inboxAddress,
   };
+}
+
+/**
+ * Re-publish an existing space to the API server using locally stored keys.
+ * Used by the invite self-heal path: when the API server has no record of
+ * the space (404 on manifest GET), the original creation-time POST must
+ * have failed silently. We re-run the three publish steps (registration,
+ * hub-membership, manifest) with fresh signatures.
+ *
+ * Idempotent on the server — postSpace and postSpaceManifest accept
+ * timestamp-newer-wins, postHubAdd is a no-op when the membership is
+ * already set. Throws on the first failure so the caller sees what went
+ * wrong instead of guessing.
+ */
+export async function republishSpace(spaceId: string): Promise<void> {
+  const space = getSpace(spaceId);
+  if (!space) throw new Error('Space not found locally; cannot republish.');
+
+  const spaceKey = getSpaceKey(spaceId, spaceId);
+  const configKey = getSpaceKey(spaceId, 'config');
+  const ownerKey = getSpaceKey(spaceId, 'owner');
+  const hubKey = getSpaceKey(spaceId, 'hub');
+  const inboxKey = getSpaceKey(spaceId, 'inbox');
+  if (
+    !spaceKey?.publicKey || !spaceKey.privateKey ||
+    !configKey?.publicKey ||
+    !ownerKey?.publicKey || !ownerKey.privateKey ||
+    !hubKey?.publicKey || !hubKey.privateKey || !hubKey.address ||
+    !inboxKey?.publicKey || !inboxKey.privateKey
+  ) {
+    throw new Error('Local keys incomplete; cannot republish space.');
+  }
+
+  const client = getQuorumClient();
+  const cryptoProvider = new NativeCryptoProvider();
+  const timestamp = Date.now();
+
+  // 1. Re-register space (postSpace).
+  const timestampBytes = int64ToBytes(timestamp);
+  const payloadBytes = new Uint8Array([
+    ...hexToBytes(spaceKey.publicKey),
+    ...hexToBytes(configKey.publicKey),
+    ...hexToBytes(ownerKey.publicKey),
+    ...timestampBytes,
+  ]);
+  const payloadBase64 = numberArrayToBase64(Array.from(payloadBytes));
+
+  const spacePrivateKeyBase64 = numberArrayToBase64(Array.from(hexToBytes(spaceKey.privateKey)));
+  const spaceSignatureHex = base64ToHex(
+    await cryptoProvider.signEd448(spacePrivateKeyBase64, payloadBase64)
+  );
+
+  const ownerPrivateKeyBase64 = numberArrayToBase64(Array.from(hexToBytes(ownerKey.privateKey)));
+  const ownerSignatureHex = base64ToHex(
+    await cryptoProvider.signEd448(ownerPrivateKeyBase64, payloadBase64)
+  );
+
+  await client.postSpace(spaceId, {
+    space_address: spaceId,
+    space_public_key: spaceKey.publicKey,
+    space_signature: spaceSignatureHex,
+    config_public_key: configKey.publicKey,
+    owner_public_keys: [ownerKey.publicKey],
+    owner_signatures: [ownerSignatureHex],
+    timestamp,
+  });
+
+  // 2. Re-add inbox to hub (postHubAdd). Server treats existing membership
+  // as a 200 no-op, so this is safe to retry.
+  const addInboxMessage = 'add' + inboxKey.publicKey;
+  const addInboxBase64 = numberArrayToBase64(Array.from(new TextEncoder().encode(addInboxMessage)));
+  const hubPrivateKeyBase64 = numberArrayToBase64(Array.from(hexToBytes(hubKey.privateKey)));
+  const hubSigForAdd = base64ToHex(
+    await cryptoProvider.signEd448(hubPrivateKeyBase64, addInboxBase64)
+  );
+
+  const addHubMessage = 'add' + hubKey.publicKey;
+  const addHubBase64 = numberArrayToBase64(Array.from(new TextEncoder().encode(addHubMessage)));
+  const inboxPrivateKeyBase64 = numberArrayToBase64(Array.from(hexToBytes(inboxKey.privateKey)));
+  const inboxSigForAdd = base64ToHex(
+    await cryptoProvider.signEd448(inboxPrivateKeyBase64, addHubBase64)
+  );
+
+  await client.postHubAdd({
+    hub_address: hubKey.address,
+    hub_public_key: hubKey.publicKey,
+    hub_signature: hubSigForAdd,
+    inbox_public_key: inboxKey.publicKey,
+    inbox_signature: inboxSigForAdd,
+  });
+
+  // 3. Re-encrypt + upload the manifest. Reuses broadcastSpaceUpdate so we
+  // keep the encryption logic in one place.
+  const { broadcastSpaceUpdate } = await import('./broadcastSpaceUpdate');
+  await broadcastSpaceUpdate(space);
 }
 
 export interface KickUserParams {
@@ -513,15 +532,12 @@ export async function kickUser(params: KickUserParams): Promise<KickUserResult> 
   const adapter = getMMKVAdapter();
   const timestamp = Date.now();
 
-  logger.log('[SpaceService.kickUser] Starting kick for:', userAddress, 'from space:', spaceId);
-
   // Get required keys
   const spaceKey = getSpaceKey(spaceId, spaceId);
   const ownerKey = getSpaceKey(spaceId, 'owner');
   const hubKey = getSpaceKey(spaceId, 'hub');
 
   if (!spaceKey || !ownerKey || !hubKey) {
-    console.error('[SpaceService.kickUser] Missing required keys');
     throw new Error('Missing required keys for kick operation');
   }
 
@@ -534,7 +550,6 @@ export async function kickUser(params: KickUserParams): Promise<KickUserResult> 
   // Get the OLD config key BEFORE generating new one - needed for sealing rekey messages
   const oldConfigKey = getSpaceKey(spaceId, 'config');
   const oldConfigPublicKeyArray = oldConfigKey ? Array.from(hexToBytes(oldConfigKey.publicKey)) : undefined;
-  logger.log('[SpaceService.kickUser] Old config key exists:', !!oldConfigKey);
 
   // 1. Generate new config keypair
   const newConfigKeypair = await cryptoProvider.generateX448();
@@ -548,8 +563,6 @@ export async function kickUser(params: KickUserParams): Promise<KickUserResult> 
     publicKey: newConfigPublicKeyHex,
     privateKey: newConfigPrivateKeyHex,
   });
-
-  logger.log('[SpaceService.kickUser] Generated new config key');
 
   // 2. Build and sign new space registration payload
   const timestampBytes = int64ToBytes(timestamp);
@@ -585,9 +598,7 @@ export async function kickUser(params: KickUserParams): Promise<KickUserResult> 
       owner_signatures: [ownerSignatureHex],
       timestamp,
     });
-    logger.log('[SpaceService.kickUser] Updated space registration');
   } catch (error) {
-    console.error('[SpaceService.kickUser] Failed to update space registration:', error);
     throw error;
   }
 
@@ -630,9 +641,7 @@ export async function kickUser(params: KickUserParams): Promise<KickUserResult> 
       owner_public_key: ownerKey.publicKey,
       owner_signature: manifestSignatureHex,
     });
-    logger.log('[SpaceService.kickUser] Updated space manifest');
   } catch (error) {
-    console.error('[SpaceService.kickUser] Failed to update manifest:', error);
     // Continue with kick - manifest update is not critical
   }
 
@@ -647,8 +656,6 @@ export async function kickUser(params: KickUserParams): Promise<KickUserResult> 
          m.address !== userAddress &&
          m.address !== selfAddress
   );
-
-  logger.log('[SpaceService.kickUser] Sending rekey to', filteredMembers.length, 'members');
 
   // 6. Create and send sync envelopes to remaining members
   const outbounds: string[] = [];
@@ -678,7 +685,6 @@ export async function kickUser(params: KickUserParams): Promise<KickUserResult> 
       const peerKey = getSpaceKey(spaceId, 'peer');
 
       if (!inboxKey || !userKey) {
-        logger.warn('[SpaceService.kickUser] Missing keys for full rekey, falling back to simple rekey');
       } else {
         // Build keysets for re-establishing session
         const userKeyset: UserKeyset = {
@@ -729,7 +735,6 @@ export async function kickUser(params: KickUserParams): Promise<KickUserResult> 
         const registration = await constructUserRegistration(userKeyset, [], [deviceKeyset]);
 
         // Re-establish Triple Ratchet session with enough evals for remaining members
-        logger.log('[SpaceService.kickUser] Re-establishing Triple Ratchet session for rekey');
         const session = await establishTripleRatchetSessionForSpace(
           userKeyset,
           deviceKeyset,
@@ -775,8 +780,6 @@ export async function kickUser(params: KickUserParams): Promise<KickUserResult> 
           timestamp: Date.now(),
         });
 
-        logger.log('[SpaceService.kickUser] Updated own encryption state with new peer maps');
-
         // Send personalized rekey to each remaining member
         idCounter = 2;
         for (const member of filteredMembers) {
@@ -789,7 +792,6 @@ export async function kickUser(params: KickUserParams): Promise<KickUserResult> 
             })?.[0];
 
             if (!memberInboxPubKey || !newIdPeerMap[idCounter]) {
-              logger.warn('[SpaceService.kickUser] Could not find peer info for member, sending simple rekey:', member.address);
               // Fall back to simple rekey
               const rekeyMessage = JSON.stringify({
                 type: 'control',
@@ -829,7 +831,6 @@ export async function kickUser(params: KickUserParams): Promise<KickUserResult> 
             // Get eval for this member
             const evalSecret = session.evals.shift();
             if (!evalSecret) {
-              logger.warn('[SpaceService.kickUser] Ran out of evals for member:', member.address);
               idCounter++;
               continue;
             }
@@ -881,19 +882,15 @@ export async function kickUser(params: KickUserParams): Promise<KickUserResult> 
             );
 
             outbounds.push(JSON.stringify({ type: 'sync', ...syncEnvelope }));
-            logger.log('[SpaceService.kickUser] Created personalized rekey for member:', member.address);
             idCounter++;
           } catch (memberError) {
-            console.error('[SpaceService.kickUser] Failed to create rekey for member:', member.address, memberError);
           }
         }
 
         // Update evals pool
         saveSpaceInviteEvals(spaceId, session.evals);
-        logger.log('[SpaceService.kickUser] Updated invite evals pool with', session.evals.length, 'remaining evals');
       }
     } catch (rekeyError) {
-      console.error('[SpaceService.kickUser] Full rekey failed, falling back to simple rekey:', rekeyError);
       // Fall back to simple rekey for all members
       for (const member of filteredMembers) {
         if (!member.inbox_address) continue;
@@ -919,8 +916,8 @@ export async function kickUser(params: KickUserParams): Promise<KickUserResult> 
             oldConfigPublicKeyArray
           );
           outbounds.push(JSON.stringify({ type: 'sync', ...syncEnvelope }));
-        } catch (error) {
-          console.error('[SpaceService.kickUser] Failed to create simple rekey:', error);
+        } catch {
+          // Encryption to this member failed (bad key, etc.) — skip and continue with others
         }
       }
     }
@@ -950,8 +947,8 @@ export async function kickUser(params: KickUserParams): Promise<KickUserResult> 
           oldConfigPublicKeyArray
         );
         outbounds.push(JSON.stringify({ type: 'sync', ...syncEnvelope }));
-      } catch (error) {
-        console.error('[SpaceService.kickUser] Failed to create rekey envelope:', error);
+      } catch {
+        // Encryption to this member failed — skip and continue with others
       }
     }
   }
@@ -978,9 +975,8 @@ export async function kickUser(params: KickUserParams): Promise<KickUserResult> 
       );
 
       outbounds.push(JSON.stringify({ type: 'sync', ...kickEnvelope }));
-      logger.log('[SpaceService.kickUser] Sent kick notification to kicked user');
-    } catch (error) {
-      console.error('[SpaceService.kickUser] Failed to send kick notification:', error);
+    } catch {
+      // Failed to encrypt kick notification — the user will still be kicked locally
     }
   }
 
@@ -991,7 +987,6 @@ export async function kickUser(params: KickUserParams): Promise<KickUserResult> 
       inbox_address: '',
       isKicked: true,
     });
-    logger.log('[SpaceService.kickUser] Marked user as kicked locally');
   }
 
   // 8.5 Save kick event as a message (for chat history)
@@ -1014,7 +1009,6 @@ export async function kickUser(params: KickUserParams): Promise<KickUserResult> 
     } as KickMessage,
   };
   await adapter.saveMessage(kickMessage, timestamp, '', '', '', '');
-  logger.log('[SpaceService.kickUser] Saved kick message to chat history');
 
   // 9. Update invite URL with new config key
   const inviteUrl = `quorum://join#spaceId=${spaceId}&configKey=${newConfigPrivateKeyHex}`;
@@ -1024,8 +1018,6 @@ export async function kickUser(params: KickUserParams): Promise<KickUserResult> 
   };
   saveSpace(spaceWithInvite);
   await adapter.saveSpace(spaceWithInvite);
-
-  logger.log('[SpaceService.kickUser] Kick completed, sending', outbounds.length, 'envelopes');
 
   return {
     success: true,
@@ -1052,7 +1044,6 @@ function saveSpaceInviteEvals(spaceId: string, evals: number[][]): void {
   const encryptionStates = encryptionStateStorage.getEncryptionStates(spaceConversationId);
 
   if (encryptionStates.length === 0) {
-    logger.warn('[SpaceService] No encryption state to update with new evals');
     return;
   }
 
@@ -1079,8 +1070,6 @@ function saveSpaceInviteEvals(spaceId: string, evals: number[][]): void {
     state: JSON.stringify(updatedState),
     timestamp: Date.now(),
   });
-
-  logger.log('[SpaceService] Updated evals pool, remaining:', evals.length);
 }
 
 /**

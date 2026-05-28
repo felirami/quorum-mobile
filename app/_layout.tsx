@@ -1,14 +1,24 @@
-// Crypto polyfill - must be first import
-import { logger } from '@quilibrium/quorum-shared';
-import 'react-native-get-random-values';
+// NOTE: Polyfills (Buffer, react-native-get-random-values) AND the
+// background-task `defineTask` registration are installed BEFORE expo-router
+// boots, in `index.js` (the custom entry point). Route files are discovered
+// via require.context, so _layout.tsx is not guaranteed to evaluate before
+// the OS dispatches a background-task wakeup — registering the handler from
+// here was a silent no-op when iOS BGTaskScheduler / Android WorkManager
+// woke the app, because the JS bridge had finished initializing and looked
+// up the handler before the route tree had been imported. Don't add the
+// import back here.
 
-// Background task registration - must be imported early before any React components
-// This registers the background fetch task with the native module
-import '../services/notifications/backgroundTask';
+// Global error reporter — install before any provider mounts so it can
+// surface uncaught errors and unhandled promise rejections that React's
+// <ErrorBoundary> doesn't catch (event handlers, async callbacks, etc.).
+import { installGlobalErrorReporter } from '@/services/observability/globalErrorReporter';
+installGlobalErrorReporter();
 
-// Log environment check at startup - remove after verifying
-console.log('[App] __DEV__:', typeof __DEV__ !== 'undefined' ? __DEV__ : 'undefined');
-console.log('[App] logger.isEnabled():', logger.isEnabled());
+// React Query <-> RN bridges. Without these, refetchInterval and
+// refetchOnWindowFocus don't fire reliably on RN because the focus
+// manager never sees an "active" state.
+import { installReactQueryRnBridges } from '@/services/observability/reactQueryRnBridges';
+installReactQueryRnBridges();
 
 import { QueryClient } from '@tanstack/react-query';
 import { PersistQueryClientProvider } from '@tanstack/react-query-persist-client';
@@ -16,21 +26,31 @@ import { useFonts } from 'expo-font';
 import { Slot, router, useSegments } from 'expo-router';
 import * as SplashScreen from 'expo-splash-screen';
 import { StatusBar } from 'expo-status-bar';
+import * as SystemUI from 'expo-system-ui';
 import React from 'react';
-import { ActivityIndicator, View } from 'react-native';
+import { ActivityIndicator, Platform, View } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import 'react-native-reanimated';
 
-// Prevent the splash screen from auto-hiding
-SplashScreen.preventAutoHideAsync();
+// Prevent the splash screen from auto-hiding (guarded for Fast Refresh)
+let splashScreenPrevented = false;
+if (!splashScreenPrevented) {
+  splashScreenPrevented = true;
+  SplashScreen.preventAutoHideAsync();
+}
 
 import {
   ApiClientProvider,
   AuthProvider,
   StorageProvider,
   WebSocketProvider,
+  SpaceCallProvider,
+  CallProvider,
   useAuth,
 } from '@/context';
+import { ToastProvider } from '@/context/ToastContext';
+import { CallOverlay, SpaceCallOverlay } from '@/components/Call';
+import { ErrorBoundary } from '@/components/ErrorBoundary';
 import { queryConfig } from '@/services/api';
 import { queryPersister } from '@/services/offline';
 import {
@@ -38,6 +58,11 @@ import {
   registerBackgroundFetch,
   setupNotificationResponseListener,
 } from '@/services/notifications';
+import {
+  registerPushTokenWithQuorum,
+  startPushTokenRotationListener,
+} from '@/services/notifications/pushRegistration';
+import { registerBackgroundNotificationTask } from '@/services/notifications/pushReceivedTask';
 import { CustomThemeProvider, useTheme } from '@/theme';
 
 // Wrapper to inject auth info into ApiClientProvider
@@ -67,8 +92,6 @@ function AuthRouter() {
   // Check if we're in the onboarding route group
   const inOnboarding = segments[0] === '(onboarding)';
 
-  logger.log('AuthRouter:', { authState, inOnboarding, segments: segments.join('/') });
-
   // Initialize notifications when user is authenticated
   React.useEffect(() => {
     if (authState !== 'authenticated' || notificationsInitializedRef.current) {
@@ -82,25 +105,29 @@ function AuthRouter() {
         // Request permissions and set up notification channel
         const granted = await initializeNotifications();
         if (granted) {
-          logger.log('[App] Notifications initialized');
-
-          // Register background fetch task
-          const registered = await registerBackgroundFetch();
-          if (registered) {
-            logger.log('[App] Background fetch registered');
-          }
+          // Register background fetch task — fallback only; primary
+          // delivery is server-pushed via Expo (see pushRegistration).
+          await registerBackgroundFetch();
+          // Tell the OS to dispatch silent pushes to our background task
+          // handler (defined in pushReceivedTask, registered in index.js).
+          await registerBackgroundNotificationTask();
+          // Bind this device's Expo token to every inbox the user holds
+          // so quorum-api can wake us when a message lands.
+          await registerPushTokenWithQuorum();
         }
-      } catch (error) {
-        logger.log('[App] Failed to initialize notifications:', error);
+      } catch {
+        // Notification setup is best-effort — app works without notifications
       }
     };
 
     initNotifications();
 
-    // Set up notification tap handler
+    // Set up notification tap handler + Expo token rotation listener.
     const subscription = setupNotificationResponseListener();
+    const stopRotation = startPushTokenRotationListener();
     return () => {
       subscription.remove();
+      stopRotation();
     };
   }, [authState]);
 
@@ -125,7 +152,6 @@ function AuthRouter() {
 
     // Navigate to onboarding if unauthenticated and not already there
     if (authState === 'unauthenticated' && !inOnboarding) {
-      logger.log('Redirecting to onboarding');
       isNavigatingRef.current = true;
       setTimeout(() => {
         router.replace('/(onboarding)');
@@ -138,13 +164,16 @@ function AuthRouter() {
 
     // Navigate to home if authenticated and still in onboarding
     if (authState === 'authenticated' && inOnboarding) {
-      logger.log('Redirecting to home');
+      if (isNavigatingRef.current) return;
       isNavigatingRef.current = true;
-      setTimeout(async () => {
-        router.replace('/');
-        // Force app reload to cleanly transition from onboarding to main app
-        const { reloadAppAsync } = await import('expo');
-        await reloadAppAsync();
+      setTimeout(() => {
+        // Use dismissAll to clear the onboarding stack, then navigate to messages tab
+        router.dismissAll();
+        router.replace('/(tabs)/messages');
+        // Reset navigation ref after navigation completes
+        setTimeout(() => {
+          isNavigatingRef.current = false;
+        }, 500);
       }, 50);
       return;
     }
@@ -154,12 +183,17 @@ function AuthRouter() {
   // This prevents flash of wrong UI before navigation completes
   const shouldShowLoading =
     authState === 'loading' ||
-    (authState === 'unauthenticated' && !inOnboarding) ||
-    (authState === 'authenticated' && inOnboarding);
+    (authState === 'unauthenticated' && !inOnboarding);
 
-  // Always render Slot (so routes are mounted for navigation), but overlay with loading when needed
+  // Always render Slot (so routes are mounted for navigation), but
+  // overlay with loading when needed. The wrapper View's background
+  // shows through during iOS native-stack swipe-back animations (the
+  // brief gap between the outgoing and incoming screens). Without an
+  // explicit color it defaults to white, which is the "left edge
+  // white flash" users saw in dark mode when going back from
+  // channels → spaces, spaces → list, DM → inbox, etc.
   return (
-    <View style={{ flex: 1 }}>
+    <View style={{ flex: 1, backgroundColor: theme.colors.surface1 }}>
       <Slot />
       {shouldShowLoading && (
         <View style={{
@@ -170,7 +204,7 @@ function AuthRouter() {
           bottom: 0,
           justifyContent: 'center',
           alignItems: 'center',
-          backgroundColor: isDark ? '#0a0a0a' : '#f5f5f5',
+          backgroundColor: isDark ? '#0a0a0b' : '#ffffff',
         }}>
           <ActivityIndicator size="large" color={theme.colors.primary} />
         </View>
@@ -179,18 +213,31 @@ function AuthRouter() {
   );
 }
 
-const queryClient = new QueryClient({
-  defaultOptions: {
-    queries: {
-      staleTime: queryConfig.staleTime.feed,
-      gcTime: queryConfig.gcTime,
-      retry: queryConfig.retry,
-    },
-  },
-});
+// Lazy-initialize QueryClient to preserve instance across Fast Refresh
+let queryClientInstance: QueryClient | null = null;
+function getQueryClient() {
+  if (!queryClientInstance) {
+    queryClientInstance = new QueryClient({
+      defaultOptions: {
+        queries: {
+          staleTime: queryConfig.staleTime.feed,
+          gcTime: queryConfig.gcTime,
+          retry: queryConfig.retry,
+        },
+      },
+    });
+  }
+  return queryClientInstance;
+}
 
 function StatusBarWrapper() {
   const { isDark } = useTheme();
+
+  React.useEffect(() => {
+    const bgColor = isDark ? '#0a0a0b' : '#ffffff';
+    SystemUI.setBackgroundColorAsync(bgColor);
+  }, [isDark]);
+
   return <StatusBar style={isDark ? 'light' : 'dark'} />;
 }
 
@@ -203,28 +250,42 @@ export default function RootLayout() {
     return null;
   }
 
+  const queryClient = getQueryClient();
+
+  const content = (
+    <PersistQueryClientProvider
+      client={queryClient}
+      persistOptions={{
+        persister: queryPersister,
+        maxAge: 24 * 60 * 60 * 1000, // 24 hours
+      }}
+    >
+      <CustomThemeProvider defaultAccentColor="blue">
+        <StorageProvider>
+          <AuthProvider>
+            <AuthAwareApiProvider>
+              <WebSocketProvider>
+                <SpaceCallProvider>
+                  <CallProvider>
+                    <ToastProvider>
+                      <AuthRouter />
+                      <CallOverlay />
+                      <SpaceCallOverlay />
+                    </ToastProvider>
+                  </CallProvider>
+                </SpaceCallProvider>
+              </WebSocketProvider>
+            </AuthAwareApiProvider>
+          </AuthProvider>
+        </StorageProvider>
+        <StatusBarWrapper />
+      </CustomThemeProvider>
+    </PersistQueryClientProvider>
+  );
+
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
-      <PersistQueryClientProvider
-        client={queryClient}
-        persistOptions={{
-          persister: queryPersister,
-          maxAge: 24 * 60 * 60 * 1000, // 24 hours
-        }}
-      >
-        <CustomThemeProvider defaultAccentColor="blue">
-          <StorageProvider>
-            <AuthProvider>
-              <AuthAwareApiProvider>
-                <WebSocketProvider>
-                  <AuthRouter />
-                </WebSocketProvider>
-              </AuthAwareApiProvider>
-            </AuthProvider>
-          </StorageProvider>
-          <StatusBarWrapper />
-        </CustomThemeProvider>
-      </PersistQueryClientProvider>
+      <ErrorBoundary>{content}</ErrorBoundary>
     </GestureHandlerRootView>
   );
 }

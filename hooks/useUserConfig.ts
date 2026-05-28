@@ -62,7 +62,6 @@ export function useUserConfig(): UseUserConfigReturn {
         setConfig(freshConfig);
         setError(null);
       } catch (err) {
-        console.error('[useUserConfig] Failed to refresh config:', err);
         setError(err instanceof Error ? err : new Error(String(err)));
       } finally {
         setIsLoading(false);
@@ -79,7 +78,6 @@ export function useUserConfig(): UseUserConfigReturn {
       setConfig(freshConfig);
       setError(null);
     } catch (err) {
-      console.error('[useUserConfig] Failed to refresh config:', err);
       setError(err instanceof Error ? err : new Error(String(err)));
     } finally {
       setIsLoading(false);
@@ -94,7 +92,6 @@ export function useUserConfig(): UseUserConfigReturn {
         const updated = await updateConfig(user.address, { allowSync: enabled });
         setConfig(updated);
       } catch (err) {
-        console.error('[useUserConfig] Failed to update allowSync:', err);
         throw err;
       }
     },
@@ -114,7 +111,6 @@ export function useUserConfig(): UseUserConfigReturn {
         });
         setConfig(updated);
       } catch (err) {
-        console.error('[useUserConfig] Failed to update notification settings:', err);
         throw err;
       }
     },
@@ -189,8 +185,8 @@ export function useBookmarks() {
         if (config?.allowSync) {
           await saveConfig(config);
         }
-      } catch (error) {
-        console.error('[useBookmarks] Failed to sync after adding bookmark:', error);
+      } catch {
+        // Config sync is best-effort — bookmark is already saved locally
       }
     },
     [user?.address]
@@ -209,8 +205,8 @@ export function useBookmarks() {
         if (config?.allowSync) {
           await saveConfig(config);
         }
-      } catch (error) {
-        console.error('[useBookmarks] Failed to sync after removing bookmark:', error);
+      } catch {
+        // Config sync is best-effort — bookmark removal is already saved locally
       }
     },
     [user?.address]

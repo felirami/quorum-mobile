@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Image, ImageStyle, TouchableOpacity, StyleProp } from 'react-native';
 import { SCREEN_WIDTH, imageDimensionCache } from '../utils';
 
@@ -8,6 +8,7 @@ interface AutoHeightImageProps {
   maxWidth?: number;
   style?: StyleProp<ImageStyle>;
   onPress?: () => void;
+  onLongPress?: () => void;
 }
 
 /**
@@ -20,6 +21,7 @@ export function AutoHeightImage({
   maxWidth = SCREEN_WIDTH,
   style,
   onPress,
+  onLongPress,
 }: AutoHeightImageProps) {
   const cacheKey = `${uri}:${maxWidth}`;
   const cachedDimensions = imageDimensionCache.get(cacheKey);
@@ -27,6 +29,13 @@ export function AutoHeightImage({
     width: maxWidth,
     height: cachedDimensions ?? 250,
   });
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     // Skip if already cached
@@ -42,10 +51,12 @@ export function AutoHeightImage({
         const aspectRatio = imgHeight / imgWidth;
         const calculatedHeight = Math.min(maxWidth * aspectRatio, maxHeight);
         imageDimensionCache.set(cacheKey, calculatedHeight);
+        if (!mountedRef.current) return;
         setDimensions({ width: maxWidth, height: calculatedHeight });
       },
       () => {
         imageDimensionCache.set(cacheKey, 250);
+        if (!mountedRef.current) return;
         setDimensions({ width: maxWidth, height: 250 }); // fallback
       }
     );
@@ -59,9 +70,14 @@ export function AutoHeightImage({
     />
   );
 
-  if (onPress) {
+  if (onPress || onLongPress) {
     return (
-      <TouchableOpacity activeOpacity={0.9} onPress={onPress}>
+      <TouchableOpacity
+        activeOpacity={0.9}
+        onPress={onPress}
+        onLongPress={onLongPress}
+        delayLongPress={300}
+      >
         {imageElement}
       </TouchableOpacity>
     );

@@ -2,8 +2,10 @@
  * DMChatHeader - Header for DM conversation chat view
  */
 
+import type { AppTheme } from '@/theme';
 import { DefaultAvatar } from '@/components/ui/DefaultAvatar';
 import { IconSymbol } from '@/components/ui/IconSymbol';
+import { truncateAddress } from '@/utils/formatAddress';
 import type { Conversation } from '@/hooks/chat/useConversations';
 import React, { useMemo } from 'react';
 import { Dimensions, Image, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
@@ -14,13 +16,21 @@ interface DMChatHeaderProps {
   conversation: Conversation;
   sidebarsVisible: boolean;
   onShowSidebars: () => void;
-  theme: any;
+  onInfoPress?: () => void;
+  onOpenSearch?: () => void;
+  onCallPress?: () => void;
+  onVideoCallPress?: () => void;
+  theme: AppTheme;
 }
 
-export function DMChatHeader({
+export const DMChatHeader = React.memo(function DMChatHeader({
   conversation,
   sidebarsVisible,
   onShowSidebars,
+  onInfoPress,
+  onOpenSearch,
+  onCallPress,
+  onVideoCallPress,
   theme,
 }: DMChatHeaderProps) {
   const styles = createStyles(theme);
@@ -28,11 +38,7 @@ export function DMChatHeader({
   // Format display name
   const displayName = useMemo(() => {
     if (conversation.displayName) return conversation.displayName;
-    const addr = conversation.address;
-    if (!addr) return 'Unknown';
-    if (addr.startsWith('@')) return addr;
-    if (addr.length > 16) return `${addr.slice(0, 8)}...${addr.slice(-4)}`;
-    return addr;
+    return truncateAddress(conversation.address, 'long');
   }, [conversation.displayName, conversation.address]);
 
   return (
@@ -51,15 +57,30 @@ export function DMChatHeader({
         <Text style={styles.title} numberOfLines={1}>{displayName}</Text>
       </View>
       <View style={styles.right}>
-        <TouchableOpacity style={styles.headerIconButton}>
+        {onVideoCallPress && (
+          <TouchableOpacity style={styles.headerIconButton} onPress={onVideoCallPress}>
+            <IconSymbol name="video" color={theme.colors.textMuted} size={18} />
+          </TouchableOpacity>
+        )}
+        {onCallPress && (
+          <TouchableOpacity style={styles.headerIconButton} onPress={onCallPress}>
+            <IconSymbol name="phone" color={theme.colors.textMuted} size={18} />
+          </TouchableOpacity>
+        )}
+        {onOpenSearch && (
+          <TouchableOpacity style={styles.headerIconButton} onPress={onOpenSearch}>
+            <IconSymbol name="magnifyingglass" color={theme.colors.textMuted} size={18} />
+          </TouchableOpacity>
+        )}
+        <TouchableOpacity style={styles.headerIconButton} onPress={onInfoPress}>
           <IconSymbol name="info.circle" color={theme.colors.textMuted} size={18} />
         </TouchableOpacity>
       </View>
     </View>
   );
-}
+});
 
-const createStyles = (theme: any) => StyleSheet.create({
+const createStyles = (theme: AppTheme) => StyleSheet.create({
   container: {
     flexDirection: 'row',
     alignItems: 'center',

@@ -4,7 +4,7 @@
 
 import React from 'react';
 import { View, Text, StyleSheet } from 'react-native';
-import { useTheme } from '@/theme';
+import { useTheme, type AppTheme } from '@/theme';
 import type { OnboardingStep } from '@/context';
 
 const STEPS: { key: OnboardingStep; label: string }[] = [
@@ -66,7 +66,7 @@ export function StepIndicator({ currentStep }: StepIndicatorProps) {
   );
 }
 
-const createStyles = (theme: any) =>
+const createStyles = (theme: AppTheme) =>
   StyleSheet.create({
     container: {
       alignItems: 'center',

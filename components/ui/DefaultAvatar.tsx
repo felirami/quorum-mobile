@@ -4,12 +4,12 @@
  */
 
 import React, { useMemo } from 'react';
-import { View, Text, StyleSheet } from 'react-native';
+import { View, Text, StyleSheet, type StyleProp, type ViewStyle } from 'react-native';
 
 interface DefaultAvatarProps {
   address: string;
   size: number;
-  style?: any;
+  style?: StyleProp<ViewStyle>;
 }
 
 // Generate a deterministic color from a string

@@ -1,4 +1,3 @@
-import { logger } from '@quilibrium/quorum-shared';
 import React from 'react';
 import { StyleProp, Text, TextStyle, TouchableOpacity, ViewStyle } from 'react-native';
 import { useTheme } from '@/theme';
@@ -35,7 +34,6 @@ export default function BrowserLink({
       });
     } else {
       // In a real app, you would use Linking.openURL(url) here
-      logger.log('Opening external URL:', url);
     }
   };
 

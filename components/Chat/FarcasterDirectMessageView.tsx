@@ -3,18 +3,19 @@
  * Matches the structure of the regular DM view in index.tsx
  */
 
-import React, { useCallback, useMemo, useState, useRef } from 'react';
+import type { AppTheme } from '@/theme';
+import React, { useCallback, useEffect, useMemo, useState, useRef } from 'react';
 import {
   View,
   Text,
   StyleSheet,
   Image,
-  KeyboardAvoidingView,
-  Platform,
   Dimensions,
   Alert,
+  Keyboard,
+  KeyboardAvoidingView,
+  Platform,
 } from 'react-native';
-import { logger } from '@quilibrium/quorum-shared';
 import { DMChatHeader } from './DMChatHeader';
 import { MessagesList } from './MessagesList';
 import { MessageInput, type MessageInputHandle, type ReplyToMessage } from './MessageInput';
@@ -39,8 +40,11 @@ const FarcasterLogo = require('@/assets/images/farcaster.png');
 interface FarcasterDirectMessageViewProps {
   conversation: Conversation;
   onBack: () => void;
-  theme: any;
+  theme: AppTheme;
   onOpenFarcasterCast?: (username: string, castHashPrefix: string) => void;
+  onLinkPress?: (url: string) => void;
+  bottomInset?: number;
+  tabBarHeight?: number;
 }
 
 export function FarcasterDirectMessageView({
@@ -48,6 +52,9 @@ export function FarcasterDirectMessageView({
   onBack,
   theme,
   onOpenFarcasterCast,
+  onLinkPress,
+  bottomInset = 0,
+  tabBarHeight = 0,
 }: FarcasterDirectMessageViewProps) {
   const { user, farcasterAuthToken } = useAuth();
   const currentUserFid = user?.farcaster?.fid;
@@ -80,11 +87,9 @@ export function FarcasterDirectMessageView({
   }, [conversation.conversationId, conversation.unreadCount]);
 
   const handleAttachmentPress = useCallback(async () => {
-    logger.log('[FarcasterDM] Attachment button pressed');
     const result = await pickImage('library');
 
     if (result.cancelled) {
-      logger.log('[FarcasterDM] Image picker cancelled');
       return;
     }
 
@@ -95,12 +100,6 @@ export function FarcasterDirectMessageView({
       return;
     }
 
-    logger.log('[FarcasterDM] Image selected:', {
-      width: result.attachment.width,
-      height: result.attachment.height,
-      mimeType: result.attachment.mimeType,
-    });
-
     setPendingAttachment(result.attachment);
   }, []);
 
@@ -109,6 +108,9 @@ export function FarcasterDirectMessageView({
   }, []);
 
   const handleSendMessage = useCallback(async () => {
+    // Prevent double-tap while sending
+    if (sendMutation.isPending || isUploading) return;
+
     // Use farcasterParticipantFids for group chats, fall back to single fid for 1:1
     const recipientFids = conversation.farcasterParticipantFids?.length
       ? conversation.farcasterParticipantFids
@@ -128,7 +130,6 @@ export function FarcasterDirectMessageView({
       // If we have an attachment, upload it first
       if (pendingAttachment && farcasterAuthToken) {
         setIsUploading(true);
-        logger.log('[FarcasterDM] Uploading image...');
 
         try {
           const imageUrl = await uploadFarcasterImage({
@@ -141,8 +142,6 @@ export function FarcasterDirectMessageView({
           if (!imageUrl) {
             throw new Error('Failed to upload image');
           }
-
-          logger.log('[FarcasterDM] Image uploaded:', imageUrl);
 
           // Build message with image URL (matching Farcaster format)
           finalMessage = hasText ? `${imageUrl} ${finalMessage}` : imageUrl;
@@ -157,7 +156,6 @@ export function FarcasterDirectMessageView({
             }],
           };
         } catch (uploadError) {
-          logger.log('[FarcasterDM] Image upload failed:', uploadError);
           Alert.alert('Upload Failed', 'Failed to upload image. Please try again.');
           setIsUploading(false);
           return;
@@ -178,7 +176,7 @@ export function FarcasterDirectMessageView({
     } finally {
       setIsUploading(false);
     }
-  }, [conversation, messageText, sendMutation, replyTo, pendingAttachment, farcasterAuthToken]);
+  }, [conversation, messageText, sendMutation, replyTo, pendingAttachment, farcasterAuthToken, isUploading]);
 
   const handleReply = useCallback((message: DisplayMessage) => {
     setReplyTo({
@@ -225,18 +223,33 @@ export function FarcasterDirectMessageView({
   const displayName = conversation.displayName ||
     (conversation.farcasterUsername ? `@${conversation.farcasterUsername}` : 'Unknown');
 
+  // Android KeyboardAvoidingView's `padding` behavior is unreliable when the
+  // screen sits inside a parent that already has paddingBottom (the tab bar
+  // inset on the DM screen). Subscribe to the keyboard directly and pad the
+  // bottom ourselves — matching DMChatArea's tuned offset.
+  const [androidKeyboardHeight, setAndroidKeyboardHeight] = useState(0);
+  useEffect(() => {
+    if (Platform.OS !== 'android') return;
+    const showSub = Keyboard.addListener('keyboardDidShow', (e) => {
+      setAndroidKeyboardHeight(e.endCoordinates.height);
+    });
+    const hideSub = Keyboard.addListener('keyboardDidHide', () => {
+      setAndroidKeyboardHeight(0);
+    });
+    return () => { showSub.remove(); hideSub.remove(); };
+  }, []);
+
   return (
     <KeyboardAvoidingView
-      style={styles.container}
-      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+      style={[
+        styles.container,
+        Platform.OS === 'android' && androidKeyboardHeight > 0 && {
+          paddingBottom: androidKeyboardHeight - tabBarHeight / 2 - 10,
+        },
+      ]}
+      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      keyboardVerticalOffset={0}
     >
-      <DMChatHeader
-        conversation={conversation}
-        sidebarsVisible={false}
-        onShowSidebars={onBack}
-        theme={theme}
-      />
-
       {/* Security warning banner */}
       <View style={styles.warningBanner}>
         <Image source={FarcasterLogo} style={styles.warningIcon} />
@@ -259,6 +272,7 @@ export function FarcasterDirectMessageView({
         onRemoveReaction={handleRemoveReaction}
         onReply={handleReply}
         onOpenFarcasterCast={onOpenFarcasterCast}
+        onLinkPress={onLinkPress}
       />
 
       <MessageInput
@@ -274,16 +288,17 @@ export function FarcasterDirectMessageView({
         onAttachmentPress={handleAttachmentPress}
         pendingAttachment={pendingAttachment}
         onClearAttachment={handleClearAttachment}
+        bottomInset={bottomInset}
       />
     </KeyboardAvoidingView>
   );
 }
 
-const createStyles = (theme: any) =>
+const createStyles = (theme: AppTheme) =>
   StyleSheet.create({
     container: {
       flex: 1,
-      width: SCREEN_WIDTH,
+      flexDirection: 'column',
     },
     warningBanner: {
       flexDirection: 'row',

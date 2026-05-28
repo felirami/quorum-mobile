@@ -9,7 +9,7 @@ import {
   ViewStyle,
   TextStyle,
 } from 'react-native';
-import { useTheme } from '@/theme';
+import { useTheme, type AppTheme } from '@/theme';
 import { IconSymbol, type IconSymbolName } from './IconSymbol';
 
 type ButtonVariant = 'primary' | 'secondary' | 'danger' | 'ghost';
@@ -121,7 +121,7 @@ export function Button({
 }
 
 const createStyles = (
-  theme: any,
+  theme: AppTheme,
   variant: ButtonVariant,
   size: ButtonSize,
   disabled: boolean,

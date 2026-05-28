@@ -3,6 +3,11 @@
  *
  * Provides the bridge between React Native and mini apps running in WebView.
  * Uses @farcaster/miniapp-host-react-native for compatibility with Farcaster mini apps.
+ *
+ * SECURITY: This hook implements secure signing isolation. Private keys are NEVER
+ * passed to the EthereumProviderService. Instead, signing callbacks are provided
+ * that will be invoked when user approval is needed. The actual signing happens
+ * in the native context via SecureSigningService, only after user approval.
  */
 
 import { RefObject, useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -20,50 +25,91 @@ import { fetchFarcasterProfileByFid } from '@/services/onboarding/farcasterServi
 import { Context } from '@farcaster/miniapp-core';
 import { Address, Hex, PersonalMessage, Secp256k1, Signature, Siwe } from 'ox';
 import type { SetPrimaryButtonOptions } from './types';
+import {
+  EthereumProviderService,
+  TransactionForApproval,
+  MessageForApproval,
+  TypedDataForApproval,
+  SigningResult,
+} from './ethereumProvider';
 
-// ============ Hook Options ============
+// Hook Options
+
+export interface ComposeCastOptions {
+  text?: string;
+  embeds?: string[];
+  parent?: { hash: string };
+  channelKey?: string;
+}
+
+export interface ComposeCastResult {
+  hash?: string;
+  error?: { type: string; message?: string };
+}
+
+// Address only -- private keys are accessed via getPrivateKey callback when needed.
+export interface WalletInfo {
+  address: string;
+}
 
 export interface UseMiniAppBridgeOptions {
-  /** WebView ref */
   webViewRef: RefObject<WebView | null>;
-  /** Domain of the mini app */
   domain: string;
-  /** Full URL of the mini app */
   url: string;
-  /** Called when mini app signals ready */
+  visible?: boolean;
+  walletInfo?: WalletInfo | null;
   onReady?: (options?: { disableNativeGestures?: boolean }) => void;
-  /** Called when mini app requests close */
   onClose?: () => void;
-  /** Called when primary button state changes */
   onPrimaryButtonChange?: (options: SetPrimaryButtonOptions | null) => void;
-  /** Called when mini app requires Farcaster but user hasn't connected one */
   onFarcasterRequired?: () => void;
+  onComposeCast?: (options: ComposeCastOptions) => Promise<ComposeCastResult>;
+  /** Called when mini app requests to view a profile */
+  onViewProfile?: (opts: { fid?: number; username?: string }) => void;
+  /** Called when mini app requests to view a cast */
+  onViewCast?: (opts: { hash: string }) => void;
+  // All signing callbacks show approval UI before signing.
+  onSendTransaction?: (tx: TransactionForApproval) => Promise<SigningResult>;
+  onSignTransaction?: (tx: TransactionForApproval) => Promise<SigningResult>;
+  onSignMessage?: (msg: MessageForApproval) => Promise<SigningResult>;
+  onSignTypedData?: (data: TypedDataForApproval) => Promise<SigningResult>;
+  onSwapToken?: (opts: { sellToken?: string; buyToken?: string; sellAmount?: string; chain?: string }) => void;
 }
 
 export interface MiniAppBridgeResult {
-  /** Handler for WebView messages */
   onMessage: (e: any) => void;
-  /** Emit event to mini app */
   emit: (event: string, data?: Record<string, unknown>) => void;
-  /** Current primary button state */
   primaryButton: SetPrimaryButtonOptions | null;
-  /** Whether the mini app is ready */
   isReady: boolean;
-  /** Whether back navigation is enabled */
   backEnabled: boolean;
-  /** Trigger back navigation in mini app */
   triggerBack: () => void;
-  /** Whether Farcaster account is required but missing */
   farcasterRequired: boolean;
-  /** Whether the bridge is ready to receive messages */
   bridgeReady: boolean;
 }
 
-// ============ Hook Implementation ============
+// Hook Implementation
 
 export function useMiniAppBridge(options: UseMiniAppBridgeOptions): MiniAppBridgeResult {
-  const { webViewRef, domain, url, onReady, onClose, onPrimaryButtonChange, onFarcasterRequired } = options;
+  const {
+    webViewRef,
+    domain,
+    url,
+    visible = true,
+    walletInfo,
+    onReady,
+    onClose,
+    onPrimaryButtonChange,
+    onFarcasterRequired,
+    onComposeCast,
+    onViewProfile,
+    onViewCast,
+    onSendTransaction,
+    onSignTransaction,
+    onSignMessage,
+    onSignTypedData,
+    onSwapToken,
+  } = options;
 
+  // Debug: Log on every render
   const insets = useSafeAreaInsets();
   const { user } = useAuth();
 
@@ -142,6 +188,109 @@ export function useMiniAppBridge(options: UseMiniAppBridgeOptions): MiniAppBridg
   const urlRef = useRef(url);
   urlRef.current = url;
 
+  // Refs for callbacks to avoid stale closure issues and prevent SDK recreation
+  const onReadyRef = useRef(onReady);
+  onReadyRef.current = onReady;
+
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
+  const onPrimaryButtonChangeRef = useRef(onPrimaryButtonChange);
+  onPrimaryButtonChangeRef.current = onPrimaryButtonChange;
+
+  const onFarcasterRequiredRef = useRef(onFarcasterRequired);
+  onFarcasterRequiredRef.current = onFarcasterRequired;
+
+  const onComposeCastRef = useRef(onComposeCast);
+  onComposeCastRef.current = onComposeCast;
+
+  const onViewProfileRef = useRef(onViewProfile);
+  onViewProfileRef.current = onViewProfile;
+
+  const onViewCastRef = useRef(onViewCast);
+  onViewCastRef.current = onViewCast;
+
+  // SECURE: Refs for signing callbacks (no private key involved)
+  const onSendTransactionRef = useRef(onSendTransaction);
+  onSendTransactionRef.current = onSendTransaction;
+
+  const onSignTransactionRef = useRef(onSignTransaction);
+  onSignTransactionRef.current = onSignTransaction;
+
+  const onSignMessageRef = useRef(onSignMessage);
+  onSignMessageRef.current = onSignMessage;
+
+  const onSignTypedDataRef = useRef(onSignTypedData);
+  onSignTypedDataRef.current = onSignTypedData;
+
+
+
+  /**
+   * Create Ethereum provider when wallet info is available AND modal is visible.
+   * SECURITY: No private key is passed to the provider. Only the address for
+   * display/verification. All signing operations use the secure callbacks.
+   */
+  const ethereumProviderService = useMemo(() => {
+    if (!visible) {
+      return null;
+    }
+    if (!walletInfo?.address) {
+      return null;
+    }
+
+    // SECURITY: Provider is created with address only - no private key
+    return new EthereumProviderService({
+      address: walletInfo.address,
+      defaultChainId: 8453, // Default to Base for mini apps
+      // Secure callbacks that delegate to parent component
+      onSendTransaction: async (tx) => {
+        if (onSendTransactionRef.current) {
+          return onSendTransactionRef.current(tx);
+        }
+        return { success: false, error: 'Transaction signing not configured' };
+      },
+      onSignTransaction: async (tx) => {
+        if (onSignTransactionRef.current) {
+          return onSignTransactionRef.current(tx);
+        }
+        return { success: false, error: 'Transaction signing not configured' };
+      },
+      onSignMessage: async (msg) => {
+        if (onSignMessageRef.current) {
+          return onSignMessageRef.current(msg);
+        }
+        return { success: false, error: 'Message signing not configured' };
+      },
+      onSignTypedData: async (data) => {
+        if (onSignTypedDataRef.current) {
+          return onSignTypedDataRef.current(data);
+        }
+        return { success: false, error: 'Typed data signing not configured' };
+      },
+    });
+  }, [visible, walletInfo?.address]);
+
+  // Wrap provider in a plain object with bound methods (required for Comlink serialization)
+  const ethereumProvider = useMemo(() => {
+    if (!ethereumProviderService) return null;
+
+    const boundRequest = ethereumProviderService.request.bind(ethereumProviderService);
+    const boundOn = ethereumProviderService.on.bind(ethereumProviderService);
+    const boundRemoveListener = ethereumProviderService.removeListener.bind(ethereumProviderService);
+    const provider = {
+      request: boundRequest,
+      on: boundOn,
+      removeListener: boundRemoveListener,
+    };
+
+    // Verify the provider works
+    return provider;
+  }, [ethereumProviderService]);
+
+  // Keep provider ref updated
+  const ethereumProviderRef = useRef(ethereumProvider);
+  ethereumProviderRef.current = ethereumProvider;
+
   // Create the SDK object to expose to mini apps
   const sdk = useMemo(() => {
     return {
@@ -164,6 +313,13 @@ export function useMiniAppBridge(options: UseMiniAppBridgeOptions): MiniAppBridg
           'haptics.selectionChanged',
           'back',
           'domain.quorum',
+          // Always advertise wallet capabilities - Quorum always has a wallet
+          // The provider will be ready by the time user interacts with it
+          'wallet.getEthereumProvider',
+          'wallet.getEvmProvider',
+          'actions.viewToken',
+          'actions.sendToken',
+          'actions.swapToken',
         ];
 
         if (user?.farcaster) {
@@ -173,14 +329,19 @@ export function useMiniAppBridge(options: UseMiniAppBridgeOptions): MiniAppBridg
             'actions.addMiniApp'
           );
         }
-
         return capabilities;
       },
 
       getChains: async () => {
-        return [
-          { reference: '1', caip2: 'eip155:1' },
+        // Return supported chains
+        const chains = [
+          { reference: '1', caip2: 'eip155:1' },      // Ethereum
+          { reference: '10', caip2: 'eip155:10' },    // Optimism
+          { reference: '137', caip2: 'eip155:137' },  // Polygon
+          { reference: '8453', caip2: 'eip155:8453' }, // Base
+          { reference: '42161', caip2: 'eip155:42161' }, // Arbitrum
         ];
+        return chains;
       },
 
       // Core actions
@@ -193,18 +354,18 @@ export function useMiniAppBridge(options: UseMiniAppBridgeOptions): MiniAppBridg
           const hasFarcaster = !!user?.farcaster?.custodyAddress;
           if (!hasFarcaster) {
             setFarcasterRequired(true);
-            onFarcasterRequired?.();
+            onFarcasterRequiredRef.current?.();
           } else {
             setFarcasterRequired(false);
           }
         }
 
         setIsReady(true);
-        onReady?.(opts);
+        onReadyRef.current?.(opts);
       },
 
       close: () => {
-        onClose?.();
+        onCloseRef.current?.();
       },
 
       openUrl: (url: string) => {
@@ -213,14 +374,16 @@ export function useMiniAppBridge(options: UseMiniAppBridgeOptions): MiniAppBridg
 
       setPrimaryButton: (opts: SetPrimaryButtonOptions) => {
         setPrimaryButton(opts);
-        onPrimaryButtonChange?.(opts);
+        onPrimaryButtonChangeRef.current?.(opts);
       },
 
       // Navigation
       viewProfile: (opts: { fid?: number; username?: string }) => {
+        onViewProfileRef.current?.(opts);
       },
 
       viewCast: (opts: { hash: string }) => {
+        onViewCastRef.current?.(opts);
       },
 
       openMiniApp: (opts: { url: string }) => {
@@ -236,14 +399,14 @@ export function useMiniAppBridge(options: UseMiniAppBridgeOptions): MiniAppBridg
         const hasFarcaster = !!user?.farcaster?.custodyAddress && !!user?.farcaster?.fid;
         if (!hasFarcaster) {
           setFarcasterRequired(true);
-          onFarcasterRequired?.();
+          onFarcasterRequiredRef.current?.();
           throw new Error('rejected_by_user');
         }
 
         const custodyPrivateKey = await getFarcasterCustodyKey();
         if (!custodyPrivateKey) {
           setFarcasterRequired(true);
-          onFarcasterRequired?.();
+          onFarcasterRequiredRef.current?.();
           throw new Error('rejected_by_user');
         }
 
@@ -337,8 +500,39 @@ export function useMiniAppBridge(options: UseMiniAppBridgeOptions): MiniAppBridg
         text?: string;
         embeds?: string[];
         parent?: { hash: string };
+        channelKey?: string;
       }) => {
-        return {};
+        // Check if Farcaster is connected - use contextRef for latest user data
+        const currentUser = contextRef.current?.user;
+        const hasFarcaster = !!currentUser?.fid && currentUser.fid > 0;
+        if (!hasFarcaster) {
+          setFarcasterRequired(true);
+          onFarcasterRequired?.();
+          return { error: { type: 'rejected_by_user', message: 'Farcaster account required' } };
+        }
+
+        // Check if compose handler is available - use ref for latest callback
+        const composeCastHandler = onComposeCastRef.current;
+        if (!composeCastHandler) {
+          return { error: { type: 'rejected_by_user', message: 'Compose not available' } };
+        }
+
+        try {
+          const result = await composeCastHandler({
+            text: opts?.text,
+            embeds: opts?.embeds,
+            parent: opts?.parent,
+            channelKey: opts?.channelKey,
+          });
+          return result;
+        } catch (error) {
+          return {
+            error: {
+              type: 'rejected_by_user',
+              message: error instanceof Error ? error.message : 'Compose failed'
+            }
+          };
+        }
       },
 
       // Back state
@@ -346,25 +540,69 @@ export function useMiniAppBridge(options: UseMiniAppBridgeOptions): MiniAppBridg
         setBackEnabled(state.visible);
       },
 
-      // Wallet / Provider methods (stubs - not yet implemented)
+      // Wallet / Provider methods
       signManifest: async () => {
         return { error: { type: 'rejected_by_user', message: 'Not implemented' } };
       },
 
-      ethProviderRequest: async () => {
-        throw new Error('Not implemented');
+      ethProviderRequest: async (params: { method: string; params?: unknown[] }) => {
+        // Wait up to 2 seconds for provider to be ready (handles race condition with wallet loading)
+        let provider = ethereumProviderRef.current;
+        if (!provider) {
+          for (let i = 0; i < 20; i++) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+            provider = ethereumProviderRef.current;
+            if (provider) {
+              break;
+            }
+          }
+        }
+
+        if (!provider) {
+          // Return a proper EIP-1193 error
+          throw { code: 4100, message: 'Wallet not connected' };
+        }
+
+        try {
+          const result = await provider.request({
+            method: params.method,
+            params: params.params,
+          });
+          return result;
+        } catch (error: unknown) {
+          // Re-throw provider errors with proper structure
+          if (error instanceof Error && 'code' in error) {
+            throw error;
+          }
+          throw new Error(error instanceof Error ? error.message : 'Provider request failed');
+        }
       },
 
       eip6963RequestProvider: () => {
+        // EIP-6963 provider discovery - emit provider info
+        if (ethereumProviderRef.current) {
+          endpoint?.emit({
+            event: 'eip6963:announceProvider',
+            info: {
+              name: 'Quorum',
+              icon: 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PHJlY3Qgd2lkdGg9IjMyIiBoZWlnaHQ9IjMyIiByeD0iOCIgZmlsbD0iIzg4NTVmZiIvPjx0ZXh0IHg9IjUwJSIgeT0iNTAlIiBkb21pbmFudC1iYXNlbGluZT0ibWlkZGxlIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmaWxsPSJ3aGl0ZSIgZm9udC1mYW1pbHk9InNhbnMtc2VyaWYiIGZvbnQtc2l6ZT0iMTYiIGZvbnQtd2VpZ2h0PSJib2xkIj5RPC90ZXh0Pjwvc3ZnPg==',
+              rdns: 'app.quorum.MiniAppWallet',
+              uuid: `quorum-${Date.now()}`,
+            },
+          } as any);
+        }
       },
 
       viewToken: (opts: { token: string; chain?: string }) => {
+        // TODO: Navigate to token view in wallet modal
       },
 
       sendToken: (opts: { token: string; chain?: string; amount?: string; recipientFid?: number }) => {
+        // TODO: Open send token flow
       },
 
       swapToken: (opts: { sellToken?: string; buyToken?: string; sellAmount?: string; chain?: string }) => {
+        onSwapToken?.(opts);
       },
 
       requestCameraAndMicrophoneAccess: async () => {
@@ -372,13 +610,28 @@ export function useMiniAppBridge(options: UseMiniAppBridgeOptions): MiniAppBridg
         return true;
       },
     };
-  }, [context, domain, user, onReady, onClose, onPrimaryButtonChange, onFarcasterRequired]);
+  }, [context, domain, user]);
+
+  // Debug logging for wallet integration
+  useEffect(() => {
+    if (ethereumProvider) {
+    }
+  }, [walletInfo, ethereumProviderService, ethereumProvider]);
+
+  // Log what we're passing to the hook
+  useEffect(() => {
+  }, [endpoint, sdk, ethereumProvider]);
 
   // Expose SDK via the official Farcaster hook
+  // Always expose SDK so non-wallet features work immediately
+  // Wallet requests will gracefully fail until provider is ready
   // Cast to any since our SDK has minor type differences but is compatible at runtime
   useExposeWebViewToEndpoint({
     endpoint,
     sdk: sdk as any,
+    // Pass the ethereum provider for wallet integration (may be null initially)
+    ethProvider: ethereumProvider as any,
+    debug: true,
   });
 
   // Emit function for events

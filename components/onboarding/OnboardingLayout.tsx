@@ -11,7 +11,8 @@ import {
   ScrollView,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { useTheme } from '@/theme';
+import { useTheme, type AppTheme } from '@/theme';
+import type { EdgeInsets } from 'react-native-safe-area-context';
 import StepIndicator from './StepIndicator';
 import type { OnboardingStep } from '@/context';
 
@@ -64,7 +65,7 @@ export function OnboardingLayout({
   );
 }
 
-const createStyles = (theme: any, isDark: boolean, insets: any) =>
+const createStyles = (theme: AppTheme, isDark: boolean, insets: EdgeInsets) =>
   StyleSheet.create({
     container: {
       flex: 1,

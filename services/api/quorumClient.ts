@@ -64,26 +64,59 @@ export interface UserRegistration {
   signature: string;
 }
 
-// API Configuration
-const API_CONFIG = {
-  baseUrl: 'https://api.quorummessenger.com',
-  wsUrl: 'wss://api.quorummessenger.com/ws',
-};
+export interface DirectoryEntry {
+  space_address: string;
+  name: string;
+  description: string;
+  icon: string;
+  invite_link: string;
+  category: string;
+  status: string;
+  submitted_at: number;
+  reviewed_at?: number;
+  member_count?: number;
+}
+
+export interface DirectoryResponse {
+  entries: DirectoryEntry[];
+  total: number;
+  has_more: boolean;
+}
+
+import { getApiConfig } from './config';
 
 interface FetchOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   body?: unknown;
   timeout?: number;
   headers?: Record<string, string>;
+  /**
+   * Optional hard cap on response body size in bytes. When set, the
+   * response's Content-Length header is checked BEFORE the body is
+   * consumed; oversized responses cause the call to throw a
+   * `RESPONSE_TOO_LARGE` error code so the caller can decide whether
+   * to surface or swallow it. Defends against RN's
+   * BlobModule/okhttp OOMs when a server returns a huge body (e.g.
+   * a user profile with an uncompressed multi-MB avatar inline).
+   * Responses without a Content-Length header bypass the check.
+   */
+  maxResponseBytes?: number;
 }
 
 export class QuorumMobileClient implements QuorumApiClient {
-  private baseUrl: string;
+  // Optional explicit override for tests / per-instance use. When unset, every
+  // fetch resolves the URL dynamically via getApiConfig() so the dev-mode
+  // toggle takes effect immediately without restarting the app.
+  private explicitBaseUrl: string | undefined;
   private userAddress: string | null = null;
   private signMessage: ((message: string) => Promise<string>) | null = null;
 
   constructor(baseUrl?: string) {
-    this.baseUrl = baseUrl ?? API_CONFIG.baseUrl;
+    this.explicitBaseUrl = baseUrl;
+  }
+
+  private get baseUrl(): string {
+    return this.explicitBaseUrl ?? getApiConfig().baseUrl;
   }
 
   setUserAddress(address: string): void {
@@ -95,7 +128,7 @@ export class QuorumMobileClient implements QuorumApiClient {
   }
 
   private async fetch<T>(endpoint: string, options: FetchOptions = {}): Promise<T> {
-    const { method = 'GET', body, timeout = DEFAULT_TIMEOUT, headers = {} } = options;
+    const { method = 'GET', body, timeout = DEFAULT_TIMEOUT, headers = {}, maxResponseBytes } = options;
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeout);
@@ -115,20 +148,35 @@ export class QuorumMobileClient implements QuorumApiClient {
 
       if (!response.ok) {
         const errorBody = await response.text();
-        // Don't log 404 as error - it's expected for missing resources
-        if (response.status !== 404) {
-          console.error('[QuorumClient] HTTP error:', response.status, errorBody);
-        }
         let errorData;
         try {
           errorData = JSON.parse(errorBody);
         } catch {
           errorData = { message: errorBody };
         }
-        throw Object.assign(new Error(errorData.message || `HTTP ${response.status}`), {
+        // Server uses {"error": "..."} consistently; fall back to that before HTTP code.
+        throw Object.assign(new Error(errorData.message || errorData.error || `HTTP ${response.status}`), {
           status: response.status,
           code: errorData.code,
         });
+      }
+
+      // Size cap before body read so BlobModule doesn't materialize a
+      // huge byte array. Bypassed on chunked responses where
+      // Content-Length is absent.
+      if (maxResponseBytes !== undefined) {
+        const len = response.headers.get('content-length');
+        if (len) {
+          const parsed = parseInt(len, 10);
+          if (Number.isFinite(parsed) && parsed > maxResponseBytes) {
+            // Drain so the socket is released, but don't materialize.
+            try { await response.text(); } catch { /* */ }
+            throw Object.assign(new Error(`Response too large: ${parsed} > ${maxResponseBytes}`), {
+              status: response.status,
+              code: 'RESPONSE_TOO_LARGE',
+            });
+          }
+        }
       }
 
       const contentType = response.headers.get('content-type');
@@ -148,7 +196,7 @@ export class QuorumMobileClient implements QuorumApiClient {
     }
   }
 
-  // ============ Spaces ============
+  // Spaces
 
   async fetchSpaces(): Promise<Space[]> {
     if (!this.userAddress) {
@@ -171,7 +219,32 @@ export class QuorumMobileClient implements QuorumApiClient {
     });
   }
 
-  // ============ Messages ============
+  // Messages
+
+  /**
+   * Fetch sealed hub-log entries for a given hub. Used by the iOS NSE
+   * (via a Swift port of this call) and the Android background push
+   * task to decrypt an incoming push payload and decide whether to
+   * suppress the notification for control-type messages
+   * (update-profile, edit-message, remove-message).
+   *
+   * Read-only, no auth — payloads are sealed HubSealedMessage JSON,
+   * useless without the recipient's per-hub TR state. The push
+   * payload carries the seq so callers fetch just the single entry
+   * with `after = seq - 1, limit = 1`.
+   */
+  async fetchHubLog(params: {
+    hubAddress: string;
+    after?: number;
+    limit?: number;
+  }): Promise<Array<{ seq: number; ts: number; payload: string }>> {
+    const queryParams = new URLSearchParams();
+    if (params.after !== undefined) queryParams.set('after', params.after.toString());
+    if (params.limit !== undefined) queryParams.set('limit', params.limit.toString());
+    const query = queryParams.toString();
+    const endpoint = `/hub/${params.hubAddress}/log${query ? `?${query}` : ''}`;
+    return this.fetch<Array<{ seq: number; ts: number; payload: string }>>(endpoint);
+  }
 
   async fetchMessages(params: {
     spaceId: string;
@@ -219,7 +292,7 @@ export class QuorumMobileClient implements QuorumApiClient {
     );
   }
 
-  // ============ Reactions ============
+  // Reactions
 
   async addReaction(params: AddReactionParams): Promise<void> {
     await this.fetch<void>(
@@ -238,7 +311,7 @@ export class QuorumMobileClient implements QuorumApiClient {
     );
   }
 
-  // ============ Conversations ============
+  // Conversations
 
   async fetchConversations(): Promise<Conversation[]> {
     if (!this.userAddress) {
@@ -285,7 +358,7 @@ export class QuorumMobileClient implements QuorumApiClient {
     return this.fetch<{ messages: Message[]; nextPageToken?: string }>(endpoint);
   }
 
-  // ============ User Registration (for E2E Encryption) ============
+  // User Registration (E2E Encryption)
 
   /**
    * Fetch a user's registration info for E2E encryption
@@ -329,7 +402,29 @@ export class QuorumMobileClient implements QuorumApiClient {
     });
   }
 
-  // ============ Pinning ============
+  async registerPushToken(params: {
+    inbox_address: string;
+    inbox_public_key: string;
+    expo_token: string;
+    platform: 'ios' | 'android';
+    farcaster_fid?: number;
+    timestamp: number;
+    inbox_signature: string;
+  }): Promise<void> {
+    await this.fetch<void>('/push/register', { method: 'POST', body: params });
+  }
+
+  async unregisterPushToken(params: {
+    inbox_address: string;
+    inbox_public_key: string;
+    expo_token: string;
+    timestamp: number;
+    inbox_signature: string;
+  }): Promise<void> {
+    await this.fetch<void>('/push/unregister', { method: 'POST', body: params });
+  }
+
+  // Pinning
 
   async pinMessage(params: {
     spaceId: string;
@@ -353,7 +448,7 @@ export class QuorumMobileClient implements QuorumApiClient {
     );
   }
 
-  // ============ User Config (E2E Encrypted Settings Sync) ============
+  // User Config (E2E Encrypted Settings Sync)
 
   /**
    * Remote user config response from server
@@ -417,7 +512,7 @@ export class QuorumMobileClient implements QuorumApiClient {
     });
   }
 
-  // ============ Space Registration ============
+  // Space Registration
 
   /**
    * Register a new space
@@ -444,7 +539,7 @@ export class QuorumMobileClient implements QuorumApiClient {
     });
   }
 
-  // ============ Space Manifest ============
+  // Space Manifest
 
   /**
    * Fetch space registration (public info about a space)
@@ -515,7 +610,7 @@ export class QuorumMobileClient implements QuorumApiClient {
     });
   }
 
-  // ============ Hub Operations ============
+  // Hub Operations
 
   /**
    * Add inbox to hub for receiving space messages
@@ -567,6 +662,231 @@ export class QuorumMobileClient implements QuorumApiClient {
     return this.fetch<{ status: string }>('/hub', {
       method: 'POST',
       body: message,
+    });
+  }
+
+  // Public Invite Links
+
+  /**
+   * Upload public invite evaluations
+   * Used for generating public invite links with reusable evaluations
+   *
+   * @param params - Invite evaluations with signatures
+   */
+  async postInviteEvals(params: {
+    space_address: string;
+    config_public_key: string;
+    space_evals: string[];
+    ephemeral_public_key: string;
+    owner_public_key: string;
+    owner_signature: string;
+  }): Promise<{ status: string }> {
+    return this.fetch<{ status: string }>('/invite/evals', {
+      method: 'POST',
+      body: params,
+    });
+  }
+
+  /**
+   * Fetch a public invite evaluation
+   * Used when joining via a public invite link.
+   *
+   * Returns the encrypted eval payload AND the ephemeral pubkey it was
+   * encrypted under. The eph key is what makes joins survive manifest
+   * rotations — broadcastSpaceUpdate (kicks, role grants, settings edits)
+   * regenerates the manifest with a fresh ephemeral key and overwrites
+   * it on the server, but evals stay put. Decoupling the two lets the
+   * joiner decrypt the eval with the right key regardless of how many
+   * times the manifest has been rotated since it was uploaded.
+   *
+   * Backwards compat: legacy server returned a bare JSON string
+   * (the ciphertext envelope). New server returns an object. We accept
+   * both shapes; when only the ciphertext is returned, callers fall
+   * back to the manifest's ephemeral pubkey.
+   *
+   * @param configPublicKey - The config public key for this invite
+   * @returns Eval payload + (optional) ephemeral pubkey, or null if 404
+   */
+  async getInviteEval(configPublicKey: string): Promise<
+    { ciphertext: string; ephemeralPublicKey: string | null } | null
+  > {
+    try {
+      const response = await this.fetch<unknown>('/invite/eval', {
+        method: 'POST',
+        body: configPublicKey,
+        headers: {
+          'Content-Type': 'text/plain',
+        },
+      });
+      if (typeof response === 'string') {
+        return { ciphertext: response, ephemeralPublicKey: null };
+      }
+      if (response && typeof response === 'object' && 'ciphertext' in response) {
+        const obj = response as { ciphertext: string; ephemeral_public_key?: string };
+        return {
+          ciphertext: obj.ciphertext,
+          ephemeralPublicKey: obj.ephemeral_public_key ?? null,
+        };
+      }
+      return null;
+    } catch (error: unknown) {
+      if (error && typeof error === 'object' && 'status' in error && error.status === 404) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  // Moderation reports — see services/reporting/reportService.ts for the
+  // full payload shape. The body is opaque to this client beyond having
+  // the right top-level fields; the service module builds and signs it.
+  async postReport(report: Record<string, unknown>): Promise<{ status: string; id: string }> {
+    return this.fetch('/reports', {
+      method: 'POST',
+      body: report,
+    });
+  }
+
+  // Public profile (plaintext, signed by user — gated client-side on
+  // isProfilePublic). Used as a fallback when an in-space update-profile
+  // hasn't reached this client yet, e.g. for users we share spaces with
+  // but joined before they set their profile.
+
+  async getPublicProfile(address: string): Promise<{
+    display_name: string;
+    profile_image: string;
+    bio: string;
+    primary_username?: string;
+    timestamp: number;
+    signature: string;
+    farcaster?: {
+      fid: number;
+      custodyAddress: string;
+      farcasterSignature: string;
+      quorumSignature: string;
+    };
+  } | null> {
+    try {
+      return await this.fetch(`/users/${address}/public-profile`, {
+        // 2MB cap. A well-formed profile after avatar compression
+        // is <250KB. Anything bigger is a pre-fix user whose avatar
+        // was uploaded uncompressed; surface as "no profile" rather
+        // than OOM the JVM heap on the read path.
+        maxResponseBytes: 2 * 1024 * 1024,
+      });
+    } catch (error: unknown) {
+      if (error && typeof error === 'object' && 'status' in error && error.status === 404) {
+        return null;
+      }
+      // Same fallthrough for oversized — treat as no profile rather
+      // than propagating to the caller (which would surface a
+      // visible error toast for what should be a soft fallback).
+      if (error && typeof error === 'object' && 'code' in error && error.code === 'RESPONSE_TOO_LARGE') {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Reverse-resolve a Farcaster fid to the linked Quorum identity.
+   * Returns the address + the linked user's public profile in one round
+   * trip so the caller can render display name / avatar / QNS name
+   * without a second fetch.
+   *
+   * The mapping is server-maintained from the `farcaster-fid/<fid>`
+   * index, written whenever a user posts a public profile with a
+   * Farcaster link whose Quorum-side signature verifies. Returns null
+   * (not throw) on 404 — the common case when looking up a Farcaster
+   * user who hasn't linked their Quorum identity, which we want to
+   * silently fall through to "no badge."
+   */
+  async getUserByFarcasterFid(fid: number): Promise<{
+    address: string;
+    public_profile: {
+      display_name: string;
+      profile_image: string;
+      bio: string;
+      primary_username?: string;
+      timestamp: number;
+      signature: string;
+      farcaster?: {
+        fid: number;
+        custodyAddress: string;
+        farcasterSignature: string;
+        quorumSignature: string;
+      };
+    };
+  } | null> {
+    try {
+      return await this.fetch(`/users/by-fid/${fid}`, {
+        maxResponseBytes: 2 * 1024 * 1024,
+      });
+    } catch (error: unknown) {
+      if (error && typeof error === 'object' && 'status' in error && error.status === 404) {
+        return null;
+      }
+      if (error && typeof error === 'object' && 'code' in error && error.code === 'RESPONSE_TOO_LARGE') {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  async postPublicProfile(
+    address: string,
+    profile: {
+      display_name: string;
+      profile_image: string;
+      bio: string;
+      primary_username?: string;
+      timestamp: number;
+      signature: string;
+      farcaster?: {
+        fid: number;
+        custodyAddress: string;
+        farcasterSignature: string;
+        quorumSignature: string;
+      };
+    },
+  ): Promise<{ status: string }> {
+    return this.fetch(`/users/${address}/public-profile`, {
+      method: 'POST',
+      body: profile,
+    });
+  }
+
+  async deletePublicProfile(
+    address: string,
+    body: { timestamp: number; signature: string },
+  ): Promise<{ status: string }> {
+    return this.fetch(`/users/${address}/public-profile`, {
+      method: 'DELETE',
+      body,
+    });
+  }
+
+  // Directory
+
+  async exploreSpaces(params?: {
+    search?: string;
+    category?: string;
+    offset?: number;
+    limit?: number;
+  }): Promise<DirectoryResponse> {
+    const queryParts: string[] = [];
+    if (params?.search) queryParts.push(`search=${encodeURIComponent(params.search)}`);
+    if (params?.category) queryParts.push(`category=${encodeURIComponent(params.category)}`);
+    if (params?.offset !== undefined) queryParts.push(`offset=${params.offset}`);
+    if (params?.limit !== undefined) queryParts.push(`limit=${params.limit}`);
+    const query = queryParts.length > 0 ? `?${queryParts.join('&')}` : '';
+    return this.fetch<DirectoryResponse>(`/directory${query}`);
+  }
+
+  async reportSpace(spaceAddress: string, reason: string): Promise<void> {
+    await this.fetch<{ status: string }>(`/directory/${spaceAddress}/report`, {
+      method: 'POST',
+      body: { reason },
     });
   }
 }

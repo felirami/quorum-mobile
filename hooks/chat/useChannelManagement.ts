@@ -6,6 +6,11 @@
  * - useUpdateChannel: Update channel properties
  * - useDeleteChannel: Delete a channel
  * - usePinChannel: Pin/unpin a channel
+ * - useAddGroup: Create a new channel group
+ * - useUpdateGroup: Update group properties
+ * - useDeleteGroup: Delete a channel group
+ * - useMoveChannel: Move a channel between groups or reorder within a group
+ * - useReorderGroups: Reorder channel groups
  */
 
 import { useMutation, useQueryClient } from '@tanstack/react-query';
@@ -14,7 +19,7 @@ import { getMMKVAdapter } from '@/services/storage/mmkvAdapter';
 import { NativeCryptoProvider } from '@/services/crypto/native-provider';
 import { bytesToHex } from '@quilibrium/quorum-shared';
 import type { Space, Channel, Group } from '@quilibrium/quorum-shared';
-import { sha256 } from '@noble/hashes/sha2';
+import { sha256 } from '@noble/hashes/sha2.js';
 import bs58 from 'bs58';
 import * as multihashes from 'multihashes';
 
@@ -112,6 +117,7 @@ export function useAddChannel() {
     },
     onSuccess: (_, params) => {
       queryClient.invalidateQueries({ queryKey: ['channels', params.spaceId] });
+      queryClient.invalidateQueries({ queryKey: ['spaces', params.spaceId] });
       queryClient.invalidateQueries({ queryKey: ['spaces'] });
     },
   });
@@ -180,6 +186,7 @@ export function useUpdateChannel() {
     },
     onSuccess: (_, params) => {
       queryClient.invalidateQueries({ queryKey: ['channels', params.spaceId] });
+      queryClient.invalidateQueries({ queryKey: ['spaces', params.spaceId] });
       queryClient.invalidateQueries({ queryKey: ['spaces'] });
     },
   });
@@ -225,6 +232,7 @@ export function useDeleteChannel() {
     },
     onSuccess: (_, params) => {
       queryClient.invalidateQueries({ queryKey: ['channels', params.spaceId] });
+      queryClient.invalidateQueries({ queryKey: ['spaces', params.spaceId] });
       queryClient.invalidateQueries({ queryKey: ['spaces'] });
     },
   });
@@ -277,6 +285,8 @@ export function usePinChannel() {
     },
     onSuccess: (_, params) => {
       queryClient.invalidateQueries({ queryKey: ['channels', params.spaceId] });
+      queryClient.invalidateQueries({ queryKey: ['spaces', params.spaceId] });
+      queryClient.invalidateQueries({ queryKey: ['spaces'] });
     },
   });
 }
@@ -322,6 +332,7 @@ export function useAddGroup() {
     },
     onSuccess: (_, params) => {
       queryClient.invalidateQueries({ queryKey: ['channels', params.spaceId] });
+      queryClient.invalidateQueries({ queryKey: ['spaces', params.spaceId] });
       queryClient.invalidateQueries({ queryKey: ['spaces'] });
     },
   });
@@ -369,6 +380,256 @@ export function useDeleteGroup() {
     },
     onSuccess: (_, params) => {
       queryClient.invalidateQueries({ queryKey: ['channels', params.spaceId] });
+      queryClient.invalidateQueries({ queryKey: ['spaces', params.spaceId] });
+      queryClient.invalidateQueries({ queryKey: ['spaces'] });
+    },
+  });
+}
+
+interface UpdateGroupParams {
+  spaceId: string;
+  groupIndex: number;
+  groupName?: string;
+  icon?: string;
+  iconColor?: string;
+}
+
+/**
+ * Update an existing channel group
+ */
+export function useUpdateGroup() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (params: UpdateGroupParams): Promise<Group> => {
+      const space = getSpace(params.spaceId);
+      if (!space) {
+        throw new Error('Space not found');
+      }
+
+      if (params.groupIndex < 0 || params.groupIndex >= space.groups.length) {
+        throw new Error('Invalid group index');
+      }
+
+      const group = space.groups[params.groupIndex];
+      const updatedGroup: Group = {
+        ...group,
+        groupName: params.groupName ?? group.groupName,
+        icon: params.icon ?? group.icon,
+        iconColor: params.iconColor ?? group.iconColor,
+      };
+
+      const updatedGroups = space.groups.map((g, index) =>
+        index === params.groupIndex ? updatedGroup : g
+      );
+
+      const updatedSpace: Space = {
+        ...space,
+        groups: updatedGroups,
+        modifiedDate: Date.now(),
+      };
+
+      saveSpace(updatedSpace);
+      const adapter = getMMKVAdapter();
+      await adapter.saveSpace(updatedSpace);
+
+      return updatedGroup;
+    },
+    onSuccess: (_, params) => {
+      queryClient.invalidateQueries({ queryKey: ['channels', params.spaceId] });
+      queryClient.invalidateQueries({ queryKey: ['spaces', params.spaceId] });
+      queryClient.invalidateQueries({ queryKey: ['spaces'] });
+    },
+  });
+}
+
+interface MoveChannelParams {
+  spaceId: string;
+  channelId: string;
+  fromGroupIndex: number;
+  toGroupIndex: number;
+  toPosition: number; // Position within the target group
+}
+
+/**
+ * Move a channel between groups or reorder within a group
+ */
+export function useMoveChannel() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (params: MoveChannelParams): Promise<void> => {
+      const space = getSpace(params.spaceId);
+      if (!space) {
+        throw new Error('Space not found');
+      }
+
+      if (params.fromGroupIndex < 0 || params.fromGroupIndex >= space.groups.length) {
+        throw new Error('Invalid source group index');
+      }
+
+      if (params.toGroupIndex < 0 || params.toGroupIndex >= space.groups.length) {
+        throw new Error('Invalid target group index');
+      }
+
+      const fromGroup = space.groups[params.fromGroupIndex];
+      const channelIndex = fromGroup.channels.findIndex(c => c.channelId === params.channelId);
+      if (channelIndex === -1) {
+        throw new Error('Channel not found in source group');
+      }
+
+      const channel = fromGroup.channels[channelIndex];
+
+      // Remove from source group
+      const updatedFromChannels = fromGroup.channels.filter(c => c.channelId !== params.channelId);
+
+      // Build updated groups
+      const updatedGroups = space.groups.map((group, index) => {
+        if (index === params.fromGroupIndex && index === params.toGroupIndex) {
+          // Moving within the same group
+          const channels = [...updatedFromChannels];
+          const insertPosition = Math.min(params.toPosition, channels.length);
+          channels.splice(insertPosition, 0, channel);
+          return { ...group, channels };
+        } else if (index === params.fromGroupIndex) {
+          // Source group - remove channel
+          return { ...group, channels: updatedFromChannels };
+        } else if (index === params.toGroupIndex) {
+          // Target group - add channel
+          const channels = [...group.channels];
+          const insertPosition = Math.min(params.toPosition, channels.length);
+          channels.splice(insertPosition, 0, channel);
+          return { ...group, channels };
+        }
+        return group;
+      });
+
+      const updatedSpace: Space = {
+        ...space,
+        groups: updatedGroups,
+        modifiedDate: Date.now(),
+      };
+
+      saveSpace(updatedSpace);
+      const adapter = getMMKVAdapter();
+      await adapter.saveSpace(updatedSpace);
+    },
+    onSuccess: (_, params) => {
+      queryClient.invalidateQueries({ queryKey: ['channels', params.spaceId] });
+      queryClient.invalidateQueries({ queryKey: ['spaces', params.spaceId] });
+      queryClient.invalidateQueries({ queryKey: ['spaces'] });
+    },
+  });
+}
+
+interface ReorderGroupsParams {
+  spaceId: string;
+  groupOrder: number[]; // Array of group indices in new order
+}
+
+/**
+ * Reorder channel groups
+ */
+export function useReorderGroups() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (params: ReorderGroupsParams): Promise<void> => {
+      const space = getSpace(params.spaceId);
+      if (!space) {
+        throw new Error('Space not found');
+      }
+
+      if (params.groupOrder.length !== space.groups.length) {
+        throw new Error('Group order length mismatch');
+      }
+
+      // Validate all indices are valid and unique
+      const indices = new Set(params.groupOrder);
+      if (indices.size !== params.groupOrder.length) {
+        throw new Error('Duplicate group indices');
+      }
+      for (const index of params.groupOrder) {
+        if (index < 0 || index >= space.groups.length) {
+          throw new Error('Invalid group index in order');
+        }
+      }
+
+      const reorderedGroups = params.groupOrder.map(index => space.groups[index]);
+
+      const updatedSpace: Space = {
+        ...space,
+        groups: reorderedGroups,
+        modifiedDate: Date.now(),
+      };
+
+      saveSpace(updatedSpace);
+      const adapter = getMMKVAdapter();
+      await adapter.saveSpace(updatedSpace);
+    },
+    onSuccess: (_, params) => {
+      queryClient.invalidateQueries({ queryKey: ['channels', params.spaceId] });
+      queryClient.invalidateQueries({ queryKey: ['spaces', params.spaceId] });
+      queryClient.invalidateQueries({ queryKey: ['spaces'] });
+    },
+  });
+}
+
+interface ReorderChannelsParams {
+  spaceId: string;
+  groupIndex: number;
+  channelOrder: string[]; // Array of channel IDs in new order
+}
+
+/**
+ * Reorder channels within a group
+ */
+export function useReorderChannels() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (params: ReorderChannelsParams): Promise<void> => {
+      const space = getSpace(params.spaceId);
+      if (!space) {
+        throw new Error('Space not found');
+      }
+
+      if (params.groupIndex < 0 || params.groupIndex >= space.groups.length) {
+        throw new Error('Invalid group index');
+      }
+
+      const group = space.groups[params.groupIndex];
+
+      // Validate all channel IDs are valid
+      const channelMap = new Map(group.channels.map(c => [c.channelId, c]));
+      if (params.channelOrder.length !== group.channels.length) {
+        throw new Error('Channel order length mismatch');
+      }
+      for (const channelId of params.channelOrder) {
+        if (!channelMap.has(channelId)) {
+          throw new Error('Invalid channel ID in order');
+        }
+      }
+
+      const reorderedChannels = params.channelOrder.map(id => channelMap.get(id)!);
+
+      const updatedGroups = space.groups.map((g, index) =>
+        index === params.groupIndex ? { ...g, channels: reorderedChannels } : g
+      );
+
+      const updatedSpace: Space = {
+        ...space,
+        groups: updatedGroups,
+        modifiedDate: Date.now(),
+      };
+
+      saveSpace(updatedSpace);
+      const adapter = getMMKVAdapter();
+      await adapter.saveSpace(updatedSpace);
+    },
+    onSuccess: (_, params) => {
+      queryClient.invalidateQueries({ queryKey: ['channels', params.spaceId] });
+      queryClient.invalidateQueries({ queryKey: ['spaces', params.spaceId] });
       queryClient.invalidateQueries({ queryKey: ['spaces'] });
     },
   });

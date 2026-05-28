@@ -1,10 +1,11 @@
-import React from 'react';
+import type { AppTheme } from '@/theme';
+import React, { useMemo } from 'react';
 import { Text, TextStyle } from 'react-native';
 
 interface CastTextProps {
   text: string;
   style?: TextStyle;
-  theme: any;
+  theme: AppTheme;
   onMentionPress?: (username: string) => void;
   onChannelPress?: (channelKey: string) => void;
   onLinkPress?: (url: string) => void;
@@ -15,23 +16,17 @@ type TextPart = {
   value: string;
 };
 
-/**
- * Renders cast text with tappable @mentions, /channels, and links.
- */
-export function CastText({
-  text,
-  style,
-  theme,
-  onMentionPress,
-  onChannelPress,
-  onLinkPress,
-}: CastTextProps) {
-  // Match URLs, @mentions (after whitespace/start), and /channels (after whitespace/start)
-  // URLs are matched first to prevent their paths being parsed as channels
-  const combinedRegex = /(https?:\/\/[^\s]+)|(?<=^|[\s])(@[a-zA-Z0-9._-]+)|(?<=^|[\s])(\/[a-zA-Z0-9_-]+)/g;
+// Match URLs, @mentions (after whitespace/start), and /channels (after whitespace/start)
+// URLs are matched first to prevent their paths being parsed as channels
+const combinedRegex = /(https?:\/\/[^\s]+)|(?<=^|[\s])(@[a-zA-Z0-9._-]+)|(?<=^|[\s])(\/[a-zA-Z0-9_-]+)/g;
+
+function parseText(text: string): TextPart[] {
   const parts: TextPart[] = [];
   let lastIndex = 0;
   let match;
+
+  // Reset regex state (global flag means lastIndex persists)
+  combinedRegex.lastIndex = 0;
 
   while ((match = combinedRegex.exec(text)) !== null) {
     // Add text before this match
@@ -59,6 +54,24 @@ export function CastText({
     parts.push({ type: 'text', value: text.slice(lastIndex) });
   }
 
+  return parts;
+}
+
+/**
+ * Renders cast text with tappable @mentions, /channels, and links.
+ */
+export const CastText = React.memo(function CastText({
+  text,
+  style,
+  theme,
+  onMentionPress,
+  onChannelPress,
+  onLinkPress,
+}: CastTextProps) {
+  // Memoize parsing so it only runs when text changes
+  const parts = useMemo(() => parseText(text), [text]);
+  const accentStyle = useMemo(() => ({ color: theme.colors.accent }), [theme.colors.accent]);
+
   return (
     <Text style={style}>
       {parts.map((part, index) => {
@@ -66,7 +79,7 @@ export function CastText({
           return (
             <Text
               key={index}
-              style={{ color: theme.colors.accent }}
+              style={accentStyle}
               onPress={() => onLinkPress?.(part.value)}
             >
               {part.value}
@@ -76,7 +89,7 @@ export function CastText({
           return (
             <Text
               key={index}
-              style={{ color: theme.colors.accent }}
+              style={accentStyle}
               onPress={() => onMentionPress?.(part.value)}
             >
               @{part.value}
@@ -86,7 +99,7 @@ export function CastText({
           return (
             <Text
               key={index}
-              style={{ color: theme.colors.accent }}
+              style={accentStyle}
               onPress={() => onChannelPress?.(part.value)}
             >
               /{part.value}
@@ -97,6 +110,6 @@ export function CastText({
       })}
     </Text>
   );
-}
+});
 
 export default CastText;

@@ -1,0 +1,291 @@
+diff --git a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebView.java b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebView.java
+index 5932fc1..384d6bb 100644
+--- a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebView.java
++++ b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebView.java
+@@ -99,6 +99,12 @@ public class RNCWebView extends WebView implements LifecycleEventListener {
+         mRNCWebViewClient.setBasicAuthCredential(credential);
+     }
+ 
++    public void setIgnoreSslErrorForLocalNetwork(boolean ignore) {
++        if (mRNCWebViewClient != null) {
++            mRNCWebViewClient.setIgnoreSslErrorForLocalNetwork(ignore);
++        }
++    }
++
+     public void setSendContentSizeChangeEvents(boolean sendContentSizeChangeEvents) {
+         this.sendContentSizeChangeEvents = sendContentSizeChangeEvents;
+     }
+diff --git a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewClient.java b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewClient.java
+index 251939e..1464e69 100644
+--- a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewClient.java
++++ b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewClient.java
+@@ -35,6 +35,7 @@ import android.webkit.CookieManager;
+ import android.webkit.CookieSyncManager;
+ 
+ import java.util.concurrent.atomic.AtomicReference;
++import java.util.regex.Pattern;
+ 
+ public class RNCWebViewClient extends WebViewClient {
+     private static String TAG = "RNCWebViewClient";
+@@ -44,6 +45,27 @@ public class RNCWebViewClient extends WebViewClient {
+     protected RNCWebView.ProgressChangedFilter progressChangedFilter = null;
+     protected @Nullable String ignoreErrFailedForThisURL = null;
+     protected @Nullable RNCBasicAuthCredential basicAuthCredential = null;
++    protected boolean ignoreSslErrorForLocalNetwork = false;
++
++    // Patterns for local network detection
++    private static final Pattern PATTERN_10 = Pattern.compile("^10\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$");
++    private static final Pattern PATTERN_172 = Pattern.compile("^172\\.(1[6-9]|2\\d|3[01])\\.\\d{1,3}\\.\\d{1,3}$");
++    private static final Pattern PATTERN_192 = Pattern.compile("^192\\.168\\.\\d{1,3}\\.\\d{1,3}$");
++    private static final Pattern PATTERN_169 = Pattern.compile("^169\\.254\\.\\d{1,3}\\.\\d{1,3}$");
++
++    public void setIgnoreSslErrorForLocalNetwork(boolean ignore) {
++        ignoreSslErrorForLocalNetwork = ignore;
++    }
++
++    private boolean isLocalNetworkHost(String host) {
++        if (host == null) return false;
++        if (host.equals("localhost") || host.equals("127.0.0.1")) return true;
++        if (PATTERN_10.matcher(host).matches()) return true;
++        if (PATTERN_172.matcher(host).matches()) return true;
++        if (PATTERN_192.matcher(host).matches()) return true;
++        if (PATTERN_169.matcher(host).matches()) return true;
++        return false;
++    }
+ 
+     public void setIgnoreErrFailedForThisURL(@Nullable String url) {
+         ignoreErrFailedForThisURL = url;
+@@ -168,6 +190,20 @@ public class RNCWebViewClient extends WebViewClient {
+         String topWindowUrl = webView.getUrl();
+         String failingUrl = error.getUrl();
+ 
++        // Bypass SSL for local network if enabled
++        if (ignoreSslErrorForLocalNetwork) {
++            try {
++                android.net.Uri uri = android.net.Uri.parse(failingUrl);
++                String host = uri.getHost();
++                if (isLocalNetworkHost(host)) {
++                    handler.proceed();
++                    return;
++                }
++            } catch (Exception e) {
++                Log.w(TAG, "Error parsing URL for local network check: " + e.getMessage());
++            }
++        }
++
+         // Cancel request after obtaining top-level URL.
+         // If request is cancelled before obtaining top-level URL, undesired behavior may occur.
+         // Undesired behavior: Return value of WebView.getUrl() may be the current URL instead of the failing URL.
+diff --git a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewManagerImpl.kt b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewManagerImpl.kt
+index 438ab6a..e3ae6be 100644
+--- a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewManagerImpl.kt
++++ b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewManagerImpl.kt
+@@ -269,6 +269,10 @@ class RNCWebViewManagerImpl(private val newArch: Boolean = false) {
+         viewWrapper.webView.setBasicAuthCredential(basicAuthCredential)
+     }
+ 
++    fun setIgnoreSslErrorForLocalNetwork(viewWrapper: RNCWebViewWrapper, ignore: Boolean) {
++        viewWrapper.webView.setIgnoreSslErrorForLocalNetwork(ignore)
++    }
++
+     fun onAfterUpdateTransaction(viewWrapper: RNCWebViewWrapper) {
+         mPendingSource?.let { source ->
+             loadSource(viewWrapper, source)
+diff --git a/node_modules/react-native-webview/android/src/newarch/com/reactnativecommunity/webview/RNCWebViewManager.java b/node_modules/react-native-webview/android/src/newarch/com/reactnativecommunity/webview/RNCWebViewManager.java
+index e20ae03..0893f8a 100644
+--- a/node_modules/react-native-webview/android/src/newarch/com/reactnativecommunity/webview/RNCWebViewManager.java
++++ b/node_modules/react-native-webview/android/src/newarch/com/reactnativecommunity/webview/RNCWebViewManager.java
+@@ -111,6 +111,11 @@ public class RNCWebViewManager extends ViewGroupManager<RNCWebViewWrapper>
+         mRNCWebViewManagerImpl.setBasicAuthCredential(view, value);
+     }
+ 
++    @ReactProp(name = "ignoreSslErrorForLocalNetwork")
++    public void setIgnoreSslErrorForLocalNetwork(RNCWebViewWrapper view, boolean value) {
++        mRNCWebViewManagerImpl.setIgnoreSslErrorForLocalNetwork(view, value);
++    }
++
+     @Override
+     @ReactProp(name = "cacheEnabled")
+     public void setCacheEnabled(RNCWebViewWrapper view, boolean value) {
+diff --git a/node_modules/react-native-webview/android/src/oldarch/com/reactnativecommunity/webview/RNCWebViewManager.java b/node_modules/react-native-webview/android/src/oldarch/com/reactnativecommunity/webview/RNCWebViewManager.java
+index 44d3378..13b93c8 100644
+--- a/node_modules/react-native-webview/android/src/oldarch/com/reactnativecommunity/webview/RNCWebViewManager.java
++++ b/node_modules/react-native-webview/android/src/oldarch/com/reactnativecommunity/webview/RNCWebViewManager.java
+@@ -86,6 +86,11 @@ public class RNCWebViewManager extends ViewGroupManager<RNCWebViewWrapper> {
+         mRNCWebViewManagerImpl.setBasicAuthCredential(view, value);
+     }
+ 
++    @ReactProp(name = "ignoreSslErrorForLocalNetwork")
++    public void setIgnoreSslErrorForLocalNetwork(RNCWebViewWrapper view, boolean value) {
++        mRNCWebViewManagerImpl.setIgnoreSslErrorForLocalNetwork(view, value);
++    }
++
+     @ReactProp(name = "cacheEnabled")
+     public void setCacheEnabled(RNCWebViewWrapper view, boolean value) {
+         mRNCWebViewManagerImpl.setCacheEnabled(view, value);
+diff --git a/node_modules/react-native-webview/apple/RNCWebViewImpl.h b/node_modules/react-native-webview/apple/RNCWebViewImpl.h
+index 1f6bbfd..dcbcadb 100644
+--- a/node_modules/react-native-webview/apple/RNCWebViewImpl.h
++++ b/node_modules/react-native-webview/apple/RNCWebViewImpl.h
+@@ -90,6 +90,7 @@ shouldStartLoadForRequest:(NSMutableDictionary<NSString *, id> *)request
+ @property (nonatomic, assign) BOOL keyboardDisplayRequiresUserAction;
+ @property (nonatomic, assign) BOOL hideKeyboardAccessoryView;
+ @property (nonatomic, assign) BOOL allowsBackForwardNavigationGestures;
++@property (nonatomic, assign) BOOL ignoreSslErrorForLocalNetwork;
+ @property (nonatomic, assign) BOOL incognito;
+ @property (nonatomic, assign) BOOL useSharedProcessPool;
+ @property (nonatomic, copy) NSString * _Nullable userAgent;
+diff --git a/node_modules/react-native-webview/apple/RNCWebViewImpl.m b/node_modules/react-native-webview/apple/RNCWebViewImpl.m
+index 7f5c24d..90aa60d 100644
+--- a/node_modules/react-native-webview/apple/RNCWebViewImpl.m
++++ b/node_modules/react-native-webview/apple/RNCWebViewImpl.m
+@@ -128,6 +128,22 @@ @interface RNCWebViewImpl () <WKUIDelegate, WKNavigationDelegate, WKScriptMessag
+ @property (nonatomic, strong) WKUserScript *atEndScript;
+ @end
+ 
++// Helper function to check if host is a local network IP
++static BOOL isLocalNetworkHost(NSString *host) {
++    if (host == nil) return NO;
++    if ([host isEqualToString:@"localhost"] || [host isEqualToString:@"127.0.0.1"]) return YES;
++    NSError *error = nil;
++    NSRegularExpression *regex10 = [NSRegularExpression regularExpressionWithPattern:@"^10\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$" options:0 error:&error];
++    if ([regex10 numberOfMatchesInString:host options:0 range:NSMakeRange(0, host.length)] > 0) return YES;
++    NSRegularExpression *regex172 = [NSRegularExpression regularExpressionWithPattern:@"^172\\.(1[6-9]|2[0-9]|3[01])\\.\\d{1,3}\\.\\d{1,3}$" options:0 error:&error];
++    if ([regex172 numberOfMatchesInString:host options:0 range:NSMakeRange(0, host.length)] > 0) return YES;
++    NSRegularExpression *regex192 = [NSRegularExpression regularExpressionWithPattern:@"^192\\.168\\.\\d{1,3}\\.\\d{1,3}$" options:0 error:&error];
++    if ([regex192 numberOfMatchesInString:host options:0 range:NSMakeRange(0, host.length)] > 0) return YES;
++    NSRegularExpression *regex169 = [NSRegularExpression regularExpressionWithPattern:@"^169\\.254\\.\\d{1,3}\\.\\d{1,3}$" options:0 error:&error];
++    if ([regex169 numberOfMatchesInString:host options:0 range:NSMakeRange(0, host.length)] > 0) return YES;
++    return NO;
++}
++
+ @implementation RNCWebViewImpl
+ {
+ #if !TARGET_OS_OSX
+@@ -137,6 +153,7 @@ @implementation RNCWebViewImpl
+ #endif // !TARGET_OS_OSX
+   BOOL _savedHideKeyboardAccessoryView;
+   BOOL _savedKeyboardDisplayRequiresUserAction;
++  BOOL _ignoreSslErrorForLocalNetwork;
+ 
+   // Workaround for StatusBar appearance bug for iOS 12
+   // https://github.com/react-native-webview/react-native-webview/issues/62
+@@ -245,6 +262,12 @@ - (instancetype)initWithFrame:(CGRect)frame
+   return self;
+ }
+ 
++// Custom setter for ignoreSslErrorForLocalNetwork with logging
++- (void)setIgnoreSslErrorForLocalNetwork:(BOOL)ignore {
++  NSLog(@"[RNCWebView] setIgnoreSslErrorForLocalNetwork called with: %d", ignore);
++  _ignoreSslErrorForLocalNetwork = ignore;
++}
++
+ #if !TARGET_OS_OSX
+ - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherGestureRecognizer {
+   // Only allow long press gesture
+@@ -1161,6 +1184,16 @@ - (void)                    webView:(WKWebView *)webView
+     completionHandler(NSURLSessionAuthChallengeUseCredential, clientAuthenticationCredential);
+     return;
+   }
++  // Bypass SSL for local network if enabled
++  NSLog(@"[RNCWebView] SSL Challenge - host: %@, ignoreSslErrorForLocalNetwork: %d, isLocal: %d, authMethod: %@",
++        host, _ignoreSslErrorForLocalNetwork, (host != nil ? isLocalNetworkHost(host) : NO), [[challenge protectionSpace] authenticationMethod]);
++  if (_ignoreSslErrorForLocalNetwork && host != nil && isLocalNetworkHost(host) && [[challenge protectionSpace] authenticationMethod] == NSURLAuthenticationMethodServerTrust) {
++    NSLog(@"[RNCWebView] Bypassing SSL for local network host: %@", host);
++    SecTrustRef serverTrust = [[challenge protectionSpace] serverTrust];
++    NSURLCredential *credential = [NSURLCredential credentialForTrust:serverTrust];
++    completionHandler(NSURLSessionAuthChallengeUseCredential, credential);
++    return;
++  }
+   if ([[challenge protectionSpace] serverTrust] != nil && customCertificatesForHost != nil && host != nil) {
+     SecCertificateRef localCertificate = (__bridge SecCertificateRef)([customCertificatesForHost objectForKey:host]);
+     if (localCertificate != nil) {
+diff --git a/node_modules/react-native-webview/apple/RNCWebViewManager.mm b/node_modules/react-native-webview/apple/RNCWebViewManager.mm
+index f8f375f..3690d59 100644
+--- a/node_modules/react-native-webview/apple/RNCWebViewManager.mm
++++ b/node_modules/react-native-webview/apple/RNCWebViewManager.mm
+@@ -72,6 +72,7 @@ - (RNCView *)view
+ RCT_EXPORT_VIEW_PROPERTY(autoManageStatusBarEnabled, BOOL)
+ RCT_EXPORT_VIEW_PROPERTY(hideKeyboardAccessoryView, BOOL)
+ RCT_EXPORT_VIEW_PROPERTY(allowsBackForwardNavigationGestures, BOOL)
++RCT_EXPORT_VIEW_PROPERTY(ignoreSslErrorForLocalNetwork, BOOL)
+ RCT_EXPORT_VIEW_PROPERTY(incognito, BOOL)
+ RCT_EXPORT_VIEW_PROPERTY(pagingEnabled, BOOL)
+ RCT_EXPORT_VIEW_PROPERTY(applicationNameForUserAgent, NSString)
+diff --git a/node_modules/react-native-webview/lib/WebViewTypes.d.ts b/node_modules/react-native-webview/lib/WebViewTypes.d.ts
+index 8cbc89f..c2f5ba4 100644
+--- a/node_modules/react-native-webview/lib/WebViewTypes.d.ts
++++ b/node_modules/react-native-webview/lib/WebViewTypes.d.ts
+@@ -209,6 +209,13 @@ export interface CommonNativeWebViewProps extends ViewProps {
+      */
+     applicationNameForUserAgent?: string;
+     basicAuthCredential?: BasicAuthCredential;
++    /**
++     * If true, allows SSL errors to be bypassed for local network addresses (localhost, 127.0.0.1, 10.x.x.x, 172.16-31.x.x, 192.168.x.x, 169.254.x.x).
++     * This is useful for development and testing with self-signed certificates on local servers.
++     * @platform ios
++     * @platform android
++     */
++    ignoreSslErrorForLocalNetwork?: boolean;
+ }
+ export declare type ContentInsetAdjustmentBehavior = 'automatic' | 'scrollableAxes' | 'never' | 'always';
+ export declare type MediaCapturePermissionGrantType = 'grantIfSameHostElsePrompt' | 'grantIfSameHostElseDeny' | 'deny' | 'grant' | 'prompt';
+@@ -1106,5 +1113,12 @@ export interface WebViewSharedProps extends ViewProps {
+      * Enables support for the Payment Request API for the WebView
+      */
+     paymentRequestEnabled?: boolean;
++    /**
++     * If true, allows SSL errors to be bypassed for local network addresses (localhost, 127.0.0.1, 10.x.x.x, 172.16-31.x.x, 192.168.x.x, 169.254.x.x).
++     * This is useful for development and testing with self-signed certificates on local servers.
++     * @platform ios
++     * @platform android
++     */
++    ignoreSslErrorForLocalNetwork?: boolean;
+ }
+ export {};
+diff --git a/node_modules/react-native-webview/src/RNCWebViewNativeComponent.ts b/node_modules/react-native-webview/src/RNCWebViewNativeComponent.ts
+index 16b65ac..6287dcc 100644
+--- a/node_modules/react-native-webview/src/RNCWebViewNativeComponent.ts
++++ b/node_modules/react-native-webview/src/RNCWebViewNativeComponent.ts
+@@ -255,6 +255,7 @@ export interface NativeProps extends ViewProps {
+     username: string;
+     password: string;
+   }>;
++  ignoreSslErrorForLocalNetwork?: boolean;
+   cacheEnabled?: WithDefault<boolean, true>;
+   incognito?: boolean;
+   injectedJavaScript?: string;
+diff --git a/node_modules/react-native-webview/src/WebViewTypes.ts b/node_modules/react-native-webview/src/WebViewTypes.ts
+index c534d17..18f93bf 100644
+--- a/node_modules/react-native-webview/src/WebViewTypes.ts
++++ b/node_modules/react-native-webview/src/WebViewTypes.ts
+@@ -318,6 +318,13 @@ export interface CommonNativeWebViewProps extends ViewProps {
+    */
+   applicationNameForUserAgent?: string;
+   basicAuthCredential?: BasicAuthCredential;
++
++  /**
++   * If true, allows SSL errors to be bypassed for local network addresses.
++   * @platform ios
++   * @platform android
++   */
++  ignoreSslErrorForLocalNetwork?: boolean;
+ }
+ 
+ export declare type ContentInsetAdjustmentBehavior =
+@@ -1349,4 +1356,11 @@ export interface WebViewSharedProps extends ViewProps {
+    * Enables support for the Payment Request API for the WebView
+    */
+   paymentRequestEnabled?: boolean;
++
++  /**
++   * If true, allows SSL errors to be bypassed for local network addresses.
++   * @platform ios
++   * @platform android
++   */
++  ignoreSslErrorForLocalNetwork?: boolean;
+ }
+diff --git a/node_modules/react-native-webview/windows/.npmignore b/node_modules/react-native-webview/windows/.gitignore
+similarity index 100%
+rename from node_modules/react-native-webview/windows/.npmignore
+rename to node_modules/react-native-webview/windows/.gitignore

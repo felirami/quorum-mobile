@@ -11,7 +11,7 @@ import {
   TouchableOpacity,
 } from 'react-native';
 import * as Clipboard from 'expo-clipboard';
-import { useTheme } from '@/theme';
+import { useTheme, type AppTheme } from '@/theme';
 import { Button } from '@/components/ui/Button';
 import { IconSymbol } from '@/components/ui/IconSymbol';
 
@@ -154,7 +154,7 @@ export function HexInputView({
   );
 }
 
-const createStyles = (theme: any) =>
+const createStyles = (theme: AppTheme) =>
   StyleSheet.create({
     container: {
       flex: 1,

@@ -1,17 +1,8 @@
-/**
- * ConfigService - Handles user configuration sync with server
- *
- * Manages encrypted config sync between mobile and server:
- * - AES-GCM encryption with key derived from SHA-512(user_private_key)[0:32]
- * - Ed448 signature for verification
- * - Timestamp-based conflict resolution
- * - Bookmark merging with tombstone tracking
- * - NavItems validation
- * - Full UserConfig compatibility with desktop
- */
+// Encrypted config sync: AES-GCM + Ed448 signatures, timestamp-based conflict resolution.
 
-import { logger } from '@quilibrium/quorum-shared';
-import { sha512 } from '@noble/hashes/sha2';
+import { base64ToHex, numberArrayToBase64 } from '@/utils/encoding';
+import { InteractionManager } from 'react-native';
+import { sha512 } from '@noble/hashes/sha2.js';
 import { gcm } from '@noble/ciphers/aes';
 import { randomBytes } from '@noble/ciphers/webcrypto';
 import { createMMKV, type MMKV } from 'react-native-mmkv';
@@ -42,39 +33,29 @@ const CONFIG_KEY_PREFIX = 'user_config:';
 const BOOKMARKS_KEY_PREFIX = 'bookmarks:';
 const DELETED_BOOKMARKS_KEY = 'deleted_bookmark_ids:';
 
-// ============ NavItems Validation ============
+// NavItems Validation
 
 const MAX_FOLDERS = 20;
 const MAX_SPACES_PER_FOLDER = 100;
-
-/**
- * Validate and sanitize NavItems array
- * Enforces limits: max 20 folders, max 100 spaces per folder
- */
 function validateItems(items: NavItem[]): NavItem[] {
   let folderCount = 0;
   return items.filter((item) => {
     if (item.type === 'folder') {
       if (folderCount >= MAX_FOLDERS) {
-        logger.warn(`[ConfigService] Folder limit exceeded, skipping folder: ${item.name}`);
         return false;
       }
       folderCount++;
       // Limit spaces per folder
       if (item.spaceIds.length > MAX_SPACES_PER_FOLDER) {
         item.spaceIds = item.spaceIds.slice(0, MAX_SPACES_PER_FOLDER);
-        logger.warn(`[ConfigService] Truncated folder ${item.name} to ${MAX_SPACES_PER_FOLDER} spaces`);
       }
     }
     return true;
   });
 }
 
-// ============ Bookmark Storage ============
+// Bookmark Storage
 
-/**
- * Get all bookmarks for a user from local storage
- */
 export function getLocalBookmarks(address: string): Bookmark[] {
   const key = `${BOOKMARKS_KEY_PREFIX}${address}`;
   const data = bookmarkStorage.getString(key);
@@ -86,9 +67,6 @@ export function getLocalBookmarks(address: string): Bookmark[] {
   }
 }
 
-/**
- * Save bookmarks to local storage
- */
 function saveLocalBookmarks(address: string, bookmarks: Bookmark[]): void {
   const key = `${BOOKMARKS_KEY_PREFIX}${address}`;
   // Enforce max bookmarks limit
@@ -96,9 +74,6 @@ function saveLocalBookmarks(address: string, bookmarks: Bookmark[]): void {
   bookmarkStorage.set(key, JSON.stringify(limitedBookmarks));
 }
 
-/**
- * Add a bookmark
- */
 export function addBookmark(address: string, bookmark: Bookmark): void {
   const bookmarks = getLocalBookmarks(address);
   // Check for duplicate messageId
@@ -114,9 +89,6 @@ export function addBookmark(address: string, bookmark: Bookmark): void {
   saveLocalBookmarks(address, bookmarks);
 }
 
-/**
- * Remove a bookmark
- */
 export function removeBookmark(address: string, bookmarkId: string): void {
   const bookmarks = getLocalBookmarks(address);
   const filtered = bookmarks.filter((b) => b.bookmarkId !== bookmarkId);
@@ -130,9 +102,6 @@ export function removeBookmark(address: string, bookmarkId: string): void {
   }
 }
 
-/**
- * Get deleted bookmark IDs (tombstones)
- */
 function getDeletedBookmarkIds(address: string): string[] {
   const key = `${DELETED_BOOKMARKS_KEY}${address}`;
   const data = bookmarkStorage.getString(key);
@@ -144,27 +113,17 @@ function getDeletedBookmarkIds(address: string): string[] {
   }
 }
 
-/**
- * Save deleted bookmark IDs
- */
 function saveDeletedBookmarkIds(address: string, ids: string[]): void {
   const key = `${DELETED_BOOKMARKS_KEY}${address}`;
   bookmarkStorage.set(key, JSON.stringify(ids));
 }
 
-/**
- * Clear deleted bookmark IDs (after successful sync)
- */
 function clearDeletedBookmarkIds(address: string): void {
   const key = `${DELETED_BOOKMARKS_KEY}${address}`;
   bookmarkStorage.remove(key);
 }
 
-/**
- * Merge local and remote bookmarks with conflict resolution
- * Strategy: Last-write-wins with tombstone tracking for deletions
- * Deduplication: Prevents multiple bookmarks pointing to same message
- */
+// Last-write-wins merge with tombstone tracking; deduplicates by messageId.
 function mergeBookmarks(
   local: Bookmark[],
   remote: Bookmark[],
@@ -198,11 +157,8 @@ function mergeBookmarks(
   return Array.from(bookmarkMap.values()).sort((a, b) => b.createdAt - a.createdAt);
 }
 
-// ============ Default Config ============
+// Default Config
 
-/**
- * Get default user config for a new user
- */
 function getDefaultUserConfig(address: string): UserConfig {
   return {
     address,
@@ -217,9 +173,6 @@ function getDefaultUserConfig(address: string): UserConfig {
   };
 }
 
-/**
- * Get local user config from storage
- */
 export function getLocalUserConfig(address: string): UserConfig | null {
   const key = `${CONFIG_KEY_PREFIX}${address}`;
   const data = configStorage.getString(key);
@@ -231,53 +184,26 @@ export function getLocalUserConfig(address: string): UserConfig | null {
   }
 }
 
-/**
- * Save user config to local storage
- */
 export function saveLocalUserConfig(config: UserConfig): void {
   const key = `${CONFIG_KEY_PREFIX}${config.address}`;
   configStorage.set(key, JSON.stringify(config));
 }
 
-/**
- * Convert number array to base64 string
- */
-function numberArrayToBase64(arr: number[]): string {
-  const uint8 = new Uint8Array(arr);
-  let binary = '';
-  for (let i = 0; i < uint8.length; i++) {
-    binary += String.fromCharCode(uint8[i]);
-  }
-  return btoa(binary);
-}
+// AES-256 key = SHA-512(private_key)[0:32]
+const derivedKeyCache = new Map<string, Uint8Array>();
 
-/**
- * Convert base64 string to hex
- */
-function base64ToHex(base64: string): string {
-  const binary = atob(base64);
-  let hex = '';
-  for (let i = 0; i < binary.length; i++) {
-    hex += binary.charCodeAt(i).toString(16).padStart(2, '0');
-  }
-  return hex;
-}
-
-/**
- * Derive AES-256 key from user private key using SHA-512
- * Key = SHA-512(private_key)[0:32]
- * Returns raw key bytes for use with @noble/ciphers
- */
 function deriveConfigKey(privateKeyHex: string): Uint8Array {
+  const cached = derivedKeyCache.get(privateKeyHex);
+  if (cached) return cached;
+
   const privateKeyBytes = hexToBytes(privateKeyHex);
   const hash = sha512(new Uint8Array(privateKeyBytes));
-  return hash.slice(0, 32);
+  const key = hash.slice(0, 32);
+  derivedKeyCache.set(privateKeyHex, key);
+  return key;
 }
 
-/**
- * Encrypt config using AES-GCM via @noble/ciphers
- * Returns hex string of (ciphertext + IV)
- */
+// Returns hex(ciphertext + IV)
 function encryptConfig(config: UserConfig, key: Uint8Array): string {
   const iv = randomBytes(12);
   const configJson = JSON.stringify(config);
@@ -292,10 +218,7 @@ function encryptConfig(config: UserConfig, key: Uint8Array): string {
   return ciphertextHex + ivHex;
 }
 
-/**
- * Decrypt config using AES-GCM via @noble/ciphers
- * Input is hex string of (ciphertext + IV) where IV is last 24 chars (12 bytes)
- */
+// Input: hex(ciphertext + IV), IV is last 24 hex chars (12 bytes)
 function decryptConfig(encryptedHex: string, key: Uint8Array): UserConfig {
   // Extract IV from last 24 hex chars (12 bytes)
   const ivHex = encryptedHex.slice(-24);
@@ -311,10 +234,7 @@ function decryptConfig(encryptedHex: string, key: Uint8Array): UserConfig {
   return JSON.parse(decoded) as UserConfig;
 }
 
-/**
- * Sign config data with Ed448
- * Signs: (encrypted_config_bytes + timestamp_bytes)
- */
+// Signs: encrypted_config_bytes + timestamp_bytes
 async function signConfigData(
   encryptedConfig: string,
   timestamp: number,
@@ -338,9 +258,6 @@ async function signConfigData(
   return base64ToHex(signatureBase64);
 }
 
-/**
- * Verify config signature with Ed448
- */
 async function verifyConfigSignature(
   encryptedConfig: string,
   timestamp: number,
@@ -372,22 +289,17 @@ async function verifyConfigSignature(
     );
     return result;
   } catch (error) {
-    logger.warn('[ConfigService] Signature verification failed:', error);
     return false;
   }
 }
 
-/**
- * Fetch and decrypt user config from server
- * Returns remote config if newer than local, otherwise local config
- */
+// Returns remote config if newer than local, otherwise local config.
 export async function getConfig(address: string): Promise<UserConfig> {
   const client = getQuorumClient();
   const privateKey = await getPrivateKey();
   const publicKey = await getPublicKey();
 
   if (!privateKey || !publicKey) {
-    logger.warn('[ConfigService] No user keys found');
     return getLocalUserConfig(address) ?? getDefaultUserConfig(address);
   }
 
@@ -395,8 +307,8 @@ export async function getConfig(address: string): Promise<UserConfig> {
   let remoteConfig: { user_config: string; timestamp: number; signature: string } | undefined;
   try {
     remoteConfig = (await client.getUserSettings(address)) ?? undefined;
-  } catch (error) {
-    logger.log('[ConfigService] No remote config found or error fetching:', error);
+  } catch {
+    // Network failure — fall through to local config
   }
 
   const localConfig = getLocalUserConfig(address);
@@ -411,7 +323,6 @@ export async function getConfig(address: string): Promise<UserConfig> {
 
   // Check timestamp - if local is newer, use local
   if (remoteConfig.timestamp < (localConfig?.timestamp ?? 0)) {
-    logger.warn('[ConfigService] Remote config is older than local');
     return localConfig!;
   }
 
@@ -429,7 +340,6 @@ export async function getConfig(address: string): Promise<UserConfig> {
   );
 
   if (!signatureValid) {
-    logger.warn('[ConfigService] Remote config has invalid signature!');
     return localConfig ?? getDefaultUserConfig(address);
   }
 
@@ -452,37 +362,30 @@ export async function getConfig(address: string): Promise<UserConfig> {
         decryptedConfig.deletedBookmarkIds ?? []
       );
       saveLocalBookmarks(address, mergedBookmarks);
-      logger.log(
-        `[ConfigService] Bookmark sync: ${mergedBookmarks.length} total after merge`
-      );
     }
 
-    // Sync spaces from spaceKeys
+    // Sync spaces from spaceKeys - defer to after animations complete
     if (decryptedConfig.spaceKeys && decryptedConfig.spaceKeys.length > 0) {
-      logger.log(
-        `[ConfigService] Config contains ${decryptedConfig.spaceKeys.length} space keys, syncing...`
-      );
-      try {
-        const { syncSpacesFromConfig } = await import('./spaceSyncService');
-        // Pass user info so the user gets saved as a member of each synced space
-        const userInfo = {
-          address,
-          displayName: decryptedConfig.name,
-          profileImage: decryptedConfig.profile_image,
-        };
-        const syncedCount = await syncSpacesFromConfig(
-          decryptedConfig.spaceKeys,
-          userInfo,
-          // WebSocket listen callback - will be handled by caller if needed
-          undefined
-        );
-        logger.log(
-          `[ConfigService] Synced ${syncedCount}/${decryptedConfig.spaceKeys.length} spaces`
-        );
-      } catch (spaceSyncError) {
-        console.error('[ConfigService] Failed to sync spaces:', spaceSyncError);
-        // Continue with rest of config - space sync failure shouldn't block
-      }
+      // Schedule space sync after UI interactions complete to avoid jank
+      const spaceKeysToSync = decryptedConfig.spaceKeys;
+      const userInfo = {
+        address,
+        displayName: decryptedConfig.name,
+        profileImage: decryptedConfig.profile_image,
+      };
+      InteractionManager.runAfterInteractions(async () => {
+        try {
+          const { syncSpacesFromConfig } = await import('./spaceSyncService');
+          await syncSpacesFromConfig(
+            spaceKeysToSync,
+            userInfo,
+            // WebSocket listen callback - will be handled by caller if needed
+            undefined
+          );
+        } catch {
+          // Space sync is best-effort during config load — spaces will sync on next app launch
+        }
+      });
     }
 
     // Save to local storage
@@ -495,28 +398,18 @@ export async function getConfig(address: string): Promise<UserConfig> {
       // Ensure profile fields are preserved
       name: decryptedConfig.name,
       profile_image: decryptedConfig.profile_image,
-    };
+      bio: (decryptedConfig as any).bio,
+      isProfilePublic: (decryptedConfig as any).isProfilePublic,
+    } as UserConfig;
     saveLocalUserConfig(configWithTimestamp);
 
-    logger.log('[ConfigService] Successfully synced remote config', {
-      spaceIds: configWithTimestamp.spaceIds?.length ?? 0,
-      items: configWithTimestamp.items?.length ?? 0,
-      bookmarks: configWithTimestamp.bookmarks?.length ?? 0,
-      hasSpaceKeys: !!configWithTimestamp.spaceKeys?.length,
-      name: configWithTimestamp.name,
-      hasProfileImage: !!configWithTimestamp.profile_image,
-    });
     return configWithTimestamp;
   } catch (error) {
-    console.error('[ConfigService] Failed to decrypt remote config:', error);
     return localConfig ?? getDefaultUserConfig(address);
   }
 }
 
-/**
- * Collect space keys and encryption states for config sync
- * Matches desktop behavior: only includes spaces with valid encryption state
- */
+// Only includes spaces with valid encryption state (matches desktop).
 function collectSpaceKeysForSync(): SpaceKeyInfo[] {
   const spaces = getAllSpaces();
   const spaceKeyInfos: SpaceKeyInfo[] = [];
@@ -532,7 +425,6 @@ function collectSpaceKeysForSync(): SpaceKeyInfo[] {
     const encryptionStates = encryptionStateStorage.getEncryptionStates(conversationId);
 
     if (encryptionStates.length === 0) {
-      logger.warn(`[ConfigService] Space ${space.spaceId} has no encryption state, skipping from sync`);
       continue;
     }
 
@@ -560,10 +452,7 @@ function collectSpaceKeysForSync(): SpaceKeyInfo[] {
   return spaceKeyInfos;
 }
 
-/**
- * Save config and optionally sync to server
- * Only syncs if config.allowSync is true
- */
+// Syncs to server if config.allowSync is true.
 export async function saveConfig(config: UserConfig): Promise<void> {
   const privateKey = await getPrivateKey();
   const publicKey = await getPublicKey();
@@ -582,14 +471,6 @@ export async function saveConfig(config: UserConfig): Promise<void> {
       // Collect space keys before encryption (matches desktop behavior)
       const spaceKeys = collectSpaceKeysForSync();
       config.spaceKeys = spaceKeys;
-
-      // Log warning if spaces are being filtered out
-      const allSpaces = getAllSpaces();
-      if (allSpaces.length > spaceKeys.length) {
-        logger.warn(
-          `[ConfigService] ${allSpaces.length - spaceKeys.length} space(s) filtered from sync (missing encryption state)`
-        );
-      }
 
       // Ensure spaceIds and items only include spaces that have encryption keys
       // This prevents server validation errors
@@ -622,18 +503,10 @@ export async function saveConfig(config: UserConfig): Promise<void> {
         signature,
       });
 
-      logger.log('[ConfigService] Config synced to server', {
-        spaceIds: config.spaceIds?.length ?? 0,
-        items: config.items?.length ?? 0,
-        bookmarks: config.bookmarks?.length ?? 0,
-        spaceKeys: config.spaceKeys?.length ?? 0,
-      });
-
       // Clear deleted bookmark tombstones after successful sync
       clearDeletedBookmarkIds(address);
       config.deletedBookmarkIds = [];
     } catch (error) {
-      console.error('[ConfigService] Failed to sync config to server:', error);
       // Continue to save locally even if sync fails
     }
   }
@@ -642,18 +515,12 @@ export async function saveConfig(config: UserConfig): Promise<void> {
   saveLocalUserConfig(config);
 }
 
-/**
- * Clear all config data (for sign out)
- */
 export function clearConfigStorage(): void {
   configStorage.clearAll();
   bookmarkStorage.clearAll();
   clearSpaceStorage();
 }
 
-/**
- * Update specific fields in config and save
- */
 export async function updateConfig(
   address: string,
   updates: Partial<UserConfig>
@@ -664,17 +531,11 @@ export async function updateConfig(
   return updatedConfig;
 }
 
-/**
- * Get user's display name from config
- */
 export function getDisplayName(address: string): string | undefined {
   const config = getLocalUserConfig(address);
   return config?.name;
 }
 
-/**
- * Get user's profile image from config
- */
 export function getProfileImage(address: string): string | undefined {
   const config = getLocalUserConfig(address);
   return config?.profile_image;

@@ -18,8 +18,13 @@ import {
   keyPairFromMnemonic,
   uploadUserRegistration
 } from '@/services/onboarding/keyService';
+import {
+  deriveFarcasterKeys,
+  lookupFarcasterAccount,
+  validateFarcasterMnemonic,
+} from '@/services/onboarding/farcasterService';
+import { fetchImageAsDataUri } from '@/utils/image';
 import * as secureStorage from '@/services/onboarding/secureStorage';
-import { logger } from '@quilibrium/quorum-shared';
 import { useRouter } from 'expo-router';
 import React, {
   createContext,
@@ -30,10 +35,13 @@ import React, {
   useRef,
   useState,
 } from 'react';
-import type { PrivacyLevel as AuthPrivacyLevel } from './AuthContext';
+import type { PrivacyLevel } from './AuthContext';
 import { useAuth } from './AuthContext';
 
-// ============ Types ============
+// Re-export PrivacyLevel from AuthContext (single source of truth)
+export type { PrivacyLevel } from './AuthContext';
+
+// Types
 
 export type OnboardingStep =
   | 'account-setup'
@@ -42,11 +50,10 @@ export type OnboardingStep =
   | 'privacy-setup'
   | 'complete';
 
-export type PrivacyLevel = 'maximum' | 'enhanced' | 'standard';
-
 export interface QuorumKeys {
   publicKey: string;
-  address: string;
+  address: string;              // Qm... style Quorum address
+  quilibriumAddress: string;    // 0x-prefixed Quilibrium address for QNS
 }
 
 export interface FarcasterAccount {
@@ -124,16 +131,18 @@ export interface OnboardingContextValue {
   // Completion - returns user info if successful, null if failed
   completeOnboarding: () => Promise<{
     address: string;
+    quilibriumAddress: string;
     publicKey: string;
     displayName?: string;
     username?: string;
     bio?: string;
     profileImage?: string;
-    privacyLevel: AuthPrivacyLevel;
+    privacyLevel: PrivacyLevel;
     farcaster?: {
       fid: number;
       username: string;
       signerPublicKey: string;
+      custodyAddress?: string;
     };
   } | null>;
 
@@ -141,7 +150,7 @@ export interface OnboardingContextValue {
   clearError: () => void;
 }
 
-// ============ Context ============
+// Context
 
 const OnboardingContext = createContext<OnboardingContextValue | null>(null);
 
@@ -168,7 +177,7 @@ const initialState: OnboardingState = {
   syncedConfig: null,
 };
 
-// ============ Provider ============
+// Provider
 
 interface OnboardingProviderProps {
   children: React.ReactNode;
@@ -206,6 +215,7 @@ export function OnboardingProvider({ children }: OnboardingProviderProps) {
               quorumKeys: {
                 address: saved.quorumAddress!,
                 publicKey: saved.quorumPublicKey!,
+                quilibriumAddress: saved.quilibriumAddress ?? '', // May be empty for old accounts
               },
               farcasterEnabled: saved.farcasterEnabled ?? false,
               profile: saved.profile ?? {},
@@ -216,8 +226,8 @@ export function OnboardingProvider({ children }: OnboardingProviderProps) {
             await secureStorage.clearOnboardingState();
           }
         }
-      } catch (error) {
-        console.error('Failed to load onboarding state:', error);
+      } catch {
+        // Failed to load saved onboarding state — start fresh
       }
     };
 
@@ -242,6 +252,7 @@ export function OnboardingProvider({ children }: OnboardingProviderProps) {
         completedSteps: state.completedSteps,
         quorumAddress: state.quorumKeys.address,
         quorumPublicKey: state.quorumKeys.publicKey,
+        quilibriumAddress: state.quorumKeys.quilibriumAddress,
         farcasterEnabled: state.farcasterEnabled,
         farcasterUsername: state.farcasterAccount?.username,
         profile: state.profile,
@@ -252,7 +263,7 @@ export function OnboardingProvider({ children }: OnboardingProviderProps) {
     saveState();
   }, [state.currentStep, state.completedSteps, state.quorumKeys, state.farcasterEnabled, state.profile, state.privacyLevel]);
 
-  // ============ Navigation ============
+  // Navigation
 
   const goToStep = useCallback((step: OnboardingStep, additionalUpdates?: Partial<OnboardingState>) => {
     setState(prev => ({ ...prev, ...additionalUpdates, currentStep: step }));
@@ -288,7 +299,7 @@ export function OnboardingProvider({ children }: OnboardingProviderProps) {
     }
   }, [state.currentStep, goToStep, markStepComplete]);
 
-  // ============ Step 1: Account ============
+  // Step 1: Account
 
   const createNewAccount = useCallback(async () => {
     setState(prev => ({ ...prev, isLoading: true, error: null }));
@@ -296,9 +307,20 @@ export function OnboardingProvider({ children }: OnboardingProviderProps) {
     try {
       const { mnemonic, keyPair } = generateMnemonic();
 
-      // Store private key securely
-      await secureStorage.storePrivateKey(keyPair.privateKey);
+      // Persist the mnemonic FIRST, then the private key. Force-close
+      // can strike between these two awaits, and the directional
+      // asymmetry matters: mnemonic → private key is recoverable
+      // (ensurePrivateKey at boot re-derives from the stored mnemonic),
+      // but private key → mnemonic is NOT (no way to recover BIP-39
+      // words from a derived Ed448 key). Writing in this order means a
+      // mid-write crash leaves us in the recoverable state instead of
+      // a perpetually-authenticated user who can never view or export
+      // their seed phrase. Sequential awaits — Promise.all is no
+      // safer here because both calls hit the same SharedPreferences
+      // file lock on Android and resolve at distinct moments either
+      // way.
       await secureStorage.storeMnemonic(mnemonic);
+      await secureStorage.storePrivateKey(keyPair.privateKey);
 
       setState(prev => ({
         ...prev,
@@ -306,6 +328,7 @@ export function OnboardingProvider({ children }: OnboardingProviderProps) {
         quorumKeys: {
           publicKey: keyPair.publicKey,
           address: keyPair.address,
+          quilibriumAddress: keyPair.quilibriumAddress,
         },
         generatedMnemonic: mnemonic,
       }));
@@ -324,12 +347,16 @@ export function OnboardingProvider({ children }: OnboardingProviderProps) {
     try {
       const keyPair = keyPairFromMnemonic(words);
 
-      await secureStorage.storePrivateKey(keyPair.privateKey);
+      // Mnemonic first — see the matching comment in createNewAccount.
+      // A force-close between these writes must leave the recoverable
+      // (mnemonic present, private key derivable) state, not the
+      // unrecoverable (private key present, mnemonic permanently lost)
+      // state.
       await secureStorage.storeMnemonic(words);
+      await secureStorage.storePrivateKey(keyPair.privateKey);
 
       // Initialize encryption keys and upload registration early
       // This is needed before we can sync config
-      logger.log('[Onboarding] Initializing encryption keys for import...');
       const deviceKeyset = await initializeEncryptionKeys(keyPair.publicKey);
       await uploadUserRegistration(
         keyPair.address,
@@ -337,21 +364,13 @@ export function OnboardingProvider({ children }: OnboardingProviderProps) {
         keyPair.privateKey,
         deviceKeyset
       );
-      logger.log('[Onboarding] Registration uploaded');
 
       // Try to sync config from server to pre-fill profile data
       let syncedConfig: OnboardingState['syncedConfig'] = null;
       let profileFromConfig: ProfileData = {};
 
-      try {
-        logger.log('[Onboarding] Syncing config for imported account...');
+      try{
         const config = await getConfig(keyPair.address);
-        logger.log('[Onboarding] Config fetched:', {
-          hasName: !!config.name,
-          hasProfileImage: !!config.profile_image,
-          allowSync: config.allowSync,
-          spaceKeyCount: config.spaceKeys?.length ?? 0,
-        });
 
         // Extract profile data if present to pre-fill
         if (config.name || config.profile_image) {
@@ -359,7 +378,6 @@ export function OnboardingProvider({ children }: OnboardingProviderProps) {
             displayName: config.name,
             profileImageUri: config.profile_image,
           };
-          logger.log('[Onboarding] Profile data from config:', profileFromConfig);
         }
 
         // Store synced config info for reference
@@ -370,32 +388,107 @@ export function OnboardingProvider({ children }: OnboardingProviderProps) {
             allowSync: config.allowSync,
             spaceCount: config.spaceKeys?.length ?? 0,
           };
-          logger.log('[Onboarding] Synced config stored:', syncedConfig);
         }
       } catch (configError) {
-        logger.log('[Onboarding] No existing config found (new account):', configError);
       }
 
-      setState(prev => ({
-        ...prev,
-        isLoading: false,
-        quorumKeys: {
-          publicKey: keyPair.publicKey,
-          address: keyPair.address,
-        },
-        generatedMnemonic: null, // Don't show mnemonic for imports
-        isImportedAccount: true,
-        syncedConfig,
-        // Pre-fill profile from config if we got any data
-        profile: {
-          ...prev.profile,
-          ...profileFromConfig,
-        },
-      }));
+      // BIP-39 bridge: a single mnemonic can derive both Quorum (ed448 at
+      // m/44'/1776'/0'/1/0) and Farcaster custody (Ethereum BIP-44). If the
+      // phrase resolves to a registered Farcaster account, onboard both at
+      // once. Failure falls through to the farcaster-setup screen.
+      let detectedFarcaster: {
+        account: NonNullable<Awaited<ReturnType<typeof lookupFarcasterAccount>>>;
+        signerPublicKey: string;
+        custodyAddress: string;
+        pfpDataUri?: string;
+      } | null = null;
+      try {
+        if (validateFarcasterMnemonic(words)) {
+          const fcKeys = deriveFarcasterKeys(words);
+          const account = await lookupFarcasterAccount(
+            fcKeys.custodyAddress,
+            fcKeys.custodyPrivateKey,
+          );
+          if (account) {
+            await Promise.all([
+              secureStorage.storeFarcasterCustodyKey(fcKeys.custodyPrivateKey),
+              secureStorage.storeFarcasterSignerKey(fcKeys.signerPrivateKey),
+              secureStorage.storeFarcasterFid(account.fid),
+              account.authToken
+                ? secureStorage.storeFarcasterAuthToken(account.authToken)
+                : Promise.resolve(),
+            ]);
+            const pfpDataUri = account.pfpUrl
+              ? (await fetchImageAsDataUri(account.pfpUrl)) ?? undefined
+              : undefined;
+            detectedFarcaster = {
+              account,
+              signerPublicKey: fcKeys.signerPublicKey,
+              custodyAddress: fcKeys.custodyAddress,
+              pfpDataUri,
+            };
+          }
+        }
+      } catch {
+        // Best-effort.
+      }
 
-      // Always proceed through normal onboarding flow for imports
-      // This allows user to review/update Farcaster and profile settings
-      goToNextStep();
+      setState(prev => {
+        const updatedProfile = { ...prev.profile, ...profileFromConfig };
+        const fc = detectedFarcaster;
+        if (fc) {
+          // Pre-fill profile from Farcaster data when not already set
+          // (config sync above takes precedence; this fills the gaps).
+          if (!updatedProfile.displayName && fc.account.displayName) {
+            updatedProfile.displayName = fc.account.displayName;
+          }
+          if (!updatedProfile.profileImageUri && fc.pfpDataUri) {
+            updatedProfile.profileImageUri = fc.pfpDataUri;
+          }
+          if (!updatedProfile.username && fc.account.username) {
+            updatedProfile.username = fc.account.username;
+          }
+        }
+        return {
+          ...prev,
+          isLoading: false,
+          quorumKeys: {
+            publicKey: keyPair.publicKey,
+            address: keyPair.address,
+            quilibriumAddress: keyPair.quilibriumAddress,
+          },
+          generatedMnemonic: null, // Don't show mnemonic for imports
+          isImportedAccount: true,
+          syncedConfig,
+          profile: updatedProfile,
+          farcasterEnabled: fc ? true : prev.farcasterEnabled,
+          farcasterAccount: fc
+            ? {
+                fid: fc.account.fid,
+                username: fc.account.username,
+                displayName: fc.account.displayName,
+                pfpUrl: fc.pfpDataUri,
+                signerPublicKey: fc.signerPublicKey,
+                custodyAddress: fc.custodyAddress,
+              }
+            : prev.farcasterAccount,
+          // Mark farcaster-setup complete so the navigator + step
+          // ordering treats it as already-done.
+          completedSteps: fc
+            ? Array.from(new Set([...prev.completedSteps, 'account-setup', 'farcaster-setup']))
+            : prev.completedSteps,
+        };
+      });
+
+      // If we picked up a Farcaster account, skip past farcaster-setup
+      // and land directly on profile-setup. Otherwise continue normally.
+      if (detectedFarcaster) {
+        markStepComplete('account-setup');
+        markStepComplete('farcaster-setup');
+        goToStep('profile-setup');
+      } else {
+        goToNextStep();
+      }
     } catch (error) {
       setState(prev => ({
         ...prev,
@@ -403,7 +496,7 @@ export function OnboardingProvider({ children }: OnboardingProviderProps) {
         error: error instanceof Error ? error.message : 'Invalid mnemonic phrase',
       }));
     }
-  }, [goToNextStep]);
+  }, [goToNextStep, goToStep, markStepComplete]);
 
   const importFromHex = useCallback(async (hexKey: string) => {
     setState(prev => ({ ...prev, isLoading: true, error: null }));
@@ -415,7 +508,6 @@ export function OnboardingProvider({ children }: OnboardingProviderProps) {
 
       // Initialize encryption keys and upload registration early
       // This is needed before we can sync config
-      logger.log('[Onboarding] Initializing encryption keys for hex import...');
       const deviceKeyset = await initializeEncryptionKeys(keyPair.publicKey);
       await uploadUserRegistration(
         keyPair.address,
@@ -423,21 +515,13 @@ export function OnboardingProvider({ children }: OnboardingProviderProps) {
         keyPair.privateKey,
         deviceKeyset
       );
-      logger.log('[Onboarding] Registration uploaded');
 
       // Try to sync config from server to pre-fill profile data
       let syncedConfig: OnboardingState['syncedConfig'] = null;
       let profileFromConfig: ProfileData = {};
 
-      try {
-        logger.log('[Onboarding] Syncing config for imported account...');
+      try{
         const config = await getConfig(keyPair.address);
-        logger.log('[Onboarding] Config fetched:', {
-          hasName: !!config.name,
-          hasProfileImage: !!config.profile_image,
-          allowSync: config.allowSync,
-          spaceKeyCount: config.spaceKeys?.length ?? 0,
-        });
 
         // Extract profile data if present to pre-fill
         if (config.name || config.profile_image) {
@@ -445,7 +529,6 @@ export function OnboardingProvider({ children }: OnboardingProviderProps) {
             displayName: config.name,
             profileImageUri: config.profile_image,
           };
-          logger.log('[Onboarding] Profile data from config:', profileFromConfig);
         }
 
         // Store synced config info for reference
@@ -456,10 +539,8 @@ export function OnboardingProvider({ children }: OnboardingProviderProps) {
             allowSync: config.allowSync,
             spaceCount: config.spaceKeys?.length ?? 0,
           };
-          logger.log('[Onboarding] Synced config stored:', syncedConfig);
         }
       } catch (configError) {
-        logger.log('[Onboarding] No existing config found (new account):', configError);
       }
 
       setState(prev => ({
@@ -468,6 +549,7 @@ export function OnboardingProvider({ children }: OnboardingProviderProps) {
         quorumKeys: {
           publicKey: keyPair.publicKey,
           address: keyPair.address,
+          quilibriumAddress: keyPair.quilibriumAddress,
         },
         generatedMnemonic: null,
         isImportedAccount: true,
@@ -497,7 +579,7 @@ export function OnboardingProvider({ children }: OnboardingProviderProps) {
     goToNextStep();
   }, [goToNextStep]);
 
-  // ============ Step 2: Farcaster ============
+  // Step 2: Farcaster
 
   const skipFarcaster = useCallback(() => {
     setState(prev => ({
@@ -525,14 +607,6 @@ export function OnboardingProvider({ children }: OnboardingProviderProps) {
         updatedProfile.username = account.username;
       }
 
-      logger.log('[Onboarding] Setting Farcaster account:', {
-        fid: account.fid,
-        username: account.username,
-        displayName: account.displayName,
-        hasPfp: !!account.pfpUrl,
-        profileUpdated: updatedProfile,
-      });
-
       return {
         ...prev,
         farcasterEnabled: true,
@@ -543,7 +617,7 @@ export function OnboardingProvider({ children }: OnboardingProviderProps) {
     goToNextStep();
   }, [goToNextStep]);
 
-  // ============ Step 3: Profile ============
+  // Step 3: Profile
 
   const updateProfile = useCallback((updates: Partial<ProfileData>) => {
     setState(prev => ({
@@ -556,13 +630,13 @@ export function OnboardingProvider({ children }: OnboardingProviderProps) {
     goToNextStep();
   }, [goToNextStep]);
 
-  // ============ Step 4: Privacy ============
+  // Step 4: Privacy
 
   const setPrivacyLevel = useCallback((level: PrivacyLevel) => {
     setState(prev => ({ ...prev, privacyLevel: level }));
   }, []);
 
-  // ============ Completion ============
+  // Completion
 
   const completeOnboarding = useCallback(async () => {
     // Prevent multiple calls
@@ -582,7 +656,6 @@ export function OnboardingProvider({ children }: OnboardingProviderProps) {
       try {
         await secureStorage.clearOnboardingState();
       } catch (clearError) {
-        logger.warn('[Onboarding] Failed to clear state (non-fatal):', clearError);
       }
 
       // Return user info for the screen to use with signIn
@@ -590,6 +663,7 @@ export function OnboardingProvider({ children }: OnboardingProviderProps) {
       // Note: We intentionally don't call setState here to avoid triggering re-renders
       return {
         address: state.quorumKeys.address,
+        quilibriumAddress: state.quorumKeys.quilibriumAddress,
         publicKey: state.quorumKeys.publicKey,
         displayName: state.profile.displayName,
         username: state.profile.username,
@@ -606,19 +680,18 @@ export function OnboardingProvider({ children }: OnboardingProviderProps) {
           : undefined,
       };
     } catch (error) {
-      console.error('[Onboarding] Error:', error);
       isCompletingRef.current = false;
       return null;
     }
   }, [state.quorumKeys, state.privacyLevel, state.profile, state.farcasterAccount]);
 
-  // ============ Error Handling ============
+  // Error Handling
 
   const clearError = useCallback(() => {
     setState(prev => ({ ...prev, error: null }));
   }, []);
 
-  // ============ Context Value ============
+  // Context Value
 
   const value = useMemo<OnboardingContextValue>(
     () => ({
@@ -664,7 +737,7 @@ export function OnboardingProvider({ children }: OnboardingProviderProps) {
   );
 }
 
-// ============ Hooks ============
+// Hooks
 
 export function useOnboarding(): OnboardingContextValue {
   const context = useContext(OnboardingContext);

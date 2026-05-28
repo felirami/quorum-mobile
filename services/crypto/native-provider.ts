@@ -7,7 +7,6 @@
 
 // Import types from the shared library
 // These types match the CryptoProvider interface
-import { logger } from '@quilibrium/quorum-shared';
 import type {
   CryptoProvider,
   Ed448Keypair,
@@ -25,8 +24,23 @@ import type {
   InboxMessageDecryptRequest,
 } from '@quilibrium/quorum-shared';
 
+import { arrayToBase64, base64ToArray, base64ToHex } from '@/utils/encoding';
 import QuorumCrypto from '../../modules/quorum-crypto/src';
-import { sha512 as nobleSha512 } from '@noble/hashes/sha2';
+import { sha512 as nobleSha512 } from '@noble/hashes/sha2.js';
+import { logger } from '@quilibrium/quorum-shared';
+/**
+ * DecryptionError - A silent error for expected decryption failures
+ *
+ * In multi-device scenarios, devices receive messages encrypted for other devices.
+ * These decryption failures are expected and shouldn't be logged as errors.
+ * This custom error class allows callers to identify and handle these silently.
+ */
+export class DecryptionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DecryptionError';
+  }
+}
 
 // Fields that should remain as strings even if they contain JSON
 // These are used by Double/Triple Ratchet operations where the state must stay serialized
@@ -37,30 +51,38 @@ const KEEP_AS_STRING_FIELDS = new Set(['ratchet_state', 'envelope']);
  * Handles nested JSON encoding where inner values are JSON strings
  */
 function parseNativeResult<T>(result: string): T {
-  // Check for common error patterns
-  if (
+  // Fast-path error check (only check short strings for error patterns)
+  if (result.length < 200 && (
     result.startsWith('invalid') ||
     result.startsWith('error') ||
     result.includes('failed') ||
     result.includes('Error')
-  ) {
+  )) {
     throw new Error(result);
   }
 
-  // Try standard JSON parsing first
+  // Try standard JSON parsing first (hot path)
   try {
     const parsed = JSON.parse(result);
 
-    // Check if this is an object with string values that are themselves JSON
-    // IMPORTANT: Some fields like ratchet_state and envelope should stay as strings
-    // even if they contain JSON, because they need to be passed back to the native module as-is
+    // Only transform if it's a plain object (not array, not primitive)
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      let needsTransform = false;
+      // Quick check: does any non-kept value look like JSON?
+      for (const [key, value] of Object.entries(parsed)) {
+        if (!KEEP_AS_STRING_FIELDS.has(key) && typeof value === 'string' && value.length > 0 && (value.charCodeAt(0) === 123 || value.charCodeAt(0) === 91)) {
+          needsTransform = true;
+          break;
+        }
+      }
+
+      if (!needsTransform) return parsed as T;
+
       const transformed: Record<string, unknown> = {};
       for (const [key, value] of Object.entries(parsed)) {
-        // Skip auto-parsing fields that should remain as strings
         if (KEEP_AS_STRING_FIELDS.has(key)) {
           transformed[key] = value;
-        } else if (typeof value === 'string' && (value.startsWith('{') || value.startsWith('['))) {
+        } else if (typeof value === 'string' && value.length > 0 && (value.charCodeAt(0) === 123 || value.charCodeAt(0) === 91)) {
           try {
             transformed[key] = JSON.parse(value);
           } catch {
@@ -75,20 +97,12 @@ function parseNativeResult<T>(result: string): T {
 
     return parsed as T;
   } catch {
-    // The native module sometimes returns malformed JSON where inner JSON objects
-    // are not properly escaped. Try to fix the format.
-    // Pattern: {"key":"{...}","key2":"{...}"}
-    // The inner {..} are valid JSON but not escaped as strings
-
-    // Try to extract key-value pairs manually
     const extractedResult = tryExtractNestedJson(result);
     if (extractedResult !== null) {
       return extractedResult as T;
     }
 
-    // If it's not JSON, it might be a quoted string or error
     if (result.startsWith('"') && result.endsWith('"')) {
-      // Remove quotes from string results
       return result.slice(1, -1) as unknown as T;
     }
     throw new Error(`Failed to parse native result: ${result}`);
@@ -216,49 +230,97 @@ function parseDoubleRatchetResult(result: string): DoubleRatchetStateAndEnvelope
 }
 
 /**
- * Parse double ratchet decrypt results, keeping ratchet_state as string
+ * Result type for double ratchet decrypt that can indicate failure without throwing
  */
-function parseDoubleRatchetDecryptResult(result: string): DoubleRatchetStateAndMessage {
+type DecryptResult =
+  | { success: true; data: DoubleRatchetStateAndMessage }
+  | { success: false; error: string };
+
+/**
+ * Parse double ratchet decrypt results, keeping ratchet_state as string
+ * Returns a result object instead of throwing to avoid React Native error logging
+ */
+function parseDoubleRatchetDecryptResult(result: string): DecryptResult {
   if (!result.startsWith('{') || !result.endsWith('}')) {
-    throw new Error(`Invalid double ratchet decrypt result format: ${result.substring(0, 100)}`);
+    return { success: false, error: `Invalid double ratchet decrypt result format: ${result.substring(0, 100)}` };
   }
 
-  // The native module now returns properly escaped JSON, so we can use JSON.parse directly
   try {
-    const parsed = JSON.parse(result) as { ratchet_state: string; message: number[] };
+    // The native module now emits `message` as a base64 string instead
+    // of a JSON int array. For a 1MB plaintext this avoids JSON.parse
+    // building a million boxed Numbers + a separate Uint8Array — both
+    // were heavy on the JS heap during decrypt batches.
+    const parsed = JSON.parse(result) as {
+      ratchet_state: string;
+      message: string | number[];
+    };
 
     if (typeof parsed.ratchet_state !== 'string') {
-      throw new Error('ratchet_state is not a string');
-    }
-    if (!Array.isArray(parsed.message)) {
-      throw new Error('message is not an array');
+      return { success: false, error: 'ratchet_state is not a string' };
     }
 
-    // Check if the message is actually an error from the Rust layer
-    // The Rust code returns errors as the message content (byte array)
-    if (parsed.message.length > 0) {
-      const messageStr = new TextDecoder().decode(new Uint8Array(parsed.message));
+    let messageBytes: number[];
+    if (typeof parsed.message === 'string') {
+      // Base64-decode to a Uint8Array, then convert to number[] which is
+      // the public DoubleRatchetStateAndMessage shape callers expect.
+      const decoded = base64ToBytes(parsed.message);
+      messageBytes = Array.from(decoded);
+    } else if (Array.isArray(parsed.message)) {
+      messageBytes = parsed.message;
+    } else {
+      return { success: false, error: 'message is neither string nor array' };
+    }
+
+    // Check if the message is actually an error from the Rust layer.
+    // The Rust code can return errors as the message content (byte array).
+    if (messageBytes.length > 0) {
+      const messageStr = new TextDecoder().decode(new Uint8Array(messageBytes));
       if (messageStr.startsWith('Decryption failed:') ||
           messageStr.startsWith('invalid') ||
           messageStr.includes('aead::Error')) {
-        throw new Error(`Double ratchet decryption error: ${messageStr}`);
+        return { success: false, error: `Double ratchet decryption error: ${messageStr}` };
       }
     }
 
     return {
-      ratchet_state: parsed.ratchet_state,
-      message: parsed.message,
+      success: true,
+      data: {
+        ratchet_state: parsed.ratchet_state,
+        message: messageBytes,
+      },
     };
   } catch (e) {
-    throw new Error(`Failed to parse double ratchet decrypt result: ${e instanceof Error ? e.message : String(e)}`);
+    return { success: false, error: `Failed to parse double ratchet decrypt result: ${e instanceof Error ? e.message : String(e)}` };
   }
+}
+
+/** Base64 → Uint8Array. Uses the global atob (available on RN's Hermes
+ *  via the `react-native-quick-base64` polyfill registered at app init)
+ *  with a fallback that hand-rolls the decode if atob isn't present. */
+function base64ToBytes(b64: string): Uint8Array {
+  // atob is available in Hermes and most JS runtimes.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const atobFn = (globalThis as any).atob as ((s: string) => string) | undefined;
+  if (atobFn) {
+    const bin = atobFn(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  // Buffer fallback — present in the Node-style polyfills RN ships.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const BufferImpl = (globalThis as any).Buffer;
+  if (BufferImpl) {
+    return new Uint8Array(BufferImpl.from(b64, 'base64'));
+  }
+  throw new Error('No base64 decoder available in this JS runtime');
 }
 
 /**
  * NativeCryptoProvider - Implements CryptoProvider using QuorumCrypto native module
  */
 export class NativeCryptoProvider implements CryptoProvider {
-  // ============ Key Generation ============
+  // Key Generation
 
   async generateX448(): Promise<X448Keypair> {
     const result = await QuorumCrypto.generateX448();
@@ -330,7 +392,7 @@ export class NativeCryptoProvider implements CryptoProvider {
     }
   }
 
-  // ============ X3DH Key Agreement ============
+  // X3DH Key Agreement
 
   async senderX3DH(params: SenderX3DHParams): Promise<string> {
     const input = JSON.stringify({
@@ -362,7 +424,7 @@ export class NativeCryptoProvider implements CryptoProvider {
     return result;
   }
 
-  // ============ Double Ratchet ============
+  // Double Ratchet
 
   async newDoubleRatchet(params: NewDoubleRatchetParams): Promise<string> {
     const input = JSON.stringify({
@@ -374,7 +436,6 @@ export class NativeCryptoProvider implements CryptoProvider {
       receiving_ephemeral_key: params.receiving_ephemeral_key,
     });
     const result = await QuorumCrypto.newDoubleRatchet(input);
-    logger.log('[Native] newDoubleRatchet raw result (first 200):', result.substring(0, 200));
     if (result.startsWith('invalid') || result.includes('error')) {
       throw new Error(result);
     }
@@ -387,21 +448,13 @@ export class NativeCryptoProvider implements CryptoProvider {
     // The native module expects ratchet_state to be a STRING (JSON-encoded)
     // When we JSON.stringify the whole input, the ratchet_state gets double-encoded
     // This is the expected format based on desktop SDK behavior
-    logger.log('[Native] doubleRatchetEncrypt ratchet_state type:', typeof stateAndMessage.ratchet_state);
-    logger.log('[Native] doubleRatchetEncrypt ratchet_state preview:',
-      typeof stateAndMessage.ratchet_state === 'string'
-        ? stateAndMessage.ratchet_state.substring(0, 100)
-        : 'NOT A STRING');
     const input = JSON.stringify({
       ratchet_state: stateAndMessage.ratchet_state,
       message: stateAndMessage.message,
     });
-    logger.log('[Native] doubleRatchetEncrypt input (first 200):', input.substring(0, 200));
     const result = await QuorumCrypto.doubleRatchetEncrypt(input);
-    logger.log('[Native] doubleRatchetEncrypt raw result (first 200):', result.substring(0, 200));
     // Use special parsing that keeps ratchet_state and envelope as strings
     const parsed = parseDoubleRatchetResult(result);
-    logger.log('[Native] doubleRatchetEncrypt parsed ratchet_state (first 100):', parsed.ratchet_state.substring(0, 100));
     return parsed;
   }
 
@@ -411,23 +464,27 @@ export class NativeCryptoProvider implements CryptoProvider {
     // The native module expects ratchet_state to be a STRING (JSON-encoded)
     // When we JSON.stringify the whole input, the ratchet_state gets double-encoded
     // This is the expected format based on desktop SDK behavior
-    logger.log('[Native] doubleRatchetDecrypt input state preview (100):', stateAndEnvelope.ratchet_state?.substring(0, 100));
-    logger.log('[Native] doubleRatchetDecrypt input envelope preview (100):', stateAndEnvelope.envelope?.substring(0, 100));
     const input = JSON.stringify({
       ratchet_state: stateAndEnvelope.ratchet_state,
       envelope: stateAndEnvelope.envelope,
     });
-    logger.log('[Native] doubleRatchetDecrypt stringified input (200):', input.substring(0, 200));
     const result = await QuorumCrypto.doubleRatchetDecrypt(input);
-    logger.log('[Native] doubleRatchetDecrypt raw result (300):', result.substring(0, 300));
     // Use special parsing that keeps ratchet_state as string
+    // Returns a result object to avoid throwing errors for expected failures
     const parsed = parseDoubleRatchetDecryptResult(result);
-    logger.log('[Native] doubleRatchetDecrypt parsed message length:', parsed.message?.length);
-    logger.log('[Native] doubleRatchetDecrypt parsed message bytes (first 20):', parsed.message?.slice(0, 20));
-    return parsed;
+    if (!parsed.success) {
+      // Return a special result that indicates decryption failure
+      // Callers should check for this instead of catching exceptions
+      return {
+        ratchet_state: stateAndEnvelope.ratchet_state, // Return original state unchanged
+        message: [], // Empty message indicates failure
+        decryptionError: parsed.error, // Include error message for logging
+      } as DoubleRatchetStateAndMessage & { decryptionError?: string };
+    }
+    return parsed.data;
   }
 
-  // ============ Triple Ratchet ============
+  // Triple Ratchet
 
   async newTripleRatchet(params: NewTripleRatchetParams): Promise<TripleRatchetStateAndMetadata> {
     const input = JSON.stringify({
@@ -493,17 +550,27 @@ export class NativeCryptoProvider implements CryptoProvider {
       envelope: stateAndEnvelope.envelope,
     });
     const result = await QuorumCrypto.tripleRatchetDecrypt(input);
-    return parseNativeResult<TripleRatchetStateAndMessage>(result);
+    // Native side now emits `message` as a base64 string (same shape
+    // as doubleRatchetDecrypt). Decode here so callers continue to
+    // see `number[]`.
+    const parsed = JSON.parse(result) as {
+      ratchet_state: string;
+      message: string | number[];
+    };
+    const messageBytes: number[] =
+      typeof parsed.message === 'string'
+        ? Array.from(base64ToBytes(parsed.message))
+        : (parsed.message as number[]);
+    return {
+      ratchet_state: parsed.ratchet_state,
+      message: messageBytes,
+    } as TripleRatchetStateAndMessage;
   }
 
   async tripleRatchetResize(
-    state: TripleRatchetStateAndMetadata
+    _state: TripleRatchetStateAndMetadata
   ): Promise<TripleRatchetStateAndMetadata> {
-    // Note: This requires the full resize request format
-    // For now, just pass through - will need to be updated based on actual usage
-    const input = JSON.stringify(state);
-    // TODO: Implement when triple ratchet resize is needed
-    throw new Error('tripleRatchetResize not yet implemented');
+    throw new Error('tripleRatchetResize not yet implemented; use tripleRatchetResizeForInvites');
   }
 
   /**
@@ -528,10 +595,25 @@ export class NativeCryptoProvider implements CryptoProvider {
       total: total,
     });
     const result = await QuorumCrypto.tripleRatchetResize(input);
-    return parseNativeResult<number[][]>(result);
+    // Native side returns a JSON array of base64-encoded byte arrays
+    // (one per eval). Decode each to number[] to preserve the public
+    // signature.
+    const parsed = JSON.parse(result) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return (parsed as unknown[]).map((entry) => {
+      if (typeof entry === 'string') {
+        return Array.from(base64ToBytes(entry));
+      }
+      if (Array.isArray(entry)) {
+        // Legacy int-array shape — kept just in case older native code
+        // is in the build during a transition.
+        return entry as number[];
+      }
+      return [];
+    });
   }
 
-  // ============ Inbox Message Encryption ============
+  // Inbox Message Encryption
 
   async encryptInboxMessage(request: InboxMessageEncryptRequest): Promise<string> {
     const input = JSON.stringify({
@@ -540,7 +622,6 @@ export class NativeCryptoProvider implements CryptoProvider {
       plaintext: request.plaintext,
     });
     const result = await QuorumCrypto.encryptInboxMessage(input);
-    logger.log('[Native] encryptInboxMessage result (first 200):', result.substring(0, 200));
     if (result.startsWith('invalid') || result.includes('error')) {
       throw new Error(result);
     }
@@ -554,10 +635,29 @@ export class NativeCryptoProvider implements CryptoProvider {
       ciphertext: request.ciphertext,
     });
     const result = await QuorumCrypto.decryptInboxMessage(input);
-    return parseNativeResult<number[]>(result);
+    // Rust returns base64 on success, a plain-text error string
+    // otherwise. Error prefixes include both lowercase ("invalid
+    // ephemeral key length") and capitalized ("Invalid ciphertext:
+    // ...", "Decryption failed: ...") variants. Case-insensitive
+    // match catches both without falsely treating success base64 as
+    // an error.
+    if (result.length < 200) {
+      const lower = result.toLowerCase();
+      if (
+        lower.startsWith('invalid') ||
+        lower.startsWith('error') ||
+        lower.startsWith('decryption failed') ||
+        lower.startsWith('encryption failed') ||
+        lower.includes('failed') ||
+        lower.includes(' error')
+      ) {
+        throw new Error(result);
+      }
+    }
+    return Array.from(base64ToBytes(result));
   }
 
-  // ============ Inbox Envelope Sealing ============
+  // Inbox Envelope Sealing
 
   /**
    * Seal an inbox envelope for a specific recipient
@@ -627,7 +727,7 @@ export class NativeCryptoProvider implements CryptoProvider {
     return new TextDecoder().decode(new Uint8Array(decryptedBytes));
   }
 
-  // ============ Hub Envelope Sealing ============
+  // Hub Envelope Sealing
 
   /**
    * Seal a message for hub delivery
@@ -720,24 +820,12 @@ export class NativeCryptoProvider implements CryptoProvider {
     message: string,
     configPublicKey?: number[]
   ): Promise<SyncSealedMessage> {
-    logger.log('[sealSyncEnvelope] === START ===');
-    logger.log('[sealSyncEnvelope] inboxAddress:', inboxAddress.substring(0, 12));
-    logger.log('[sealSyncEnvelope] hubAddress:', hubAddress.substring(0, 12));
-    logger.log('[sealSyncEnvelope] hubKeypair.publicKey length:', hubKeypair.publicKey.length);
-    logger.log('[sealSyncEnvelope] hubKeypair.privateKey length:', hubKeypair.privateKey.length);
-    logger.log('[sealSyncEnvelope] ownerKeypair.publicKey length:', ownerKeypair.publicKey.length);
-    logger.log('[sealSyncEnvelope] message length:', message.length);
-    logger.log('[sealSyncEnvelope] configPublicKey provided:', !!configPublicKey, 'length:', configPublicKey?.length);
-
     // Use config key if provided, otherwise fall back to hub-derived key (legacy)
     let x448PublicKey: number[];
     if (configPublicKey) {
       x448PublicKey = configPublicKey;
-      const configPubHex = configPublicKey.slice(0, 16).map(b => b.toString(16).padStart(2, '0')).join('');
-      logger.log('[sealSyncEnvelope] Using config key, HEX prefix:', configPubHex);
     } else {
       // Legacy: Derive X448 public key from hub Ed448 private key via SHA-512
-      logger.log('[sealSyncEnvelope] WARNING: No config key provided, using hub-derived key (legacy)');
       const hubPrivateKeyBytes = new Uint8Array(hubKeypair.privateKey);
       const sha512Hash = this.sha512(hubPrivateKeyBytes);
       const x448PrivateKeyBytes = sha512Hash.slice(0, 56);
@@ -747,34 +835,18 @@ export class NativeCryptoProvider implements CryptoProvider {
       const x448PublicKeyBase64Result = await QuorumCrypto.getPublicKeyX448(x448PrivateKeyBase64);
       const x448PublicKeyBase64 = parseNativeResult<string>(x448PublicKeyBase64Result);
       x448PublicKey = base64ToArray(x448PublicKeyBase64);
-      const x448PubHex = x448PublicKey.slice(0, 16).map(b => b.toString(16).padStart(2, '0')).join('');
-      logger.log('[sealSyncEnvelope] Legacy: derived x448PublicKey HEX prefix:', x448PubHex);
     }
-    logger.log('[sealSyncEnvelope] x448PublicKey length:', x448PublicKey.length);
 
     // 2. Generate ephemeral X448 keypair
     const ephemeralKeypair = await this.generateX448();
-    logger.log('[sealSyncEnvelope] ephemeral public key length:', ephemeralKeypair.public_key.length);
 
     // 3. Encrypt message using inbox encryption
     const messageBytes = new TextEncoder().encode(message);
-    logger.log('[sealSyncEnvelope] messageBytes length:', messageBytes.length);
     const encryptedEnvelope = await this.encryptInboxMessage({
       inbox_public_key: x448PublicKey,
       ephemeral_private_key: ephemeralKeypair.private_key,
       plaintext: Array.from(messageBytes),
     });
-    logger.log('[sealSyncEnvelope] encryptedEnvelope length:', encryptedEnvelope.length);
-    logger.log('[sealSyncEnvelope] encryptedEnvelope FULL:', encryptedEnvelope);
-    // Parse to check structure
-    try {
-      const parsed = JSON.parse(encryptedEnvelope);
-      logger.log('[sealSyncEnvelope] envelope keys:', Object.keys(parsed).join(','));
-      logger.log('[sealSyncEnvelope] has initialization_vector:', 'initialization_vector' in parsed);
-      logger.log('[sealSyncEnvelope] has associated_data:', 'associated_data' in parsed);
-    } catch (e) {
-      logger.log('[sealSyncEnvelope] FAILED to parse envelope:', e);
-    }
 
     // 4. Sign the encrypted envelope with owner Ed448 key
     // The envelope is a JSON string - encode as UTF-8 bytes then to base64 (matches desktop)
@@ -783,10 +855,9 @@ export class NativeCryptoProvider implements CryptoProvider {
     const envelopeBase64 = arrayToBase64(Array.from(envelopeBytes));
     const signatureBase64 = await this.signEd448(ownerPrivateKeyBase64, envelopeBase64);
     const signatureHex = base64ToHex(signatureBase64);
-    logger.log('[sealSyncEnvelope] signatureHex length:', signatureHex.length);
 
     // 5. Build and return SyncSealedMessage
-    const result = {
+    return {
       inbox_address: inboxAddress,
       hub_address: hubAddress,
       owner_public_key: arrayToHex(ownerKeypair.publicKey),
@@ -794,16 +865,9 @@ export class NativeCryptoProvider implements CryptoProvider {
       envelope: encryptedEnvelope,
       owner_signature: signatureHex,
     };
-    logger.log('[sealSyncEnvelope] === END === result keys:', Object.keys(result).join(','));
-    logger.log('[sealSyncEnvelope] ephemeral_public_key (first 32 hex):', result.ephemeral_public_key.substring(0, 32));
-    logger.log('[sealSyncEnvelope] owner_public_key (first 32 hex):', result.owner_public_key.substring(0, 32));
-    logger.log('[sealSyncEnvelope] FULL hubAddress:', hubAddress);
-    logger.log('[sealSyncEnvelope] FULL envelope (first 200):', encryptedEnvelope.substring(0, 200));
-
-    return result;
   }
 
-  // ============ Hub Envelope Unsealing ============
+  // Hub Envelope Unsealing
 
   /**
    * Unseal a hub message received from WebSocket
@@ -829,19 +893,15 @@ export class NativeCryptoProvider implements CryptoProvider {
     if (configPrivateKey) {
       // Use config key directly for decryption
       x448PrivateKey = configPrivateKey;
-      logger.log('[Native] unsealHubEnvelope using config key, length:', configPrivateKey.length, 'first 8 bytes:', configPrivateKey.slice(0, 8));
     } else {
       // Legacy: Derive X448 private key from Ed448 private key via SHA-512
       const privateKeyBytes = new Uint8Array(hubPrivateKey);
       const sha512Hash = this.sha512(privateKeyBytes);
       x448PrivateKey = Array.from(sha512Hash.slice(0, 56));
-      logger.log('[Native] unsealHubEnvelope using derived key, length:', x448PrivateKey.length, 'first 8 bytes:', x448PrivateKey.slice(0, 8));
     }
 
     // 2. Parse ephemeral public key from hex
-    logger.log('[Native] unsealHubEnvelope ephemeral hex length:', ephemeralPublicKeyHex.length, 'hex prefix:', ephemeralPublicKeyHex.substring(0, 16));
     const ephemeralPublicKey = hexToArray(ephemeralPublicKeyHex);
-    logger.log('[Native] unsealHubEnvelope ephemeral key length:', ephemeralPublicKey.length);
 
     // 3. Parse encrypted envelope
     const ciphertext = JSON.parse(encryptedEnvelope) as {
@@ -849,10 +909,8 @@ export class NativeCryptoProvider implements CryptoProvider {
       initialization_vector: string;
       associated_data?: string;
     };
-    logger.log('[Native] unsealHubEnvelope ciphertext keys:', Object.keys(ciphertext));
 
     // 4. Decrypt using inbox decryption
-    logger.log('[Native] unsealHubEnvelope calling decryptInboxMessage with key length:', x448PrivateKey.length);
     const decryptedBytes = await this.decryptInboxMessage({
       inbox_private_key: x448PrivateKey,
       ephemeral_public_key: ephemeralPublicKey,
@@ -863,7 +921,7 @@ export class NativeCryptoProvider implements CryptoProvider {
     return new TextDecoder().decode(new Uint8Array(decryptedBytes));
   }
 
-  // ============ Sync Envelope Unsealing ============
+  // Sync Envelope Unsealing
 
   /**
    * Unseal a sync envelope received from WebSocket
@@ -885,21 +943,12 @@ export class NativeCryptoProvider implements CryptoProvider {
     syncEnvelope: SyncSealedMessage,
     configPrivateKey?: number[]
   ): Promise<string> {
-    logger.log('[unsealSyncEnvelope] === START ===');
-    logger.log('[unsealSyncEnvelope] inbox_address:', syncEnvelope.inbox_address?.substring(0, 12));
-    logger.log('[unsealSyncEnvelope] hub_address:', syncEnvelope.hub_address?.substring(0, 12));
-    logger.log('[unsealSyncEnvelope] ephemeral_public_key length:', syncEnvelope.ephemeral_public_key?.length);
-    logger.log('[unsealSyncEnvelope] envelope length:', syncEnvelope.envelope?.length);
-    logger.log('[unsealSyncEnvelope] configPrivateKey provided:', !!configPrivateKey, 'length:', configPrivateKey?.length);
-
     // 1. Use config key if provided, otherwise derive X448 private key from Ed448 private key via SHA-512
     let x448PrivateKey: number[];
     if (configPrivateKey) {
       x448PrivateKey = configPrivateKey;
-      logger.log('[unsealSyncEnvelope] Using config private key for decryption');
     } else {
       // Legacy: Derive X448 private key from Ed448 private key via SHA-512
-      logger.log('[unsealSyncEnvelope] WARNING: No config key provided, using hub-derived key (legacy)');
       const privateKeyBytes = new Uint8Array(hubPrivateKey);
       const sha512Hash = this.sha512(privateKeyBytes);
       x448PrivateKey = Array.from(sha512Hash.slice(0, 56));
@@ -923,11 +972,344 @@ export class NativeCryptoProvider implements CryptoProvider {
     });
 
     // 5. Convert to string
-    const result = new TextDecoder().decode(new Uint8Array(decryptedBytes));
-    logger.log('[unsealSyncEnvelope] === END === decrypted length:', result.length);
-    logger.log('[unsealSyncEnvelope] decrypted preview:', result.substring(0, 100));
-    return result;
+    return new TextDecoder().decode(new Uint8Array(decryptedBytes));
   }
+
+  // Batch Operations
+
+  /**
+   * Batch unseal multiple hub/sync envelopes in a single native call.
+   * This eliminates N JS-native bridge crossings for N messages.
+   *
+   * Key derivation (SHA-512 of hub key → X448, or use config key) is done
+   * once natively for the entire batch.
+   *
+   * @param hubPrivateKey - Ed448 private key bytes for the hub
+   * @param messages - Array of {ephemeral_public_key (hex), envelope (JSON ciphertext string)}
+   * @param configPrivateKey - Optional X448 config private key (preferred over hub-derived)
+   * @returns Array of results, each either {plaintext} or {error}
+   */
+  async batchUnsealEnvelopes(
+    hubPrivateKey: number[],
+    messages: { ephemeral_public_key: string; envelope: string }[],
+    configPrivateKey?: number[]
+  ): Promise<({ plaintext: string } | { error: string })[]> {
+    if (messages.length === 0) return [];
+
+    const input = JSON.stringify({
+      hub_private_key: hubPrivateKey,
+      config_private_key: configPrivateKey ?? null,
+      messages: messages.map(m => ({
+        ephemeral_public_key: m.ephemeral_public_key,
+        envelope: m.envelope,
+      })),
+    });
+
+    const result = await QuorumCrypto.batchUnsealEnvelopes(input);
+    const parsed = JSON.parse(result) as {
+      results: ({ plaintext: string } | { error: string })[];
+    };
+    return parsed.results;
+  }
+
+  // Batch Process Messages
+
+  /**
+   * Process an entire batch of messages in a single native call.
+   * Handles unseal + TR/DR decrypt for all messages.
+   * 1 bridge crossing per batch regardless of batch size.
+   */
+  async batchProcessMessages(input: BatchProcessInput): Promise<BatchProcessOutput> {
+    // Chunk inputs > 1.5MB across native calls. Android's org.json eagerly
+    // tokenizes the entire tree into boxed primitives and OOMs the JVM
+    // heap on large reconnect-catchup batches. Two-level split:
+    // inter-group (each group is independent), and intra-group (slice a
+    // single busy group's messages, re-reading TR state from MMKV between
+    // chunks since Rust persists it before each native call resolves).
+    const MAX_BATCH_JSON_BYTES = 1_500_000;
+    const fullInputStr = JSON.stringify(input);
+
+    if (fullInputStr.length <= MAX_BATCH_JSON_BYTES) {
+      return await this._callBatchProcessMessages(fullInputStr);
+    }
+
+    const merged: BatchProcessOutput = {
+      space_results: [],
+      dm_results: [],
+    };
+    let anyTruncated = false;
+
+    const callSub = async (sub: BatchProcessInput) => {
+      const subStr = JSON.stringify(sub);
+      const subOut = await this._callBatchProcessMessages(subStr);
+      merged.space_results.push(...subOut.space_results);
+      merged.dm_results.push(...subOut.dm_results);
+      if (subOut.truncated) anyTruncated = true;
+    };
+
+    for (const sg of input.space_groups) {
+      const sgStr = JSON.stringify({
+        user_address: input.user_address,
+        space_groups: [sg],
+        dm_groups: [],
+      });
+      if (sgStr.length <= MAX_BATCH_JSON_BYTES) {
+        await callSub({
+          user_address: input.user_address,
+          space_groups: [sg],
+          dm_groups: [],
+        });
+        continue;
+      }
+
+      const sliceOutput = await this._processSpaceGroupInSlices(input.user_address, sg);
+      merged.space_results.push(...sliceOutput.space_results);
+      if (sliceOutput.truncated) anyTruncated = true;
+    }
+
+    // DM groups don't share state across groups, so pack 5 per call —
+    // stays well under the parse threshold even with init envelopes.
+    const DM_CHUNK_SIZE = 5;
+    for (let i = 0; i < input.dm_groups.length; i += DM_CHUNK_SIZE) {
+      await callSub({
+        user_address: input.user_address,
+        space_groups: [],
+        dm_groups: input.dm_groups.slice(i, i + DM_CHUNK_SIZE),
+      });
+    }
+
+    if (anyTruncated) merged.truncated = true;
+    return merged;
+  }
+
+  /**
+   * Slice a single space group's messages, refreshing the TR state
+   * from MMKV between chunks so each chunk starts from the correct
+   * ratchet position. A single oversized message falls through as a
+   * chunk-of-one and may surface `truncated`.
+   */
+  private async _processSpaceGroupInSlices(
+    userAddress: string,
+    group: BatchSpaceGroup,
+  ): Promise<{ space_results: BatchSpaceGroupResult[]; truncated: boolean }> {
+    // TR state dominates memory; envelopes are small. 25 per chunk
+    // stays under the parse threshold for typical TR-state sizes.
+    const MESSAGES_PER_SLICE = 25;
+
+    // Lazy import to keep the door open for storage to depend on us.
+    const { encryptionStateStorage } = await import('./encryption-state-storage');
+
+    let currentState = group.tr_state;
+    let currentFallback = group.tr_fallback_state;
+    let currentIsNested = group.tr_state_is_nested;
+
+    const allMessages: BatchSpaceMessageResult[] = [];
+    let anyTruncated = false;
+
+    for (let i = 0; i < group.messages.length; i += MESSAGES_PER_SLICE) {
+      const slice = group.messages.slice(i, i + MESSAGES_PER_SLICE);
+      const subGroup: BatchSpaceGroup = {
+        ...group,
+        tr_state: currentState,
+        tr_fallback_state: currentFallback,
+        tr_state_is_nested: currentIsNested,
+        messages: slice,
+      };
+      const subOut = await this._callBatchProcessMessages(JSON.stringify({
+        user_address: userAddress,
+        space_groups: [subGroup],
+        dm_groups: [],
+      }));
+      const subSpaceResult = subOut.space_results[0];
+      if (subSpaceResult) {
+        allMessages.push(...subSpaceResult.messages);
+      }
+      if (subOut.truncated) anyTruncated = true;
+
+      const isLastSlice = i + MESSAGES_PER_SLICE >= group.messages.length;
+      if (!isLastSlice) {
+        const fresh = this._readFreshTRState(encryptionStateStorage, group.space_id);
+        if (fresh) {
+          currentState = fresh.state;
+          currentFallback = fresh.fallbackState;
+          currentIsNested = fresh.isNested;
+        }
+      }
+    }
+
+    return {
+      space_results: [{
+        space_id: group.space_id,
+        messages: allMessages,
+      }],
+      truncated: anyTruncated,
+    };
+  }
+
+  /**
+   * Re-read a space's TR state from MMKV. Mirrors the gathering
+   * logic in WebSocketContext.preclassifyAndGatherState — same
+   * convention of using the first encryption state and unwrapping
+   * the nested {state, template, evals} envelope when present.
+   */
+  private _readFreshTRState(
+    encryptionStateStorage: typeof import('./encryption-state-storage').encryptionStateStorage,
+    spaceId: string,
+  ): { state: string; fallbackState: string | null; isNested: boolean } | null {
+    const spaceConversationId = `${spaceId}/${spaceId}`;
+    const states = encryptionStateStorage.getEncryptionStates(spaceConversationId);
+    if (states.length === 0) return null;
+    const first = states[0];
+
+    let state = first.state;
+    let isNested = false;
+    try {
+      const parsed = JSON.parse(state);
+      if (parsed && typeof parsed === 'object' && typeof parsed.state === 'string') {
+        state = parsed.state;
+        isNested = true;
+      }
+    } catch {
+      // Not JSON-parseable; treat as flat state string.
+    }
+
+    let fallbackState: string | null = null;
+    const fb = encryptionStateStorage.getFallbackState(spaceConversationId, first.inboxId);
+    if (fb) {
+      let fbState = fb.state;
+      try {
+        const parsed = JSON.parse(fbState);
+        if (parsed && typeof parsed === 'object' && typeof parsed.state === 'string') {
+          fbState = parsed.state;
+        }
+      } catch { /* */ }
+      fallbackState = fbState;
+    }
+
+    return { state, fallbackState, isNested };
+  }
+
+  private async _callBatchProcessMessages(inputStr: string): Promise<BatchProcessOutput> {
+    const result = await QuorumCrypto.batchProcessMessages(inputStr);
+    const parsed = JSON.parse(result) as BatchProcessOutput;
+    if (parsed.truncated) {
+      // Native side hit its output-size cap and one or more messages
+      // came back with empty decrypted content. Log loudly until the
+      // caller wires per-message refetch; this is the structural seam
+      // where OOM-prevention meets "I might be missing message bodies".
+      logger.warn(
+        '[batchProcessMessages] native side returned truncated:true — some messages have empty decrypted_message. Refetch needed.',
+      );
+    }
+    return parsed;
+  }
+}
+
+// Batch Process Types
+
+/** A space message to be processed natively */
+export interface BatchSpaceMessage {
+  inbox_address: string;
+  timestamp: number;
+  envelope_type: 'hub' | 'sync';
+  ephemeral_public_key: string; // hex
+  envelope: string; // JSON ciphertext
+}
+
+/** A space group: all messages for a single spaceId */
+export interface BatchSpaceGroup {
+  space_id: string;
+  hub_private_key: number[];
+  config_private_key: number[] | null;
+  tr_state: string;           // Current TR ratchet state (JSON string)
+  tr_fallback_state: string | null; // Frozen fallback state
+  tr_state_is_nested: boolean; // Whether state was wrapped in {state:...,template:...,evals:...}
+  sent_envelope_fingerprints: string[]; // First 100 chars of sent TR envelopes for self-echo detection
+  messages: BatchSpaceMessage[];
+}
+
+/** Result for a single space message */
+export interface BatchSpaceMessageResult {
+  status: 'decrypted' | 'control' | 'self_echo' | 'unseal_failed' | 'decrypt_failed' | 'plaintext';
+  decrypted_message?: string;  // JSON string of the decrypted Message
+  control_payload?: string;    // JSON string of control payload
+  used_fallback?: boolean;
+  timestamp: number;
+}
+
+/** Result for a space group (native writes TR state to MMKV directly) */
+export interface BatchSpaceGroupResult {
+  space_id: string;
+  messages: BatchSpaceMessageResult[];
+}
+
+/** A DM message to be processed natively */
+export interface BatchDMMessage {
+  inbox_address: string;
+  timestamp: number;
+  encrypted_content: string;    // Raw SealedMessage JSON
+  is_double_ratchet_envelope: boolean;
+  is_init_envelope: boolean;
+}
+
+/** DR state entry for trial decryption */
+export interface BatchDRState {
+  conversation_id: string;
+  inbox_id: string;
+  state: string; // DR ratchet state JSON string
+}
+
+/** A DM group: messages for a conversation + inbox type */
+export interface BatchDMGroup {
+  conversation_id: string;
+  message_type: 'device_inbox' | 'conversation_inbox';
+  device_inbox_private_key: number[] | null;
+  device_inbox_encryption_private_key: number[] | null; // For unsealing init envelopes
+  conversation_inbox_private_key: number[] | null;
+  conversation_inbox_signing_private_key: number[] | null;
+  identity_private_key: number[];
+  pre_key_private_key: number[];
+  dr_states: BatchDRState[];
+  messages: BatchDMMessage[];
+}
+
+/** Input for batchProcessMessages native call */
+export interface BatchProcessInput {
+  user_address: string;
+  space_groups: BatchSpaceGroup[];
+  dm_groups: BatchDMGroup[];
+}
+
+/** Result for a single DM message */
+export interface BatchDMMessageResult {
+  status: 'decrypted' | 'init_decrypted' | 'decrypt_failed' | 'no_state' | 'unseal_failed';
+  decrypted_message?: string;  // JSON string of the decrypted Message
+  used_state_inbox_id?: string;
+  user_profile?: { display_name?: string; user_icon?: string };
+  return_inbox?: { inbox_address: string; inbox_encryption_key: string; inbox_public_key?: string };
+  conversation_id?: string; // For init messages: the resolved conversation ID
+  timestamp?: number; // Original message timestamp for inbox deletion matching
+}
+
+/** Result for a DM group (native writes DR states + session to MMKV directly) */
+export interface BatchDMGroupResult {
+  conversation_id: string;
+  new_conversation_inbox?: string; // Address for WS subscription (init messages)
+  messages: BatchDMMessageResult[];
+}
+
+/** Output of batchProcessMessages native call */
+export interface BatchProcessOutput {
+  space_results: BatchSpaceGroupResult[];
+  dm_results: BatchDMGroupResult[];
+  /**
+   * Set when the batch hit the native-side output-size cap and dropped
+   * one or more `decrypted_message` field contents. The metadata for
+   * those messages (status, timestamp, conversation_id) is still
+   * present — callers should refetch the affected messages
+   * individually via `decryptInboxMessage` / DR / TR paths.
+   */
+  truncated?: boolean;
 }
 
 /**
@@ -962,47 +1344,12 @@ export interface SyncSealedMessage {
   owner_signature: string;
 }
 
-/**
- * Convert array to base64 string
- */
-function arrayToBase64(arr: number[]): string {
-  const uint8 = new Uint8Array(arr);
-  let binary = '';
-  for (let i = 0; i < uint8.length; i++) {
-    binary += String.fromCharCode(uint8[i]);
-  }
-  return btoa(binary);
-}
-
-/**
- * Convert base64 string to number array
- */
-function base64ToArray(base64: string): number[] {
-  const binary = atob(base64);
-  const arr: number[] = [];
-  for (let i = 0; i < binary.length; i++) {
-    arr.push(binary.charCodeAt(i));
-  }
-  return arr;
-}
 
 /**
  * Convert number array to hex string
  */
 function arrayToHex(arr: number[]): string {
   return arr.map(b => b.toString(16).padStart(2, '0')).join('');
-}
-
-/**
- * Convert base64 string to hex string
- */
-function base64ToHex(base64: string): string {
-  const binary = atob(base64);
-  let hex = '';
-  for (let i = 0; i < binary.length; i++) {
-    hex += binary.charCodeAt(i).toString(16).padStart(2, '0');
-  }
-  return hex;
 }
 
 /**

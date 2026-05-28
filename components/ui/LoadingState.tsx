@@ -6,7 +6,7 @@ import {
   View,
   ViewStyle,
 } from 'react-native';
-import { useTheme } from '@/theme';
+import { useTheme, type AppTheme } from '@/theme';
 
 type LoadingSize = 'sm' | 'md' | 'lg';
 
@@ -59,7 +59,7 @@ export function LoadingState({
   );
 }
 
-const createStyles = (theme: any, size: LoadingSize) =>
+const createStyles = (theme: AppTheme, size: LoadingSize) =>
   StyleSheet.create({
     container: {
       alignItems: 'center',

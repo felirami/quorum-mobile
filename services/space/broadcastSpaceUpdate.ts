@@ -10,37 +10,13 @@
  * Used by useUpdateSpace and useRoleManagement hooks.
  */
 
-import { logger } from '@quilibrium/quorum-shared';
-import { bytesToHex, hexToBytes, int64ToBytes } from '@quilibrium/quorum-shared';
+import { base64ToHex, numberArrayToBase64 } from '@/utils/encoding';
+import { logger, bytesToHex, hexToBytes, int64ToBytes } from '@quilibrium/quorum-shared';
 import { getSpaceKey } from '@/services/config/spaceStorage';
 import { getQuorumClient } from '@/services/api/quorumClient';
 import { NativeCryptoProvider } from '@/services/crypto/native-provider';
 import { sendSpaceManifestMessage, type SpaceManifest } from './spaceMessageService';
 import type { Space } from '@quilibrium/quorum-shared';
-
-/**
- * Helper to convert number array to base64
- */
-function numberArrayToBase64(arr: number[]): string {
-  const uint8 = new Uint8Array(arr);
-  let binary = '';
-  for (let i = 0; i < uint8.length; i++) {
-    binary += String.fromCharCode(uint8[i]);
-  }
-  return btoa(binary);
-}
-
-/**
- * Helper to convert base64 to hex
- */
-function base64ToHex(base64: string): string {
-  const binary = atob(base64);
-  let hex = '';
-  for (let i = 0; i < binary.length; i++) {
-    hex += binary.charCodeAt(i).toString(16).padStart(2, '0');
-  }
-  return hex;
-}
 
 export interface BroadcastSpaceUpdateResult {
   manifest: SpaceManifest;
@@ -66,7 +42,6 @@ export async function broadcastSpaceUpdate(
   const ownerKey = getSpaceKey(space.spaceId, 'owner');
 
   if (!configKey || !ownerKey) {
-    logger.log('[broadcastSpaceUpdate] Missing keys for space:', space.spaceId);
     return null;
   }
 
@@ -109,23 +84,21 @@ export async function broadcastSpaceUpdate(
       owner_signature: manifestSignatureHex,
     };
 
-    // 3. Post to API
+    // 3. Post to API. Surface failures so callers can decide how to react —
+    // the previous silent swallow caused invites to fail forever with no
+    // signal when this upload didn't land at space creation time.
     const client = getQuorumClient();
-    try {
-      await client.postSpaceManifest(space.spaceId, manifest);
-      logger.log('[broadcastSpaceUpdate] Manifest uploaded to API');
-    } catch (apiError) {
-      logger.log('[broadcastSpaceUpdate] Failed to upload manifest to API:', apiError);
-      // Continue - hub broadcast is more important for real-time sync
-    }
+    await client.postSpaceManifest(space.spaceId, manifest);
 
     // 4. Create WebSocket envelope
     const wsEnvelope = await sendSpaceManifestMessage(space.spaceId, manifest);
-    logger.log('[broadcastSpaceUpdate] WebSocket envelope created');
 
     return { manifest, wsEnvelope };
   } catch (error) {
-    console.error('[broadcastSpaceUpdate] Failed to create broadcast:', error);
-    return null;
+    // Log and rethrow so callers see the real failure instead of guessing
+    // from a silent null. Previously this swallow caused invite self-heal
+    // to silently fail and the user would still see "manifest missing".
+    logger.warn('[broadcastSpaceUpdate] failed', error);
+    throw error;
   }
 }

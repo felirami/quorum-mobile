@@ -11,11 +11,15 @@ import type { DirectCastMessage } from '@/services/farcasterClient';
 
 // Message type categories for rendering
 export type MessageRenderType =
-  | 'post'      // Regular text message
-  | 'system'    // Join/leave/kick events
-  | 'embed'     // Image/video
-  | 'sticker'   // Sticker
-  | 'deleted';  // Deleted message placeholder
+  | 'post'        // Regular text message
+  | 'system'      // Join/leave/kick events
+  | 'embed'       // Image/video
+  | 'sticker'     // Sticker
+  | 'deleted'     // Deleted message placeholder
+  | 'call-event'  // Voice/video call event (1-to-1)
+  | 'space-call'  // Space (group) call indicator
+  | 'cast'        // Farcaster cast from a linked channel
+  | 'error';      // Malformed message — surfaced inline so prod issues are visible without logs
 
 // Reaction display info
 export interface DisplayReaction {
@@ -63,6 +67,18 @@ export interface DisplayMessage {
   isReply?: boolean;
   replyToMessageId?: string;
   replyToAuthor?: string;
+  replyToPreview?: string;
+  // Space call specific
+  spaceCallId?: string;
+  spaceCallMediaType?: 'audio' | 'video';
+  spaceCallEnded?: boolean;
+  // Farcaster cast (when renderType === 'cast')
+  cast?: any;
+  castChannelKey?: string;
+  // Error detail (when renderType === 'error') — surfaced inline so prod
+  // users can screenshot the row and we can trace what's malformed
+  // without needing to reproduce or wire up logs.
+  errorDetail?: string;
 }
 
 // Display-oriented server/space for rendering
@@ -80,20 +96,46 @@ export interface DisplayChannel {
   id: string;
   name: string;
   unread: boolean;
+  mentionCount?: number;
   topic?: string;
   // Original channel if available
   originalChannel?: Channel;
+}
+
+// Display-oriented channel group for rendering
+export interface DisplayGroup {
+  name: string;
+  channels: DisplayChannel[];
 }
 
 // Member lookup map
 export type MemberMap = Record<string, SpaceMember>;
 
 /**
- * Format timestamp to display string
+ * Format timestamp to display string (Discord-style)
+ * - Today: "12:34 PM"
+ * - Yesterday: "Yesterday at 12:34 PM"
+ * - Older: "01/15/2025 12:34 PM"
  */
 export function formatTime(timestamp: number): string {
   const date = new Date(timestamp);
-  return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  const now = new Date();
+  const timeStr = date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+
+  // Check if same day - show time only
+  if (date.toDateString() === now.toDateString()) {
+    return timeStr;
+  }
+
+  // Check if yesterday
+  const yesterday = new Date(now);
+  yesterday.setDate(yesterday.getDate() - 1);
+  if (date.toDateString() === yesterday.toDateString()) {
+    return `Yesterday at ${timeStr}`;
+  }
+
+  // Older - show date and time
+  return `${date.toLocaleDateString()} ${timeStr}`;
 }
 
 // Image URL pattern - matches common image hosting URLs
@@ -141,6 +183,7 @@ export function stripImageUrls(text: string): string {
  */
 export function getMessageText(message: SharedMessage, memberName?: string): string {
   const content = message.content;
+  if (!content) return '';
   if (content.type === 'post') {
     const text = content.text;
     return Array.isArray(text) ? text.join('\n') : text;
@@ -152,7 +195,11 @@ export function getMessageText(message: SharedMessage, memberName?: string): str
     return '';  // Stickers render visually
   }
   if (content.type === 'embed') {
-    return '';  // Embeds render visually
+    // Embeds may carry an optional caption alongside the image. The
+    // send path (sendEmbedMessage in spaceMessageService) puts it under
+    // content.text. Older messages without a caption fall through to ''.
+    const caption = (content as { text?: string }).text;
+    return typeof caption === 'string' ? caption : '';
   }
   if (content.type === 'join') {
     return `${memberName ?? 'Someone'} joined the space`;
@@ -170,6 +217,27 @@ export function getMessageText(message: SharedMessage, memberName?: string): str
   if (content.type === 'remove-message') {
     return 'This message was deleted';
   }
+  if (content.type === 'call-event') {
+    const c = content as any;
+    const icon = c.mediaType === 'video' ? 'Video' : 'Voice';
+    if (c.event === 'completed' && c.duration) {
+      const mins = Math.floor(c.duration / 60);
+      const secs = c.duration % 60;
+      const dur = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+      return `${icon} call \u00B7 ${dur}`;
+    }
+    if (c.event === 'missed') return `Missed ${icon.toLowerCase()} call`;
+    if (c.event === 'declined') return `${icon} call \u00B7 Declined`;
+    if (c.event === 'failed') return `${icon} call \u00B7 Failed`;
+    return `${icon} call`;
+  }
+  if (content.type === 'space-call-start') {
+    const label = content.mediaType === 'video' ? 'Video' : 'Voice';
+    return `${label} call started`;
+  }
+  if (content.type === 'space-call-end') {
+    return 'Call ended';
+  }
   return '';
 }
 
@@ -178,6 +246,7 @@ export function getMessageText(message: SharedMessage, memberName?: string): str
  */
 export function getMessageRenderType(message: SharedMessage): MessageRenderType {
   const content = message.content;
+  if (!content) return 'error';
   switch (content.type) {
     case 'join':
     case 'leave':
@@ -190,6 +259,11 @@ export function getMessageRenderType(message: SharedMessage): MessageRenderType 
       return 'sticker';
     case 'remove-message':
       return 'deleted';
+    case 'call-event':
+      return 'call-event';
+    case 'space-call-start':
+    case 'space-call-end':
+      return 'space-call';
     default:
       return 'post';
   }
@@ -213,13 +287,29 @@ export function toDisplayReactions(
 /**
  * Convert shared Message to DisplayMessage
  */
-/**
- * Format an address for display when no name is available
- */
+import { truncateAddress } from '@/utils/formatAddress';
+
 function formatAddressDisplay(address: string): string {
-  if (!address) return 'Unknown';
-  if (address.length <= 12) return address;
-  return `${address.slice(0, 6)}...${address.slice(-4)}`;
+  return truncateAddress(address, 'medium');
+}
+
+/**
+ * Build a short error description for a malformed message. Goal is
+ * something a user can screenshot in production that we can act on
+ * without a repro — not a full pretty-printed JSON dump, but enough to
+ * identify the message and what's missing.
+ */
+function buildMessageErrorDetail(message: SharedMessage): string {
+  const parts: string[] = [];
+  if (!message.content) parts.push('no content');
+  else if (typeof message.content !== 'object') parts.push(`bad content type: ${typeof message.content}`);
+  else if (!('type' in message.content)) parts.push('content missing type');
+
+  const id = message.messageId ? `msg ${String(message.messageId).slice(0, 12)}` : 'msg <no id>';
+  const sender = (message as unknown as { publicKey?: string }).publicKey;
+  const senderStr = sender ? ` · sender ${String(sender).slice(0, 8)}` : '';
+  const ts = message.createdDate ? new Date(message.createdDate).toISOString() : '';
+  return `${parts.join(', ') || 'malformed'} (${id}${senderStr}${ts ? ` · ${ts}` : ''})`;
 }
 
 export function toDisplayMessage(
@@ -227,11 +317,21 @@ export function toDisplayMessage(
   members: MemberMap,
   currentUserId?: string
 ): DisplayMessage {
-  const senderId = message.content.senderId;
+  // Defensive: if a stored message has no `content` (corrupt save,
+  // partial decrypt result, malformed control envelope), render an
+  // inline error row instead of throwing. The error row surfaces enough
+  // identifying info that a production screenshot is debuggable without
+  // logs.
+  const content = (message.content as SharedMessage['content'] | undefined) ?? null;
+  const senderId = content && 'senderId' in content && typeof content.senderId === 'string'
+    ? content.senderId
+    : (message as unknown as { publicKey?: string }).publicKey ?? 'unknown';
   const member = members[senderId];
   const memberName = member?.display_name || member?.name || formatAddressDisplay(senderId);
-  const content = message.content;
   const renderType = getMessageRenderType(message);
+  const errorDetail = renderType === 'error'
+    ? buildMessageErrorDetail(message)
+    : undefined;
 
   // Base display message
   const displayMessage: DisplayMessage = {
@@ -246,7 +346,13 @@ export function toDisplayMessage(
     sendError: message.sendError,
     originalMessage: message,
     renderType,
+    errorDetail,
   };
+
+  // Bail out cleanly for malformed messages with no content. The base
+  // displayMessage above is enough to render the error row without
+  // touching any of the type-specific branches below.
+  if (!content) return displayMessage;
 
   // Add system event type for system messages
   if (content.type === 'join' || content.type === 'leave' || content.type === 'kick') {
@@ -277,6 +383,17 @@ export function toDisplayMessage(
   // Add sticker info
   if (content.type === 'sticker') {
     displayMessage.stickerId = content.stickerId;
+  }
+
+  // Add space call info
+  if (content.type === 'space-call-start') {
+    displayMessage.spaceCallId = content.callId;
+    displayMessage.spaceCallMediaType = content.mediaType;
+    displayMessage.spaceCallEnded = false;
+  }
+  if (content.type === 'space-call-end') {
+    displayMessage.spaceCallId = content.callId;
+    displayMessage.spaceCallEnded = true;
   }
 
   // Add reactions
@@ -326,6 +443,7 @@ export function toDisplayChannel(channel: Channel): DisplayChannel {
     id: channel.channelId,
     name: channel.channelName,
     unread: (channel.mentionCount ?? 0) > 0,
+    mentionCount: channel.mentionCount ?? 0,
     topic: channel.channelTopic,
     originalChannel: channel,
   };
@@ -416,5 +534,33 @@ export function directCastToDisplayMessage(
       `fid:${message.inReplyTo.senderFid}`;
   }
 
+  // Handle optimistic messages (sending state)
+  const messageWithOptimistic = message as DirectCastMessage & { _optimistic?: boolean };
+  if (messageWithOptimistic._optimistic) {
+    displayMessage.sendStatus = 'sending';
+  }
+
   return displayMessage;
+}
+
+/**
+ * Wrap a Farcaster cast as a DisplayMessage so it can be merged into the chat
+ * stream and rendered inline by MessagesList.
+ */
+export function castToDisplayMessage(cast: any, channelKey: string): DisplayMessage {
+  const author = cast?.author ?? {};
+  const pfpUrl: string | undefined = author?.pfp?.url;
+  return {
+    // Prefix to avoid collision with Quorum message IDs
+    id: `cast:${cast.hash}`,
+    userId: `fc:${author.fid ?? ''}`,
+    userName: author.displayName ?? author.username ?? 'Unknown',
+    userAvatar: pfpUrl ?? '',
+    timestamp: cast.timestamp ?? 0,
+    timeString: '',
+    content: cast.text ?? '',
+    renderType: 'cast',
+    cast,
+    castChannelKey: channelKey,
+  };
 }

@@ -5,10 +5,12 @@
  * needed for X3DH key exchange when sending encrypted messages.
  */
 
-import { logger } from '@quilibrium/quorum-shared';
 import { getQuorumClient, type UserRegistration } from '@/services/api/quorumClient';
 import { encryptionStateStorage } from '@/services/crypto/encryption-state-storage';
 import { useQuery } from '@tanstack/react-query';
+import { logger } from '@quilibrium/quorum-shared';
+
+const log = logger.scope('[Registration]');
 
 /**
  * Query key for recipient registration
@@ -35,7 +37,14 @@ export function useRecipientRegistration(
       if (!recipientAddress) {
         throw new Error('Recipient address required');
       }
-      return apiClient.fetchUserRegistration(recipientAddress);
+      log.log('Fetching registration', { address: recipientAddress?.substring(0, 12) });
+      const result = await apiClient.fetchUserRegistration(recipientAddress);
+      log.log('Registration result', {
+        address: recipientAddress?.substring(0, 12),
+        found: !!result,
+        deviceCount: result?.device_registrations?.length ?? 0,
+      });
+      return result;
     },
     enabled: !!recipientAddress && (options?.enabled ?? true),
     staleTime: 1000 * 60 * 60, // 1 hour - keys don't change often
@@ -62,57 +71,53 @@ function hexToBytes(hex: string): number[] {
   return bytes;
 }
 
+/** Device info for a single device/inbox */
+export interface DeviceInfo {
+  identityKey: number[];
+  signedPreKey: number[];
+  inboxAddress: string;
+  inboxEncryptionKey: number[];
+}
+
 /**
  * Convert UserRegistration to the format needed by useSendDirectMessage
+ * Returns info for the first device only (for backward compatibility)
  */
-export function toRecipientInfo(registration: UserRegistration) {
-  // Get the first device registration (primary device)
-  const device = registration.device_registrations?.[0];
+export function toRecipientInfo(registration: UserRegistration): DeviceInfo | null {
+  const devices = toAllDeviceInfos(registration);
+  return devices.length > 0 ? devices[0] : null;
+}
 
-  if (!device) {
-    logger.log('[E2E] No device registrations found for user:', registration.user_address);
-    return null;
+/**
+ * Convert UserRegistration to info for ALL devices
+ * Used for multi-device DM support - messages are sent to all recipient devices
+ */
+export function toAllDeviceInfos(registration: UserRegistration): DeviceInfo[] {
+  const devices = registration.device_registrations ?? [];
+
+  if (devices.length === 0) {
+    return [];
   }
 
-  // Extract fields from API structure:
-  // - identity_public_key: hex string
-  // - pre_public_key: hex string (the "signed pre-key" for X3DH)
-  // - inbox_registration: { inbox_address, inbox_encryption_public_key }
-  const identityKey = device.identity_public_key;
-  const preKey = device.pre_public_key;
-  const inboxAddr = device.inbox_registration?.inbox_address;
+  const deviceInfos: DeviceInfo[] = [];
 
-  logger.log('[E2E] Converting registration to recipientInfo:', {
-    userAddress: registration.user_address,
-    identityKeyLength: identityKey?.length,
-    preKeyLength: preKey?.length,
-    inboxAddress: inboxAddr,
-  });
+  for (const device of devices) {
+    const identityKey = device.identity_public_key;
+    const preKey = device.pre_public_key;
+    const inboxAddr = device.inbox_registration?.inbox_address;
+    const inboxEncryptionKey = device.inbox_registration?.inbox_encryption_public_key;
 
-  if (!identityKey || !preKey || !inboxAddr) {
-    logger.log('[E2E] Missing required fields in device registration:', {
-      hasIdentityKey: !!identityKey,
-      hasPreKey: !!preKey,
-      hasInboxAddr: !!inboxAddr,
+    if (!identityKey || !preKey || !inboxAddr || !inboxEncryptionKey) {
+      continue;
+    }
+
+    deviceInfos.push({
+      identityKey: hexToBytes(identityKey),
+      signedPreKey: hexToBytes(preKey),
+      inboxAddress: inboxAddr,
+      inboxEncryptionKey: hexToBytes(inboxEncryptionKey),
     });
-    return null;
   }
 
-  // Get the inbox encryption public key for sealing the message
-  const inboxEncryptionKey = device.inbox_registration?.inbox_encryption_public_key;
-
-  if (!inboxEncryptionKey) {
-    logger.log('[E2E] Missing inbox_encryption_public_key in device registration');
-    return null;
-  }
-
-  logger.log('[E2E] inbox_encryption_public_key length:', inboxEncryptionKey.length);
-
-  // Convert hex strings to number arrays for the crypto provider
-  return {
-    identityKey: hexToBytes(identityKey),
-    signedPreKey: hexToBytes(preKey),
-    inboxAddress: inboxAddr,
-    inboxEncryptionKey: hexToBytes(inboxEncryptionKey),
-  };
+  return deviceInfos;
 }

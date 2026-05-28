@@ -7,7 +7,7 @@ import {
   View,
   ViewStyle,
 } from 'react-native';
-import { useTheme } from '@/theme';
+import { useTheme, type AppTheme } from '@/theme';
 import { IconSymbol, type IconSymbolName } from './IconSymbol';
 
 type TabBarVariant = 'underline' | 'pill' | 'segmented';
@@ -119,7 +119,7 @@ export function TabBar({
   );
 }
 
-const createStyles = (theme: any, variant: TabBarVariant) => {
+const createStyles = (theme: AppTheme, variant: TabBarVariant) => {
   const isUnderline = variant === 'underline';
   const isPill = variant === 'pill';
   const isSegmented = variant === 'segmented';

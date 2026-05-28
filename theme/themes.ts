@@ -170,4 +170,6 @@ export const createThemedStyles = (theme: ReturnType<typeof createTheme>) => {
   };
 };
 
+export type AppTheme = ReturnType<typeof createTheme>;
+
 export { createTheme, type AccentColor };

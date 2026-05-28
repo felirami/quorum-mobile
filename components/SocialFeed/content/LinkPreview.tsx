@@ -1,5 +1,6 @@
-import React from 'react';
-import { Image, Text, TouchableOpacity, View } from 'react-native';
+import type { AppTheme } from '@/theme';
+import React, { useMemo } from 'react';
+import { Image, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 
 interface LinkPreviewProps {
   url?: string;
@@ -8,7 +9,7 @@ interface LinkPreviewProps {
   domain?: string;
   image?: string;
   useLargeImage?: boolean;
-  theme: any;
+  theme: AppTheme;
   onPress?: () => void;
 }
 
@@ -25,6 +26,8 @@ export function LinkPreview({
   theme,
   onPress,
 }: LinkPreviewProps) {
+  const styles = useMemo(() => createStyles(theme), [theme]);
+
   if (!title) return null;
 
   const handlePress = () => {
@@ -34,51 +37,32 @@ export function LinkPreview({
   if (useLargeImage && image) {
     return (
       <TouchableOpacity
-        style={{
-          backgroundColor: theme.colors.surface2,
-          borderRadius: 12,
-          overflow: 'hidden',
-          marginHorizontal: 12,
-        }}
+        style={styles.containerLarge}
         onPress={handlePress}
         activeOpacity={0.8}
       >
         <Image
           source={{ uri: image }}
-          style={{
-            width: '100%',
-            height: 180,
-            backgroundColor: theme.colors.surface3,
-          }}
+          style={styles.imageLarge}
           resizeMode="cover"
         />
-        <View style={{ padding: 12 }}>
+        <View style={staticStyles.padding12}>
           <Text
-            style={{
-              color: theme.colors.textStrong,
-              fontSize: 15,
-              fontWeight: '600',
-              marginBottom: 4,
-            }}
+            style={styles.titleLarge}
             numberOfLines={2}
           >
             {title}
           </Text>
           {description && (
             <Text
-              style={{
-                color: theme.colors.textMuted,
-                fontSize: 13,
-                lineHeight: 18,
-                marginBottom: 4,
-              }}
+              style={styles.descriptionLarge}
               numberOfLines={2}
             >
               {description}
             </Text>
           )}
           {domain && (
-            <Text style={{ color: theme.colors.textMuted, fontSize: 12 }}>
+            <Text style={styles.domainLarge}>
               {domain}
             </Text>
           )}
@@ -89,54 +73,34 @@ export function LinkPreview({
 
   return (
     <TouchableOpacity
-      style={{
-        backgroundColor: theme.colors.surface2,
-        borderRadius: 12,
-        overflow: 'hidden',
-        marginHorizontal: 12,
-        flexDirection: 'row',
-      }}
+      style={styles.containerSmall}
       onPress={handlePress}
       activeOpacity={0.8}
     >
       {image && (
         <Image
           source={{ uri: image }}
-          style={{
-            width: 100,
-            height: 100,
-            backgroundColor: theme.colors.surface3,
-          }}
+          style={styles.imageSmall}
           resizeMode="cover"
         />
       )}
-      <View style={{ flex: 1, padding: 12, justifyContent: 'center' }}>
+      <View style={staticStyles.contentSmall}>
         <Text
-          style={{
-            color: theme.colors.textStrong,
-            fontSize: 14,
-            fontWeight: '600',
-            marginBottom: 4,
-          }}
+          style={styles.titleSmall}
           numberOfLines={2}
         >
           {title}
         </Text>
         {description && (
           <Text
-            style={{
-              color: theme.colors.textMuted,
-              fontSize: 12,
-              lineHeight: 16,
-              marginBottom: 4,
-            }}
+            style={styles.descriptionSmall}
             numberOfLines={2}
           >
             {description}
           </Text>
         )}
         {domain && (
-          <Text style={{ color: theme.colors.textMuted, fontSize: 11 }}>
+          <Text style={styles.domainSmall}>
             {domain}
           </Text>
         )}
@@ -144,5 +108,74 @@ export function LinkPreview({
     </TouchableOpacity>
   );
 }
+
+const staticStyles = StyleSheet.create({
+  padding12: {
+    padding: 12,
+  },
+  contentSmall: {
+    flex: 1,
+    padding: 12,
+    justifyContent: 'center',
+  },
+});
+
+const createStyles = (theme: AppTheme) => StyleSheet.create({
+  containerLarge: {
+    backgroundColor: theme.colors.surface2,
+    borderRadius: 12,
+    overflow: 'hidden',
+    marginHorizontal: 12,
+  },
+  imageLarge: {
+    width: '100%',
+    height: 180,
+    backgroundColor: theme.colors.surface3,
+  },
+  titleLarge: {
+    color: theme.colors.textStrong,
+    fontSize: 15,
+    fontWeight: '600',
+    marginBottom: 4,
+  },
+  descriptionLarge: {
+    color: theme.colors.textMuted,
+    fontSize: 13,
+    lineHeight: 18,
+    marginBottom: 4,
+  },
+  domainLarge: {
+    color: theme.colors.textMuted,
+    fontSize: 12,
+  },
+  containerSmall: {
+    backgroundColor: theme.colors.surface2,
+    borderRadius: 12,
+    overflow: 'hidden',
+    marginHorizontal: 12,
+    flexDirection: 'row',
+  },
+  imageSmall: {
+    width: 100,
+    height: 100,
+    backgroundColor: theme.colors.surface3,
+  },
+  titleSmall: {
+    color: theme.colors.textStrong,
+    fontSize: 14,
+    fontWeight: '600',
+    marginBottom: 4,
+  },
+  descriptionSmall: {
+    color: theme.colors.textMuted,
+    fontSize: 12,
+    lineHeight: 16,
+    marginBottom: 4,
+  },
+  domainSmall: {
+    color: theme.colors.textMuted,
+    fontSize: 11,
+  },
+});
 
 export default LinkPreview;

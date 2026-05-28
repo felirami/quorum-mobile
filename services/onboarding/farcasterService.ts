@@ -8,10 +8,10 @@
 
 import { ed25519 } from '@noble/curves/ed25519';
 import { secp256k1 } from '@noble/curves/secp256k1';
-import { keccak_256 } from '@noble/hashes/sha3';
-import { bytesToHex, hexToBytes } from '@noble/hashes/utils';
-import { hmac } from '@noble/hashes/hmac';
-import { sha512 } from '@noble/hashes/sha2';
+import { keccak_256 } from '@noble/hashes/sha3.js';
+import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
+import { hmac } from '@noble/hashes/hmac.js';
+import { sha512 } from '@noble/hashes/sha2.js';
 import * as bip39 from '@scure/bip39';
 import { wordlist } from '@scure/bip39/wordlists/english';
 
@@ -288,8 +288,6 @@ export async function lookupFarcasterAccount(
     const tokenObj = data.result?.token;
     const authToken = tokenObj?.secret;
 
-    console.log('[FarcasterService] API response authToken:', authToken ? `${authToken.substring(0, 20)}...` : 'NOT RETURNED');
-
     return {
       fid: user.fid,
       username: user.username,
@@ -300,7 +298,6 @@ export async function lookupFarcasterAccount(
       authToken,
     };
   } catch (error) {
-    console.error('Failed to lookup Farcaster account:', error);
     throw error;
   }
 }
@@ -334,7 +331,6 @@ export async function refreshFarcasterAuthToken(
     );
 
     if (!response.ok) {
-      console.log('[FarcasterService] refreshFarcasterAuthToken failed:', response.status);
       return null;
     }
 
@@ -344,11 +340,8 @@ export async function refreshFarcasterAuthToken(
     const tokenObj = data.result?.token;
     const authToken = tokenObj?.secret;
 
-    console.log('[FarcasterService] refreshFarcasterAuthToken result:', authToken ? `${authToken.substring(0, 20)}...` : 'NO TOKEN');
-
     return typeof authToken === 'string' ? authToken : null;
   } catch (error) {
-    console.error('Failed to refresh Farcaster auth token:', error);
     return null;
   }
 }
@@ -361,7 +354,7 @@ export function validateFarcasterMnemonic(words: string[]): boolean {
   return bip39.validateMnemonic(mnemonic, wordlist);
 }
 
-// ============ SIWE (Sign-In with Ethereum) ============
+// SIWE (Sign-In with Ethereum)
 
 /**
  * Convert an Ethereum address to EIP-55 checksum format
@@ -546,7 +539,7 @@ export function createSignedSiweMessage(
   return { message, signature };
 }
 
-// ============ Profile Fetching ============
+// Profile Fetching
 
 /**
  * Fetch a Farcaster user's profile by FID
@@ -570,7 +563,6 @@ export async function fetchFarcasterProfileByFid(fid: number): Promise<{
     );
 
     if (!response.ok) {
-      console.warn(`[FarcasterService] Failed to fetch profile for FID ${fid}: ${response.status}`);
       return null;
     }
 
@@ -588,7 +580,6 @@ export async function fetchFarcasterProfileByFid(fid: number): Promise<{
       pfpUrl: user.pfp?.url,
     };
   } catch (error) {
-    console.error('[FarcasterService] Error fetching profile:', error);
     return null;
   }
 }

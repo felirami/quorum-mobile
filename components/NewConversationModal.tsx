@@ -2,7 +2,7 @@
  * NewConversationModal - Modal for starting a new DM conversation
  */
 
-import React, { useState, useCallback, useMemo } from 'react';
+import React, { useState, useCallback, useMemo, useEffect } from 'react';
 import {
   View,
   Text,
@@ -14,9 +14,12 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { BaseModal } from '@/components/shared';
 import { IconSymbol } from '@/components/ui/IconSymbol';
-import { useTheme } from '@/theme';
+import { useTheme, type AppTheme } from '@/theme';
+import type { EdgeInsets } from 'react-native-safe-area-context';
 import { useConversations } from '@/hooks/chat/useConversations';
 import { useStorageAdapter } from '@/context/StorageContext';
+import { useResolveName } from '@/hooks/useQNS';
+import { deriveAddress } from '@/services/onboarding/keyService';
 
 interface NewConversationModalProps {
   visible: boolean;
@@ -29,10 +32,10 @@ function isValidAddress(address: string): boolean {
   if (!address) return false;
   const trimmed = address.trim();
 
-  // Username format: @username (alphanumeric, underscores, min 2 chars after @)
+  // Username format: @username (alphanumeric, underscores, min 1 char after @)
   if (trimmed.startsWith('@')) {
     const username = trimmed.slice(1);
-    return /^[a-zA-Z0-9_]{2,}$/.test(username);
+    return /^[a-zA-Z0-9_]{1,}$/.test(username);
   }
 
   // Base58 multihash format (starts with Qm, 46 chars total for CIDv0)
@@ -59,6 +62,39 @@ export default function NewConversationModal({
   const [address, setAddress] = useState('');
   const [isCreating, setIsCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [resolvedAddress, setResolvedAddress] = useState<string | null>(null);
+
+  // Extract username for QNS lookup (without @ prefix)
+  const usernameToResolve = useMemo(() => {
+    const trimmed = address.trim();
+    if (trimmed.startsWith('@') && trimmed.length > 1) {
+      return trimmed.slice(1);
+    }
+    return '';
+  }, [address]);
+
+  // Resolve QNS name when searching for @username
+  const {
+    data: resolvedName,
+    isLoading: isResolvingName,
+    error: resolveError,
+  } = useResolveName(usernameToResolve, {
+    enabled: usernameToResolve.length >= 1,
+  });
+
+  // Derive address from resolveKey when name is resolved
+  useEffect(() => {
+    if (resolvedName?.resolveKey) {
+      try {
+        const derivedAddr = deriveAddress(resolvedName.resolveKey);
+        setResolvedAddress(derivedAddr);
+      } catch (err) {
+        setResolvedAddress(null);
+      }
+    } else {
+      setResolvedAddress(null);
+    }
+  }, [resolvedName]);
 
   // Get existing conversations to check for duplicates
   const { data: conversationsPages } = useConversations({ type: 'direct' });
@@ -68,15 +104,18 @@ export default function NewConversationModal({
   }, [conversationsPages]);
 
   // Normalize address for comparison and storage
+  // If it's a username and we have a resolved address, use that
   const normalizedAddress = useMemo(() => {
     const trimmed = address.trim();
-    // Keep usernames as-is (with @), addresses as-is
+    if (trimmed.startsWith('@') && resolvedAddress) {
+      return resolvedAddress;
+    }
     return trimmed;
-  }, [address]);
+  }, [address, resolvedAddress]);
 
   // Check if conversation already exists
   const existingConversation = useMemo(() => {
-    if (!normalizedAddress) return undefined;
+    if (!normalizedAddress || normalizedAddress.startsWith('@')) return undefined;
     const searchAddress = normalizedAddress.toLowerCase();
     return existingConversations.find(
       c => c.address?.toLowerCase() === searchAddress
@@ -84,8 +123,13 @@ export default function NewConversationModal({
   }, [existingConversations, normalizedAddress]);
 
   // Validation state
-  const isValid = isValidAddress(address);
-  const canCreate = isValid && !existingConversation && !isCreating;
+  const isInputValid = isValidAddress(address);
+  // For @usernames, also require that it's resolvable (has resolveKey)
+  const isUsernameResolvable = usernameToResolve
+    ? !!resolvedAddress
+    : true;
+  const isValid = isInputValid && isUsernameResolvable;
+  const canCreate = isValid && !existingConversation && !isCreating && !isResolvingName;
 
   const handleCreate = useCallback(async () => {
     if (!canCreate) return;
@@ -94,16 +138,21 @@ export default function NewConversationModal({
     setError(null);
 
     try {
+      // For @usernames, use the resolved Qm address
+      const targetAddress = address.trim().startsWith('@') && resolvedAddress
+        ? resolvedAddress
+        : address.trim();
+
       // Generate conversation ID (format: address/address)
-      const conversationId = `${normalizedAddress}/${normalizedAddress}`;
+      const conversationId = `${targetAddress}/${targetAddress}`;
 
       // Save conversation to storage
       await storage.saveConversation({
         conversationId,
-        address: normalizedAddress,
+        address: targetAddress,
         type: 'direct',
         timestamp: Date.now(),
-        displayName: undefined,
+        displayName: usernameToResolve ? `@${usernameToResolve}` : undefined,
         icon: undefined,
         lastReadTimestamp: undefined,
       });
@@ -116,7 +165,7 @@ export default function NewConversationModal({
     } finally {
       setIsCreating(false);
     }
-  }, [canCreate, normalizedAddress, storage, onClose, onConversationCreated]);
+  }, [canCreate, address, resolvedAddress, usernameToResolve, storage, onClose, onConversationCreated]);
 
   const handleOpenExisting = useCallback(() => {
     if (existingConversation) {
@@ -165,10 +214,36 @@ export default function NewConversationModal({
           </View>
 
           {/* Validation feedback */}
-          {address.length > 0 && !isValid && (
+          {address.length > 0 && !isInputValid && (
             <Text style={styles.errorText}>
               Enter a valid address (Qm...) or username (@...)
             </Text>
+          )}
+          {/* Username resolution status */}
+          {usernameToResolve && isInputValid && (
+            isResolvingName ? (
+              <View style={styles.resolvingBanner}>
+                <ActivityIndicator size="small" color={theme.colors.primary} />
+                <Text style={styles.resolvingText}>
+                  Looking up @{usernameToResolve}...
+                </Text>
+              </View>
+            ) : resolvedAddress ? (
+              <View style={styles.resolvedBanner}>
+                <IconSymbol name="checkmark.circle.fill" size={16} color={theme.colors.success} />
+                <Text style={styles.resolvedBannerText}>
+                  @{usernameToResolve} → {resolvedAddress.slice(0, 8)}...{resolvedAddress.slice(-6)}
+                </Text>
+              </View>
+            ) : resolvedName ? (
+              <Text style={styles.errorText}>
+                @{usernameToResolve} is registered but not publicly resolvable
+              </Text>
+            ) : resolveError ? (
+              <Text style={styles.errorText}>
+                @{usernameToResolve} not found
+              </Text>
+            ) : null
           )}
           {existingConversation && (
             <TouchableOpacity style={styles.existingBanner} onPress={handleOpenExisting}>
@@ -211,7 +286,7 @@ export default function NewConversationModal({
   );
 }
 
-const createStyles = (theme: any, insets: any) =>
+const createStyles = (theme: AppTheme, insets: EdgeInsets) =>
   StyleSheet.create({
     container: {
       flex: 1,
@@ -273,6 +348,34 @@ const createStyles = (theme: any, insets: any) =>
       fontSize: 14,
       fontFamily: theme.fonts.regular.fontFamily,
       color: theme.colors.primary,
+    },
+    resolvingBanner: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      marginTop: 12,
+      padding: 12,
+      backgroundColor: theme.colors.surface3,
+      borderRadius: 8,
+      gap: 8,
+    },
+    resolvingText: {
+      fontSize: 14,
+      fontFamily: theme.fonts.regular.fontFamily,
+      color: theme.colors.textMuted,
+    },
+    resolvedBanner: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      marginTop: 12,
+      padding: 12,
+      backgroundColor: theme.colors.success + '15',
+      borderRadius: 8,
+      gap: 8,
+    },
+    resolvedBannerText: {
+      fontSize: 14,
+      fontFamily: theme.fonts.regular.fontFamily,
+      color: theme.colors.success,
     },
     actions: {
       flexDirection: 'row',

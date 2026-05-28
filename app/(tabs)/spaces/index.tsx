@@ -1,0 +1,330 @@
+import { DefaultAvatar } from '@/components/ui/DefaultAvatar';
+import { HeaderAvatar } from '@/components/HeaderAvatar';
+import { IconSymbol } from '@/components/ui/IconSymbol';
+import { useSpaces } from '@/hooks/chat/useSpaces';
+import { isValidAvatarUri } from '@/utils/validation';
+import { useReplyTracking } from '@/hooks/chat/useReplyTracking';
+import { useSpaceActivity } from '@/hooks/chat/useSpaceActivity';
+import { textStyles, useTheme, type AppTheme } from '@/theme';
+import { haptics } from '@/utils/haptics';
+import type { Space } from '@quilibrium/quorum-shared';
+import { FlashList } from '@shopify/flash-list';
+import { router, Stack } from 'expo-router';
+import React, { Suspense, useCallback, useMemo, useState } from 'react';
+import {
+  ActivityIndicator,
+  Image,
+  RefreshControl,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
+} from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+
+const SpaceModal = React.lazy(() => import('@/components/SpaceModal'));
+
+interface SpaceItem {
+  id: string;
+  name: string;
+  icon?: string;
+  memberCount: number;
+  channelCount: number;
+  unreadCount: number;
+  timestamp: number;
+}
+
+function formatRelativeTime(timestamp: number): string {
+  const date = new Date(timestamp);
+  const now = new Date();
+  const timeStr = date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  if (date.toDateString() === now.toDateString()) return timeStr;
+  const yesterday = new Date(now);
+  yesterday.setDate(yesterday.getDate() - 1);
+  if (date.toDateString() === yesterday.toDateString()) return 'Yesterday';
+  const diffDays = Math.floor((now.getTime() - date.getTime()) / (1000 * 60 * 60 * 24));
+  if (diffDays < 7) return date.toLocaleDateString([], { weekday: 'short' });
+  return date.toLocaleDateString();
+}
+
+const SpaceRow = React.memo(function SpaceRow({
+  item,
+  styles,
+  theme,
+  onPress,
+}: {
+  item: SpaceItem;
+  styles: ReturnType<typeof createStyles>;
+  theme: AppTheme;
+  onPress: (id: string) => void;
+}) {
+  const handlePress = useCallback(() => onPress(item.id), [onPress, item.id]);
+
+  return (
+    <TouchableOpacity style={styles.row} onPress={handlePress} activeOpacity={0.6}>
+      <View style={styles.avatarContainer}>
+        {isValidAvatarUri(item.icon) ? (
+          <Image source={{ uri: item.icon }} style={styles.avatar} />
+        ) : (
+          <DefaultAvatar address={item.id} size={48} style={styles.avatar} />
+        )}
+      </View>
+      <View style={styles.rowContent}>
+        <View style={styles.rowTop}>
+          <Text style={styles.rowTitle} numberOfLines={1}>{item.name}</Text>
+          {item.timestamp > 0 && (
+            <Text style={styles.rowTime}>{formatRelativeTime(item.timestamp)}</Text>
+          )}
+        </View>
+        <View style={styles.rowBottom}>
+          <Text style={styles.rowSubtitle} numberOfLines={1}>
+            {item.channelCount} channel{item.channelCount !== 1 ? 's' : ''}
+          </Text>
+          {item.unreadCount > 0 && (
+            <View style={[styles.badge, { backgroundColor: theme.colors.primary }]}>
+              <Text style={styles.badgeText}>
+                {item.unreadCount > 99 ? '99+' : item.unreadCount}
+              </Text>
+            </View>
+          )}
+        </View>
+      </View>
+    </TouchableOpacity>
+  );
+});
+
+export default function SpacesIndex() {
+  const { theme, isDark } = useTheme();
+  const insets = useSafeAreaInsets();
+  const { data: spaces, isLoading, refetch } = useSpaces();
+  const { getReplyCount } = useReplyTracking();
+  const { getActivity } = useSpaceActivity();
+
+  const [search, setSearch] = useState('');
+  const [spaceModalVisible, setSpaceModalVisible] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+
+  const styles = useMemo(() => createStyles(theme, isDark), [theme, isDark]);
+
+  const items = useMemo<SpaceItem[]>(() => {
+    const rows: SpaceItem[] = [];
+    for (const space of (spaces as Space[]) ?? []) {
+      let unread = 0;
+      let channelCount = 0;
+      for (const group of space.groups ?? []) {
+        for (const ch of group.channels ?? []) {
+          channelCount++;
+          unread += getReplyCount(space.spaceId, ch.channelId) ?? 0;
+        }
+      }
+      const activity = getActivity(space.spaceId);
+      rows.push({
+        id: space.spaceId,
+        name: space.spaceName,
+        icon: space.iconUrl,
+        memberCount: 0,
+        channelCount,
+        unreadCount: unread,
+        timestamp: activity?.timestamp ?? space.modifiedDate ?? space.createdDate ?? 0,
+      });
+    }
+
+    const q = search.trim().toLowerCase();
+    const filtered = q ? rows.filter(r => r.name.toLowerCase().includes(q)) : rows;
+    filtered.sort((a, b) => b.timestamp - a.timestamp);
+    return filtered;
+  }, [spaces, search, getReplyCount, getActivity]);
+
+  const handlePress = useCallback((spaceId: string) => {
+    haptics.light();
+    router.push(`/spaces/${spaceId}`);
+  }, []);
+
+  const handleRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try { await refetch(); } finally { setRefreshing(false); }
+  }, [refetch]);
+
+  const handleOpenAddSpace = useCallback(() => {
+    haptics.selection();
+    setSpaceModalVisible(true);
+  }, []);
+
+  const handleSpaceCreated = useCallback((spaceId: string) => {
+    setSpaceModalVisible(false);
+    router.push(`/spaces/${spaceId}`);
+  }, []);
+
+  const handleSpaceJoined = useCallback((spaceId: string) => {
+    setSpaceModalVisible(false);
+    router.push(`/spaces/${spaceId}`);
+  }, []);
+
+  const renderItem = useCallback(
+    ({ item }: { item: SpaceItem }) => (
+      <SpaceRow item={item} styles={styles} theme={theme} onPress={handlePress} />
+    ),
+    [styles, theme, handlePress],
+  );
+
+  return (
+    <View style={[styles.container, { paddingTop: insets.top }]}>
+      <Stack.Screen options={{ headerShown: false }} />
+
+      <View style={styles.header}>
+        <View style={styles.headerSlotLeft}>
+          <HeaderAvatar />
+        </View>
+        <View style={styles.headerSlotCenter}>
+          <Text style={styles.heading}>Spaces</Text>
+        </View>
+        <View style={styles.headerSlotRight}>
+          <TouchableOpacity onPress={() => router.push('/spaces/discover')} style={styles.headerIconButton} hitSlop={8}>
+            <IconSymbol name="safari.fill" size={22} color={theme.colors.textMain} />
+          </TouchableOpacity>
+          <TouchableOpacity onPress={handleOpenAddSpace} style={styles.headerIconButton} hitSlop={8}>
+            <IconSymbol name="plus" size={22} color={theme.colors.textMain} />
+          </TouchableOpacity>
+        </View>
+      </View>
+
+      <View style={styles.searchContainer}>
+        <IconSymbol name="magnifyingglass" size={18} color={theme.colors.textMuted} />
+        <TextInput
+          style={styles.searchInput}
+          value={search}
+          onChangeText={setSearch}
+          placeholder="Search spaces"
+          placeholderTextColor={theme.colors.textMuted}
+          autoCapitalize="none"
+          autoCorrect={false}
+        />
+        {search.length > 0 && (
+          <TouchableOpacity onPress={() => setSearch('')}>
+            <IconSymbol name="xmark.circle.fill" size={18} color={theme.colors.textMuted} />
+          </TouchableOpacity>
+        )}
+      </View>
+
+      {isLoading && items.length === 0 ? (
+        <View style={styles.emptyContainer}>
+          <ActivityIndicator size="large" color={theme.colors.primary} />
+        </View>
+      ) : items.length === 0 ? (
+        <View style={styles.emptyContainer}>
+          <IconSymbol name="bubble.left.and.bubble.right" size={48} color={theme.colors.textMuted} />
+          <Text style={styles.emptyTitle}>
+            {search ? 'No matching spaces' : 'No spaces yet'}
+          </Text>
+          <Text style={styles.emptySubtitle}>
+            {search ? 'Try a different search' : 'Join or create a space to get started'}
+          </Text>
+          {!search && (
+            <TouchableOpacity
+              style={[styles.emptyButton, { backgroundColor: theme.colors.primary }]}
+              onPress={handleOpenAddSpace}
+            >
+              <Text style={styles.emptyButtonText}>Add Space</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      ) : (
+        <FlashList
+          data={items}
+          keyExtractor={item => item.id}
+          renderItem={renderItem}
+          estimatedItemSize={72}
+          drawDistance={800}
+          contentContainerStyle={styles.listContent}
+          refreshControl={
+            <RefreshControl
+              refreshing={refreshing}
+              onRefresh={handleRefresh}
+              tintColor={theme.colors.textMuted}
+            />
+          }
+        />
+      )}
+
+      {spaceModalVisible && (
+        <Suspense fallback={null}>
+          <SpaceModal
+            visible
+            onClose={() => setSpaceModalVisible(false)}
+            onSpaceCreated={handleSpaceCreated}
+            onSpaceJoined={handleSpaceJoined}
+          />
+        </Suspense>
+      )}
+    </View>
+  );
+}
+
+const createStyles = (theme: AppTheme, isDark: boolean) =>
+  StyleSheet.create({
+    container: { flex: 1, backgroundColor: theme.colors.surface1 },
+    header: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      paddingHorizontal: 16,
+      paddingTop: 8,
+      paddingBottom: 4,
+    },
+    heading: { ...textStyles.title3, color: theme.colors.textMain, textAlign: 'center' as const },
+    // Side slots take their natural width; center slot flex-fills the
+    // remainder. This way the title gets ~75-80% of the screen width
+    // (vs. the ~33% it had under equal flex), avoiding both wrapping
+    // and ellipsizing on common screen sizes.
+    headerSlotLeft: { alignItems: 'flex-start' as const, flexDirection: 'row' as const },
+    headerSlotCenter: { flex: 1, alignItems: 'center' as const, justifyContent: 'center' as const, paddingHorizontal: 8 },
+    headerSlotRight: { flexDirection: 'row' as const, alignItems: 'center' as const, justifyContent: 'flex-end' as const, gap: 4 },
+    headerIconButton: { padding: 8 },
+    searchContainer: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      backgroundColor: isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.05)',
+      borderRadius: 10,
+      marginHorizontal: 16,
+      marginVertical: 8,
+      paddingHorizontal: 10,
+      height: 36,
+      gap: 6,
+    },
+    searchInput: {
+      flex: 1,
+      ...textStyles.body,
+      color: theme.colors.textMain,
+      paddingVertical: 0,
+    },
+    emptyContainer: {
+      flex: 1,
+      justifyContent: 'center',
+      alignItems: 'center',
+      gap: 8,
+      paddingBottom: 80,
+    },
+    emptyTitle: { ...textStyles.headline, color: theme.colors.textMain, marginTop: 12 },
+    emptySubtitle: { ...textStyles.subheadline, color: theme.colors.textMuted, textAlign: 'center', paddingHorizontal: 40 },
+    emptyButton: { marginTop: 16, paddingHorizontal: 20, paddingVertical: 10, borderRadius: 20 },
+    emptyButtonText: { ...textStyles.subheadline, color: '#fff', fontWeight: '600' },
+    listContent: { paddingBottom: 100 },
+    row: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      paddingHorizontal: 16,
+      paddingVertical: 12,
+      gap: 12,
+    },
+    avatarContainer: {},
+    avatar: { width: 48, height: 48, borderRadius: 12 },
+    rowContent: { flex: 1, gap: 2 },
+    rowTop: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+    rowTitle: { ...textStyles.body, color: theme.colors.textMain, fontWeight: '600', flex: 1, marginRight: 8 },
+    rowTime: { ...textStyles.caption1, color: theme.colors.textMuted },
+    rowBottom: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+    rowSubtitle: { ...textStyles.subheadline, color: theme.colors.textMuted, flex: 1 },
+    badge: { minWidth: 20, height: 20, borderRadius: 10, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 6 },
+    badgeText: { ...textStyles.caption2, color: '#fff', fontWeight: '700' },
+  });

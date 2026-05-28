@@ -1,5 +1,5 @@
-import { logger } from '@quilibrium/quorum-shared';
 import { useQuery } from '@tanstack/react-query';
+import { isScamCast } from '@/services/farcaster/scamFilter';
 
 const THREAD_API_URL = 'https://farcaster.xyz/~api/v2/user-thread-casts';
 
@@ -15,6 +15,9 @@ export interface ThreadCast {
     };
     profile?: {
       accountLevel?: string;
+    };
+    viewerContext?: {
+      following?: boolean;
     };
   };
   text: string;
@@ -175,6 +178,13 @@ function flattenReplies(casts: ThreadCast[], depth = 0): FlattenedCast[] {
   const result: FlattenedCast[] = [];
 
   for (const cast of casts) {
+    // Suppress wallet-drainer typo-squat replies — see scamFilter.ts.
+    // Skip the cast AND its descendants since the visible payload is
+    // what matters; if a clean reply happens to descend from a scam
+    // we lose it, but that's an acceptable trade for the active
+    // hyrpia.xyz drainer floods that target every reply chain.
+    if (isScamCast(cast as unknown as Parameters<typeof isScamCast>[0])) continue;
+
     result.push({ ...cast, depth });
 
     if (cast.replies?.casts && cast.replies.casts.length > 0) {
@@ -198,12 +208,36 @@ export function useFarcasterThread({
     staleTime: 1000 * 60 * 2, // 2 minutes
   });
 
-  // Filter out "root-embed" casts (channel placeholders)
-  const actualCasts = query.data?.filter((cast) => cast.castType !== 'root-embed') ?? [];
+  // Filter out "root-embed" casts (channel placeholders) AND any
+  // wallet-drainer typo-squat casts (hyrpia.xyz). We apply both passes
+  // here so downstream cursor logic (target index, parent slicing,
+  // recursive flatten) operates on a clean array.
+  const actualCasts =
+    query.data?.filter(
+      (cast) =>
+        cast.castType !== 'root-embed' &&
+        !isScamCast(cast as unknown as Parameters<typeof isScamCast>[0]),
+    ) ?? [];
 
-  // The first actual cast is the main thread, rest are replies
-  const mainCast = actualCasts[0];
-  const replies = actualCasts.slice(1);
+  // Find the target cast - the one matching our castHashPrefix.
+  // When navigating to a reply-of-a-reply, the API may return parent
+  // casts first, then the target, then any descendants. We need to:
+  //   - identify the parents (everything strictly before target)
+  //   - show the target as the focused cast
+  //   - show descendants as replies
+  // Without exposing the parents, taps from a reply notification lose
+  // the conversation context — the user lands on the reply with no
+  // sense of what was being replied to.
+  const targetCastIndex = actualCasts.findIndex((cast) =>
+    cast.hash.toLowerCase().startsWith(castHashPrefix.toLowerCase())
+  );
+
+  const parentCasts =
+    targetCastIndex > 0 ? actualCasts.slice(0, targetCastIndex) : [];
+  const mainCast = targetCastIndex >= 0 ? actualCasts[targetCastIndex] : actualCasts[0];
+  const replies = targetCastIndex >= 0
+    ? actualCasts.slice(targetCastIndex + 1)
+    : actualCasts.slice(1);
 
   // Flatten nested replies for display
   const flattenedReplies = flattenReplies(replies);
@@ -213,6 +247,7 @@ export function useFarcasterThread({
   const channelContext = rootEmbed?.channel;
 
   return {
+    parentCasts,
     mainCast,
     replies: flattenedReplies,
     allCasts: actualCasts,

@@ -11,7 +11,7 @@ import {
   TouchableOpacity,
   ScrollView,
 } from 'react-native';
-import { useTheme } from '@/theme';
+import { useTheme, type AppTheme } from '@/theme';
 import { Button } from '@/components/ui/Button';
 import { IconSymbol } from '@/components/ui/IconSymbol';
 import { validateMnemonic, suggestWord } from '@/services/onboarding/keyService';
@@ -193,7 +193,7 @@ export function MnemonicInputView({
   );
 }
 
-const createStyles = (theme: any) =>
+const createStyles = (theme: AppTheme) =>
   StyleSheet.create({
     container: {
       flex: 1,

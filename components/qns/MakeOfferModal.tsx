@@ -1,0 +1,344 @@
+/**
+ * MakeOfferModal - Make an offer on a marketplace listing or a name
+ */
+
+import { BaseModal } from '@/components/shared';
+import { IconSymbol } from '@/components/ui/IconSymbol';
+import { useAuth } from '@/context';
+import { useCreateOfferOnListing, useCreateOfferOnName } from '@/hooks/useQNSMarketplace';
+import { useWalletSelection } from '@/hooks/useWalletSelection';
+import {
+  generateStealthOwnership,
+  stealthOwnershipToApi,
+} from '@/services/onboarding/keyService';
+import { useTheme, type AppTheme } from '@/theme';
+import type { EdgeInsets } from 'react-native-safe-area-context';
+import React from 'react';
+import {
+  ActivityIndicator,
+  Alert,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
+} from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+
+interface MakeOfferModalProps {
+  visible: boolean;
+  onClose: () => void;
+  // Provide either listing or name+nameType
+  listingId?: string;
+  name?: string;
+  nameType?: 'username' | 'domain';
+  listingToken?: 'wQUIL' | 'USDC';
+  onSuccess?: () => void;
+}
+
+const EXPIRY_OPTIONS = [
+  { label: '1 day', hours: 24 },
+  { label: '2 days', hours: 48 },
+  { label: '3 days', hours: 72 },
+  { label: '7 days', hours: 168 },
+];
+
+export default function MakeOfferModal({
+  visible,
+  onClose,
+  listingId,
+  name,
+  nameType = 'username',
+  listingToken,
+  onSuccess,
+}: MakeOfferModalProps) {
+  const { theme, isDark } = useTheme();
+  const { user } = useAuth();
+  const insets = useSafeAreaInsets();
+  const styles = createStyles(theme, isDark, insets);
+  const { activeWallet } = useWalletSelection();
+
+  const [token, setToken] = React.useState<'wQUIL' | 'USDC'>(listingToken || 'USDC');
+  const [amount, setAmount] = React.useState('');
+  const [expiryHours, setExpiryHours] = React.useState(72);
+
+  const { mutate: createOfferListing, isPending: isCreatingListing } = useCreateOfferOnListing();
+  const { mutate: createOfferName, isPending: isCreatingName } = useCreateOfferOnName();
+
+  const isSubmitting = isCreatingListing || isCreatingName;
+
+  React.useEffect(() => {
+    if (visible) {
+      setToken(listingToken || 'USDC');
+      setAmount('');
+      setExpiryHours(72);
+    }
+  }, [visible, listingToken]);
+
+  const handleSubmit = () => {
+    if (!amount || parseFloat(amount) <= 0) {
+      Alert.alert('Invalid Amount', 'Please enter a valid offer amount.');
+      return;
+    }
+
+    if (!user?.quilibriumAddress || !activeWallet) {
+      Alert.alert('Error', 'Wallet not found.');
+      return;
+    }
+
+    const stealth = generateStealthOwnership(user.quilibriumAddress);
+    const ownership = stealthOwnershipToApi(stealth);
+
+    const callbacks = {
+      onSuccess: () => {
+        Alert.alert('Offer Sent', `Your offer of ${amount} ${token} has been submitted.`);
+        onSuccess?.();
+        onClose();
+      },
+      onError: (err: Error) => {
+        Alert.alert('Error', err.message || 'Failed to create offer');
+      },
+    };
+
+    if (listingId) {
+      createOfferListing({
+        listingId,
+        token,
+        amount,
+        buyerAddress: activeWallet.address,
+        buyerOwnership: ownership,
+        expiresInHours: expiryHours,
+      }, callbacks);
+    } else if (name) {
+      createOfferName({
+        name,
+        nameType,
+        token,
+        amount,
+        buyerAddress: activeWallet.address,
+        buyerOwnership: ownership,
+        expiresInHours: expiryHours,
+      }, callbacks);
+    }
+  };
+
+  return (
+    <BaseModal visible={visible} onClose={onClose} height={0.65}>
+      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.content}>
+        <View style={styles.header}>
+          <Text style={styles.title}>Make Offer</Text>
+          <TouchableOpacity onPress={onClose}>
+            <IconSymbol name="xmark" size={20} color={theme.colors.textMuted} />
+          </TouchableOpacity>
+        </View>
+
+        {name && (
+          <View style={styles.nameContainer}>
+            <Text style={styles.nameLabel}>@{name}</Text>
+          </View>
+        )}
+
+        {/* Token Selector (only if not locked to listing token) */}
+        {!listingToken && (
+          <View style={styles.section}>
+            <Text style={styles.sectionTitle}>Token</Text>
+            <View style={styles.tokenSelector}>
+              {(['USDC', 'wQUIL'] as const).map(t => (
+                <TouchableOpacity
+                  key={t}
+                  style={[styles.tokenOption, token === t && styles.tokenOptionSelected]}
+                  onPress={() => setToken(t)}
+                >
+                  <Text style={[styles.tokenOptionText, token === t && styles.tokenOptionTextSelected]}>
+                    {t}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          </View>
+        )}
+
+        {/* Amount */}
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Offer Amount</Text>
+          <View style={styles.inputRow}>
+            <TextInput
+              style={styles.priceInput}
+              placeholder="0.00"
+              placeholderTextColor={theme.colors.textMuted}
+              value={amount}
+              onChangeText={setAmount}
+              keyboardType="decimal-pad"
+            />
+            <Text style={styles.inputToken}>{token}</Text>
+          </View>
+        </View>
+
+        {/* Expiration */}
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Expires In</Text>
+          <View style={styles.expirySelector}>
+            {EXPIRY_OPTIONS.map(opt => (
+              <TouchableOpacity
+                key={opt.hours}
+                style={[styles.expiryOption, expiryHours === opt.hours && styles.expiryOptionSelected]}
+                onPress={() => setExpiryHours(opt.hours)}
+              >
+                <Text style={[styles.expiryText, expiryHours === opt.hours && styles.expiryTextSelected]}>
+                  {opt.label}
+                </Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        </View>
+
+        {/* Fee Disclosure */}
+        <View style={styles.feeInfo}>
+          <IconSymbol name="info.circle" size={14} color={theme.colors.textMuted} />
+          <Text style={styles.feeInfoText}>
+            1% platform fee will be applied if the offer is accepted
+          </Text>
+        </View>
+
+        {/* Submit */}
+        <TouchableOpacity
+          style={[styles.submitButton, (isSubmitting || !amount) && styles.submitButtonDisabled]}
+          onPress={handleSubmit}
+          disabled={isSubmitting || !amount}
+        >
+          {isSubmitting ? (
+            <ActivityIndicator size="small" color="#fff" />
+          ) : (
+            <Text style={styles.submitButtonText}>Send Offer</Text>
+          )}
+        </TouchableOpacity>
+      </ScrollView>
+    </BaseModal>
+  );
+}
+
+const createStyles = (theme: AppTheme, isDark: boolean, insets: EdgeInsets) =>
+  StyleSheet.create({
+    content: {
+      paddingHorizontal: 20,
+      paddingBottom: insets.bottom + 20,
+    },
+    header: {
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      marginBottom: 20,
+    },
+    title: {
+      fontSize: 20,
+      fontFamily: theme.fonts.bold.fontFamily,
+      fontWeight: theme.fonts.bold.fontWeight,
+      color: theme.colors.textMain,
+    },
+    nameContainer: {
+      backgroundColor: theme.colors.surface2,
+      borderRadius: 12,
+      padding: 12,
+      alignItems: 'center',
+      marginBottom: 20,
+    },
+    nameLabel: {
+      fontSize: 20,
+      fontFamily: theme.fonts.bold.fontFamily,
+      fontWeight: theme.fonts.bold.fontWeight,
+      color: theme.colors.primary,
+    },
+    section: { marginBottom: 20 },
+    sectionTitle: {
+      fontSize: 14,
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
+      color: theme.colors.textMuted,
+      marginBottom: 8,
+      textTransform: 'uppercase',
+      letterSpacing: 0.5,
+    },
+    tokenSelector: { flexDirection: 'row', gap: 8 },
+    tokenOption: {
+      flex: 1,
+      paddingVertical: 12,
+      borderRadius: 10,
+      backgroundColor: theme.colors.surface2,
+      alignItems: 'center',
+      borderWidth: 2,
+      borderColor: 'transparent',
+    },
+    tokenOptionSelected: {
+      borderColor: theme.colors.primary,
+      backgroundColor: isDark ? 'rgba(99, 102, 241, 0.1)' : 'rgba(99, 102, 241, 0.05)',
+    },
+    tokenOptionText: {
+      fontSize: 15,
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
+      color: theme.colors.textMuted,
+    },
+    tokenOptionTextSelected: { color: theme.colors.primary },
+    inputRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      backgroundColor: theme.colors.surface2,
+      borderRadius: 10,
+    },
+    priceInput: {
+      flex: 1,
+      height: 44,
+      paddingHorizontal: 14,
+      fontSize: 16,
+      color: theme.colors.textMain,
+    },
+    inputToken: {
+      paddingHorizontal: 14,
+      fontSize: 14,
+      color: theme.colors.textMuted,
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
+    },
+    expirySelector: { flexDirection: 'row', gap: 8 },
+    expiryOption: {
+      flex: 1,
+      paddingVertical: 10,
+      borderRadius: 8,
+      backgroundColor: theme.colors.surface2,
+      alignItems: 'center',
+      borderWidth: 2,
+      borderColor: 'transparent',
+    },
+    expiryOptionSelected: {
+      borderColor: theme.colors.primary,
+      backgroundColor: isDark ? 'rgba(99, 102, 241, 0.1)' : 'rgba(99, 102, 241, 0.05)',
+    },
+    expiryText: { fontSize: 13, color: theme.colors.textMuted },
+    expiryTextSelected: {
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
+      color: theme.colors.primary,
+    },
+    feeInfo: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 6,
+      marginBottom: 20,
+    },
+    feeInfoText: { fontSize: 13, color: theme.colors.textMuted },
+    submitButton: {
+      height: 50,
+      backgroundColor: theme.colors.primary,
+      borderRadius: 12,
+      justifyContent: 'center',
+      alignItems: 'center',
+    },
+    submitButtonDisabled: { opacity: 0.5 },
+    submitButtonText: {
+      fontSize: 16,
+      fontFamily: theme.fonts.bold.fontFamily,
+      fontWeight: theme.fonts.bold.fontWeight,
+      color: '#fff',
+    },
+  });

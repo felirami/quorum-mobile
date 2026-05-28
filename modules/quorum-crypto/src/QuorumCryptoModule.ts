@@ -24,6 +24,52 @@ export interface MessageCiphertext {
  * via uniffi-generated Swift/Kotlin bindings.
  */
 interface QuorumCryptoModule extends NativeModule {
+  // Native call integration (CallKit on iOS, notification on Android)
+  reportIncomingCall(callId: string, callerName: string, hasVideo: boolean): Promise<boolean>;
+  reportOutgoingCall(callId: string, calleeName: string, hasVideo: boolean): Promise<boolean>;
+  reportOutgoingCallConnected(callId: string): Promise<boolean>;
+  reportCallConnected(callId: string): Promise<boolean>;
+  reportCallEnded(callId: string): Promise<boolean>;
+
+  // Audio session (iOS)
+  prepareAudioSession(): Promise<boolean>;
+  releaseAudioSession(): Promise<boolean>;
+  /**
+   * Toggle loudspeaker output during an active call. Resolves to false
+   * if the platform's audio session couldn't be reconfigured (rare —
+   * usually means there's no active call, in which case the call UI
+   * shouldn't be invoking this anyway).
+   *
+   * iOS: AVAudioSession.overrideOutputAudioPort(.speaker | .none).
+   * Android: AudioManager.setSpeakerphoneOn() while pinning the audio
+   * mode to MODE_IN_COMMUNICATION.
+   */
+  setSpeakerphoneEnabled(enabled: boolean): Promise<boolean>;
+  /**
+   * Start the platform-specific foreground call lifecycle so a
+   * backgrounded app keeps the WebRTC pipeline alive for the duration
+   * of the call.
+   *
+   * Android: starts QuorumCallService as a foreground service with a
+   * persistent notification ("In a Quorum call · <displayName>"),
+   * declared with foregroundServiceType="microphone". Without this,
+   * Android suspends the app within seconds of backgrounding and the
+   * call dies.
+   *
+   * iOS: no-op. The OS handles backgrounded calls automatically via
+   * the `audio` and `voip` UIBackgroundModes plus the active
+   * AVAudioSession that prepareAudioSession sets up. Method exists so
+   * JS can call it unconditionally without Platform checks.
+   *
+   * Idempotent — calling multiple times for the same call is safe.
+   */
+  startCallService(callId: string, displayName: string, hasVideo: boolean): Promise<boolean>;
+  /**
+   * Stop the foreground call service (Android) / no-op (iOS).
+   * Idempotent — safe to call when no service is running.
+   */
+  stopCallService(): Promise<boolean>;
+
   // Key Generation
   generateX448(): Promise<string>;
   generateEd448(): Promise<string>;
@@ -62,6 +108,29 @@ interface QuorumCryptoModule extends NativeModule {
    * Output: JSON string of number[][] (array of eval byte arrays)
    */
   tripleRatchetResize(input: string): Promise<string>;
+
+  /**
+   * Batch unseal multiple encrypted envelopes in a single native call.
+   * Eliminates N JS-native bridge crossings for N messages.
+   *
+   * Input: JSON string with:
+   *   hub_private_key: number[] (Ed448 private key bytes)
+   *   config_private_key?: number[] (X448 config key bytes, preferred over hub-derived)
+   *   messages: Array<{ ephemeral_public_key: string (hex), envelope: string (JSON ciphertext) }>
+   *
+   * Output: JSON string with:
+   *   results: Array<{ plaintext: string } | { error: string }>
+   */
+  batchUnsealEnvelopes(input: string): Promise<string>;
+
+  /**
+   * Process an entire batch of messages in a single native call.
+   * Handles unseal + TR/DR decrypt for all messages, eliminating 2N-5N bridge crossings.
+   *
+   * Input: JSON string (see BatchProcessInput type in native-provider.ts)
+   * Output: JSON string (see BatchProcessOutput type in native-provider.ts)
+   */
+  batchProcessMessages(input: string): Promise<string>;
 }
 
 // This call loads the native module object from the JSI

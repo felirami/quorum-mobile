@@ -5,13 +5,11 @@
  * showing space info with a join button.
  */
 
-import { logger } from '@quilibrium/quorum-shared';
 import { IconSymbol } from '@/components/ui/IconSymbol';
 import { useAuth, useWebSocket } from '@/context';
 import { useJoinSpace, useValidateInvite } from '@/hooks/chat/useSpaceActions';
-import { getSpace } from '@/services/config/spaceStorage';
 import { useSpaces } from '@/hooks/chat/useSpaces';
-import { useTheme } from '@/theme';
+import { useTheme, type AppTheme } from '@/theme';
 import React, { useMemo } from 'react';
 import {
   ActivityIndicator,
@@ -28,6 +26,8 @@ const VALID_INVITE_PREFIXES = [
   'https://qm.one/#',
   'https://quorummessenger.com/i/',
   'https://www.quorummessenger.com/i/',
+  'https://app.quorummessenger.com/#',
+  'https://app.quorummessenger.com/invite/#',
   'http://localhost:3000/',
   'http://localhost:3000/i/',
   'qm.one/',
@@ -88,7 +88,7 @@ export function InviteLinkCard({
   const { theme } = useTheme();
   const styles = createStyles(theme);
   const { user } = useAuth();
-  const { subscribe, enqueueOutbound, triggerSyncRequest } = useWebSocket();
+  const { subscribe, enqueueOutbound } = useWebSocket();
 
   // Validate and fetch space info
   const {
@@ -133,43 +133,38 @@ export function InviteLinkCard({
       const result = await joinMutation.mutateAsync({ inviteLink });
       // Subscribe to the new space inbox immediately
       if (result.inboxAddress) {
-        logger.log('[InviteLinkCard] Subscribing to new space inbox:', result.inboxAddress.substring(0, 12));
         await subscribe([result.inboxAddress]);
       }
 
       // Send join control message to announce ourselves to other participants
       if (result.joinMessageEnvelope) {
-        logger.log('[InviteLinkCard] Sending join control message to announce participant');
         enqueueOutbound(async () => [result.joinMessageEnvelope!]);
       }
 
-      // Trigger sync to get existing messages from other members
-      // Wait a short moment for subscription to be established
-      setTimeout(async () => {
-        try {
-          logger.log('[InviteLinkCard] Triggering sync request for newly joined space');
-          await triggerSyncRequest(result.spaceId, result.channelId);
-        } catch (syncError) {
-          logger.log('[InviteLinkCard] Sync request failed (non-critical):', syncError);
-        }
-      }, 1000);
+      // Hook the new space into the per-hub log transport so existing
+      // log entries get delivered without waiting for a WS reconnect.
+      const { subscribeAndCatchUpHubLog } = await import('@/services/space/hubLogSync');
+      void subscribeAndCatchUpHubLog(result.spaceId, enqueueOutbound);
 
       onJoinSuccess?.(result.spaceId, result.channelId);
     } catch (error) {
-      logger.log('[InviteLinkCard] Join failed:', error);
+      // Join failed
     }
   };
 
   // Error state
   if (validationError) {
+    const msg = validationError instanceof Error ? validationError.message : '';
+    let display = 'Could not validate invite';
+    if (msg.includes('Invalid')) display = 'Invalid invite link';
+    else if (msg.includes('not found') || msg.includes('404')) display = 'Space manifest missing on server (creator may need to re-upload)';
+    else if (msg.includes('manifest') || msg.includes('fetch')) display = 'Space not reachable';
+    else if (msg.includes('decrypt')) display = 'Wrong invite key';
+    else if (msg) display = msg;
     return (
       <View style={styles.errorContainer}>
         <IconSymbol name="exclamationmark.triangle.fill" size={16} color={theme.colors.warning ?? '#f59e0b'} />
-        <Text style={styles.errorText}>
-          {validationError instanceof Error && validationError.message.includes('Invalid')
-            ? 'Invalid invite link'
-            : 'This invite may have expired'}
-        </Text>
+        <Text style={styles.errorText}>{display}</Text>
       </View>
     );
   }
@@ -260,7 +255,7 @@ export function InviteLinkCard({
   );
 }
 
-const createStyles = (theme: any) =>
+const createStyles = (theme: AppTheme) =>
   StyleSheet.create({
     container: {
       flexDirection: 'row',

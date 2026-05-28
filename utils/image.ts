@@ -10,7 +10,6 @@ export async function fetchImageAsDataUri(url: string): Promise<string | null> {
   try {
     const response = await fetch(url);
     if (!response.ok) {
-      console.warn(`Failed to fetch image from ${url}: ${response.status}`);
       return null;
     }
 
@@ -24,13 +23,11 @@ export async function fetchImageAsDataUri(url: string): Promise<string | null> {
         resolve(result);
       };
       reader.onerror = () => {
-        console.warn('Failed to read image blob');
         resolve(null);
       };
       reader.readAsDataURL(blob);
     });
   } catch (error) {
-    console.warn('Failed to fetch image as data URI:', error);
     return null;
   }
 }

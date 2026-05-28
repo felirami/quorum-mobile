@@ -9,6 +9,7 @@
  * - Modal locked during operation (can't close)
  */
 
+import { truncateAddress } from '@/utils/formatAddress';
 import React, { useEffect, useCallback, useState } from 'react';
 import {
   View,
@@ -20,7 +21,7 @@ import {
 } from 'react-native';
 import { BaseModal } from '@/components/shared/BaseModal';
 import { DefaultAvatar } from '@/components/ui/DefaultAvatar';
-import { useTheme } from '@/theme';
+import { useTheme, type AppTheme } from '@/theme';
 import { useUserKicking } from '@/hooks/chat/useUserKicking';
 
 interface KickUserModalProps {
@@ -30,15 +31,6 @@ interface KickUserModalProps {
   userName: string;
   userIcon?: string;
   userAddress: string;
-}
-
-/**
- * Truncate an address for display
- */
-function truncateAddress(address: string | undefined): string {
-  if (!address) return 'Unknown';
-  if (address.length <= 16) return address;
-  return `${address.slice(0, 8)}...${address.slice(-6)}`;
 }
 
 export function KickUserModal({
@@ -93,7 +85,6 @@ export function KickUserModal({
 
         onClose();
       } catch (error) {
-        console.error('Kick failed:', error);
         setIsSaving(false);
       }
     }
@@ -170,7 +161,7 @@ export function KickUserModal({
   );
 }
 
-const createStyles = (theme: any) =>
+const createStyles = (theme: AppTheme) =>
   StyleSheet.create({
     container: {
       flex: 1,

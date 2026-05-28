@@ -46,3 +46,25 @@ export {
   useWebSocket,
   useWebSocketConnection,
 } from './WebSocketContext';
+
+// Calling (Voice/Video)
+export {
+  CallProvider,
+  useCall,
+} from './CallContext';
+export type {
+  CallState,
+  ActiveCall,
+  IncomingCallInfo,
+  CallContextValue,
+} from './CallContext';
+
+// Space Calls (SFU-based group calls)
+export {
+  SpaceCallProvider,
+  useSpaceCall,
+} from './SpaceCallContext';
+export type {
+  SpaceCallState,
+  SpaceCallContextValue,
+} from './SpaceCallContext';

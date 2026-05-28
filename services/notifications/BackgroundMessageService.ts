@@ -2,7 +2,7 @@
  * BackgroundMessageService - Checks for new messages in background
  *
  * This service is designed to run in background fetch tasks.
- * It creates a brief WebSocket connection to check for pending messages
+ * It checks for new Farcaster direct casts and Quorum messages
  * and shows local notifications for any new messages found.
  *
  * Limitations:
@@ -11,17 +11,17 @@
  * - Full message handling happens when app opens
  */
 
-import { logger } from '@quilibrium/quorum-shared';
-import { getDeviceKeyset } from '../onboarding/secureStorage';
+import { getDeviceKeyset, getFarcasterAuthToken } from '../onboarding/secureStorage';
 import { getInboxAddress } from '../onboarding/secureStorage';
 import { getAllSpaceInboxAddresses } from '../config/spaceStorage';
 import { encryptionStateStorage } from '../crypto/encryption-state-storage';
 import { showMessageNotification } from './NotificationService';
+import { getDirectCastConversations } from '../farcasterClient';
+import { mmkvStorage } from '../offline/storage';
 
-// API Configuration
-const API_CONFIG = {
-  wsUrl: 'wss://api.quorummessenger.com/ws',
-};
+import { getApiConfig } from '../api/config';
+
+const API_CONFIG = getApiConfig();
 
 // Timeout for background WebSocket connection (keep short for background execution limits)
 const BACKGROUND_WS_TIMEOUT = 15000; // 15 seconds
@@ -32,40 +32,114 @@ export interface BackgroundCheckResult {
   error?: string;
 }
 
+// Storage key for tracking last seen Farcaster message timestamp
+const LAST_FC_MESSAGE_KEY = 'background.lastFarcasterMessageTimestamp';
+
 /**
  * Check for new messages in background
- * Creates a brief WebSocket connection to receive pending messages
+ * Checks both Farcaster direct casts and Quorum messages
  */
 export async function checkForNewMessages(): Promise<BackgroundCheckResult> {
-  logger.log('[BackgroundMessage] Starting background message check');
+  setLastBackgroundCheckTime(Date.now());
+
+  let totalNewMessages = 0;
+  let hasError = false;
+  let errorMessage: string | undefined;
 
   try {
-    // 1. Get device keyset - if not authenticated, skip
+    // 1. Check Farcaster direct casts first (most common use case)
+    const farcasterResult = await checkFarcasterDirectCasts();
+    totalNewMessages += farcasterResult.newMessageCount;
+
+    // 2. Check Quorum messages if authenticated
     const deviceKeyset = await getDeviceKeyset();
-    if (!deviceKeyset) {
-      logger.log('[BackgroundMessage] No device keyset found, user not authenticated');
-      return { newMessageCount: 0, success: true };
+    if (deviceKeyset) {
+      const inboxAddresses = await collectInboxAddresses();
+      if (inboxAddresses.length > 0) {
+        const quorumResult = await checkInboxesViaWebSocket(inboxAddresses);
+        totalNewMessages += quorumResult.newMessageCount;
+        if (!quorumResult.success) {
+          hasError = true;
+          errorMessage = quorumResult.error;
+        }
+      }
     }
 
-    // 2. Collect all inbox addresses to check
-    const inboxAddresses = await collectInboxAddresses();
-    if (inboxAddresses.length === 0) {
-      logger.log('[BackgroundMessage] No inbox addresses to check');
-      return { newMessageCount: 0, success: true };
-    }
-
-    logger.log(`[BackgroundMessage] Checking ${inboxAddresses.length} inbox addresses`);
-
-    // 3. Create a brief WebSocket connection to check for messages
-    const result = await checkInboxesViaWebSocket(inboxAddresses);
-
-    return result;
+    return {
+      newMessageCount: totalNewMessages,
+      success: !hasError,
+      error: errorMessage,
+    };
   } catch (error) {
-    logger.log('[BackgroundMessage] Error during background check:', error);
+    return {
+      newMessageCount: totalNewMessages,
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    };
+  }
+}
+
+/**
+ * Check for new Farcaster direct cast messages
+ */
+async function checkFarcasterDirectCasts(): Promise<BackgroundCheckResult> {
+  try {
+    const token = await getFarcasterAuthToken();
+    if (!token) {
+      return { newMessageCount: 0, success: true };
+    }
+
+    // Get last seen timestamp
+    const lastSeenStr = mmkvStorage.getItem(LAST_FC_MESSAGE_KEY);
+    const lastSeenTimestamp = lastSeenStr ? parseInt(lastSeenStr, 10) : 0;
+
+    // Fetch recent conversations
+    const { conversations } = await getDirectCastConversations({
+      token,
+      category: 'default',
+      limit: 20,
+    });
+
+    let newMessageCount = 0;
+    let latestTimestamp = lastSeenTimestamp;
+
+    // Check for new messages in conversations
+    for (const conversation of conversations) {
+      const lastMessage = conversation.lastMessage;
+      if (lastMessage && lastMessage.serverTimestamp > lastSeenTimestamp) {
+        // This is a new message we haven't seen
+        newMessageCount++;
+        if (lastMessage.serverTimestamp > latestTimestamp) {
+          latestTimestamp = lastMessage.serverTimestamp;
+        }
+      }
+    }
+
+    // Update last seen timestamp
+    if (latestTimestamp > lastSeenTimestamp) {
+      mmkvStorage.setItem(LAST_FC_MESSAGE_KEY, String(latestTimestamp));
+    }
+
+    // Show notification if there are new messages
+    if (newMessageCount > 0) {
+      await showMessageNotification({
+        title: 'New Messages',
+        body: newMessageCount === 1
+          ? 'You have a new direct message'
+          : `You have ${newMessageCount} new direct messages`,
+        data: {
+          type: 'message',
+          messageId: `fc-${Date.now()}`,
+        },
+      });
+    }
+
+    return { newMessageCount, success: true };
+  } catch (error) {
     return {
       newMessageCount: 0,
       success: false,
-      error: error instanceof Error ? error.message : 'Unknown error',
+      error: error instanceof Error ? error.message : 'Farcaster check failed',
     };
   }
 }
@@ -126,7 +200,6 @@ async function checkInboxesViaWebSocket(
 
     // Set timeout for background execution limits
     const timeoutId = setTimeout(() => {
-      logger.log('[BackgroundMessage] WebSocket check timed out');
       finalize(true); // Timeout is success - we tried
     }, BACKGROUND_WS_TIMEOUT);
 
@@ -134,8 +207,6 @@ async function checkInboxesViaWebSocket(
       ws = new WebSocket(API_CONFIG.wsUrl);
 
       ws.onopen = () => {
-        logger.log('[BackgroundMessage] WebSocket connected, subscribing to inboxes');
-
         // Send listen message
         const listenMessage = JSON.stringify({
           type: 'listen',
@@ -148,7 +219,6 @@ async function checkInboxesViaWebSocket(
         // Messages are delivered immediately on subscribe if pending
         setTimeout(() => {
           if (!resolved) {
-            logger.log('[BackgroundMessage] Closing after subscribe window');
             finalize(true);
           }
         }, 5000); // 5 seconds to receive pending messages
@@ -161,7 +231,6 @@ async function checkInboxesViaWebSocket(
           // Check if this is an encrypted message
           if (data.type === 'message' && data.encrypted_content) {
             messageCount++;
-            logger.log(`[BackgroundMessage] Received message #${messageCount}`);
 
             // Show a notification for the new message
             // Note: In background, we can't fully decrypt - just show generic notification
@@ -177,19 +246,17 @@ async function checkInboxesViaWebSocket(
               });
             }
           }
-        } catch (error) {
-          logger.log('[BackgroundMessage] Error parsing message:', error);
+        } catch {
+          // Malformed WebSocket message — skip and continue listening
         }
       };
 
       ws.onerror = (error) => {
-        logger.log('[BackgroundMessage] WebSocket error:', error);
         clearTimeout(timeoutId);
         finalize(false, 'WebSocket error');
       };
 
       ws.onclose = () => {
-        logger.log('[BackgroundMessage] WebSocket closed');
         clearTimeout(timeoutId);
         if (!resolved) {
           finalize(true);

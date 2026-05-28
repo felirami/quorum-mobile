@@ -1,7 +1,3 @@
-/**
- * MMKVAdapter - StorageAdapter implementation for React Native using MMKV
- */
-
 import { storage } from '../offline/storage';
 import {
   getAllSpaces as getSpacesFromStorage,
@@ -9,6 +5,7 @@ import {
   saveSpace as saveSpaceToStorage,
   deleteSpace as deleteSpaceFromStorage,
 } from '../config/spaceStorage';
+import * as messagesDb from './messagesDb';
 import type {
   StorageAdapter,
   GetMessagesParams,
@@ -21,10 +18,13 @@ import type {
   SpaceMember,
 } from '@quilibrium/quorum-shared';
 
-// Key prefixes for organized storage
-// Note: Space storage is handled by spaceStorage.ts (quorum-spaces MMKV instance)
+// Key prefixes for organized storage.
+// Messages used to live under `messages:<spaceId>:<channelId>` as one
+// JSON blob per channel; they now live in a SQLite database (see
+// messagesDb.ts), with a one-shot MMKV→SQLite migration that runs on
+// first DB open. The MMKV key prefix is intentionally NOT listed here
+// anymore — the migration deletes those keys as it moves them.
 const KEYS = {
-  MESSAGES: (spaceId: string, channelId: string) => `messages:${spaceId}:${channelId}`,
   CONVERSATIONS: (type: string) => `conversations:${type}`,
   CONVERSATION: (id: string) => `conversation:${id}`,
   USER_CONFIG: (address: string) => `userConfig:${address}`,
@@ -33,12 +33,30 @@ const KEYS = {
 } as const;
 
 export class MMKVAdapter implements StorageAdapter {
+  // In-memory index for O(1) member lookups by address
+  private memberIndexCache = new Map<string, { index: Map<string, number>; raw: string }>();
+
   async init(): Promise<void> {
-    // MMKV is ready synchronously, no initialization needed
+    // MMKV is ready synchronously. The SQLite messages database, though,
+    // wants to open + apply its SQLCipher key + run the one-shot
+    // MMKV→SQLite migration before the first message read so the
+    // migration's JS-thread cost isn't paid by whatever UI happens to
+    // mount first.
+    //
+    // ensureDb uses the async SecureStore path to derive the SQLCipher
+    // key, then memoizes it. This matters on iOS, where the sync
+    // SecureStore bridge has been observed to fail (return null or
+    // throw) under conditions where the async path works — running
+    // here first ensures the cipher key cache is populated before any
+    // sync read tries to consume it.
+    //
+    // Returns null gracefully if the Ed448 key isn't in SecureStore
+    // yet (pre-onboarding); the first post-onboarding message
+    // operation will run ensureDb again at that point.
+    await messagesDb.ensureDb();
   }
 
-  // ============ Spaces ============
-  // Delegate to spaceStorage for consistent storage location
+  // Spaces (delegated to spaceStorage)
 
   async getSpaces(): Promise<Space[]> {
     return getSpacesFromStorage();
@@ -56,7 +74,7 @@ export class MMKVAdapter implements StorageAdapter {
     deleteSpaceFromStorage(spaceId);
   }
 
-  // ============ Channels ============
+  // Channels
 
   async getChannels(spaceId: string): Promise<Channel[]> {
     const space = await this.getSpace(spaceId);
@@ -64,38 +82,24 @@ export class MMKVAdapter implements StorageAdapter {
     return space.groups.flatMap((g) => g.channels);
   }
 
-  // ============ Messages ============
+  // Messages — backed by SQLite via messagesDb. See the module header
+  // there for the rationale (replaces the old "one JSON blob per
+  // channel" MMKV layout). These methods are thin adapters that match
+  // the StorageAdapter interface contract.
 
   async getMessages(params: GetMessagesParams): Promise<GetMessagesResult> {
-    const { spaceId, channelId, cursor, direction = 'backward', limit = 50 } = params;
+    return messagesDb.getMessages(params);
+  }
 
-    const key = KEYS.MESSAGES(spaceId, channelId);
-    const data = storage.getString(key);
-    const allMessages: Message[] = data ? JSON.parse(data) : [];
-
-    // Sort by createdDate descending (newest first)
-    allMessages.sort((a, b) => b.createdDate - a.createdDate);
-
-    let startIdx = 0;
-    if (cursor) {
-      const cursorIdx = allMessages.findIndex((m) => m.createdDate === cursor);
-      if (cursorIdx >= 0) {
-        startIdx = direction === 'backward' ? cursorIdx + 1 : Math.max(0, cursorIdx - limit);
-      }
-    }
-
-    const slice = allMessages.slice(startIdx, startIdx + limit);
-
-    // For display, reverse to chronological order
-    if (direction === 'backward') {
-      slice.reverse();
-    }
-
-    return {
-      messages: slice,
-      nextCursor: startIdx + limit < allMessages.length ? allMessages[startIdx + limit].createdDate : null,
-      prevCursor: startIdx > 0 ? allMessages[startIdx - 1].createdDate : null,
-    };
+  /**
+   * Synchronous read used by useMessages' initialData seed so the chat
+   * UI paints with cached history on the first render after navigation,
+   * with no spinner flash. Delegates to messagesDb.getMessagesSync which
+   * uses expo-sqlite's sync query APIs — fast for the typical 50-row
+   * page against an indexed table.
+   */
+  getMessagesSync(params: GetMessagesParams): GetMessagesResult {
+    return messagesDb.getMessagesSync(params);
   }
 
   async getMessage(params: {
@@ -103,12 +107,7 @@ export class MMKVAdapter implements StorageAdapter {
     channelId: string;
     messageId: string;
   }): Promise<Message | undefined> {
-    const key = KEYS.MESSAGES(params.spaceId, params.channelId);
-    const data = storage.getString(key);
-    if (!data) return undefined;
-
-    const messages: Message[] = JSON.parse(data);
-    return messages.find((m) => m.messageId === params.messageId);
+    return messagesDb.getMessage(params);
   }
 
   async saveMessage(
@@ -119,48 +118,14 @@ export class MMKVAdapter implements StorageAdapter {
     _icon: string,
     _displayName: string
   ): Promise<void> {
-    const key = KEYS.MESSAGES(message.spaceId, message.channelId);
-    const data = storage.getString(key);
-    const messages: Message[] = data ? JSON.parse(data) : [];
-
-    // Update or add message
-    const existingIdx = messages.findIndex((m) => m.messageId === message.messageId);
-    if (existingIdx >= 0) {
-      messages[existingIdx] = message;
-    } else {
-      messages.push(message);
-    }
-
-    // Keep only last 1000 messages per channel
-    if (messages.length > 1000) {
-      messages.sort((a, b) => b.createdDate - a.createdDate);
-      messages.splice(1000);
-    }
-
-    storage.set(key, JSON.stringify(messages));
+    return messagesDb.saveMessage(message);
   }
 
   async deleteMessage(messageId: string): Promise<void> {
-    // Need to find and delete from all channels - expensive but rare operation
-    const spaces = await this.getSpaces();
-    for (const space of spaces) {
-      const channels = await this.getChannels(space.spaceId);
-      for (const channel of channels) {
-        const key = KEYS.MESSAGES(space.spaceId, channel.channelId);
-        const data = storage.getString(key);
-        if (!data) continue;
-
-        const messages: Message[] = JSON.parse(data);
-        const filtered = messages.filter((m) => m.messageId !== messageId);
-        if (filtered.length !== messages.length) {
-          storage.set(key, JSON.stringify(filtered));
-          return;
-        }
-      }
-    }
+    return messagesDb.deleteMessage(messageId);
   }
 
-  // ============ Conversations ============
+  // Conversations
 
   async getConversations(params: {
     type: 'direct' | 'group';
@@ -226,7 +191,7 @@ export class MMKVAdapter implements StorageAdapter {
     storage.set(KEYS.CONVERSATIONS(conversation.type), JSON.stringify(filtered));
   }
 
-  // ============ User Config ============
+  // User Config
 
   async getUserConfig(address: string): Promise<UserConfig | undefined> {
     const data = storage.getString(KEYS.USER_CONFIG(address));
@@ -237,7 +202,7 @@ export class MMKVAdapter implements StorageAdapter {
     storage.set(KEYS.USER_CONFIG(userConfig.address), JSON.stringify(userConfig));
   }
 
-  // ============ Space Members ============
+  // Space Members
 
   async getSpaceMembers(spaceId: string): Promise<SpaceMember[]> {
     const data = storage.getString(KEYS.SPACE_MEMBERS(spaceId));
@@ -245,8 +210,24 @@ export class MMKVAdapter implements StorageAdapter {
   }
 
   async getSpaceMember(spaceId: string, address: string): Promise<SpaceMember | undefined> {
-    const members = await this.getSpaceMembers(spaceId);
-    return members.find((m) => m.address === address);
+    const key = KEYS.SPACE_MEMBERS(spaceId);
+    const data = storage.getString(key);
+    if (!data) return undefined;
+
+    const cached = this.memberIndexCache.get(spaceId);
+    if (cached && cached.raw === data) {
+      const idx = cached.index.get(address);
+      if (idx === undefined) return undefined;
+      const members: SpaceMember[] = JSON.parse(data);
+      return members[idx];
+    }
+
+    const members: SpaceMember[] = JSON.parse(data);
+    const index = new Map<string, number>();
+    members.forEach((m, i) => index.set(m.address, i));
+    this.memberIndexCache.set(spaceId, { index, raw: data });
+    const idx = index.get(address);
+    return idx !== undefined ? members[idx] : undefined;
   }
 
   async saveSpaceMember(spaceId: string, member: SpaceMember): Promise<void> {
@@ -258,9 +239,10 @@ export class MMKVAdapter implements StorageAdapter {
       members.push(member);
     }
     storage.set(KEYS.SPACE_MEMBERS(spaceId), JSON.stringify(members));
+    this.memberIndexCache.delete(spaceId);
   }
 
-  // ============ Sync Metadata ============
+  // Sync Metadata
 
   async getLastSyncTime(key: string): Promise<number | undefined> {
     const data = storage.getString(KEYS.SYNC_TIME(key));

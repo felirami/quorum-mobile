@@ -5,7 +5,7 @@
 import React, { useState } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, Share } from 'react-native';
 import * as Clipboard from 'expo-clipboard';
-import { useTheme } from '@/theme';
+import { useTheme, type AppTheme } from '@/theme';
 import { Button } from '@/components/ui/Button';
 import { Card } from '@/components/ui/Card';
 import { IconSymbol } from '@/components/ui/IconSymbol';
@@ -108,7 +108,7 @@ export function MnemonicDisplayView({
   );
 }
 
-const createStyles = (theme: any) =>
+const createStyles = (theme: AppTheme) =>
   StyleSheet.create({
     container: {
       flex: 1,

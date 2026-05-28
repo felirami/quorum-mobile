@@ -25,24 +25,39 @@ export function useUnifiedConversations(options?: { enabled?: boolean }): Unifie
   // Fetch Farcaster direct cast conversations
   const farcasterQuery = useFarcasterConversations({ enabled: options?.enabled });
 
-  // Merge and sort conversations by timestamp
-  const conversations = useMemo(() => {
-    const quorumConversations: Conversation[] = (
-      quorumQuery.data?.pages.flatMap((page) => page.conversations) ?? []
-    ).map((conv) => ({
+  // Extract pages arrays as stable dependencies
+  // This prevents re-computation when other query properties change
+  const quorumPages = quorumQuery.data?.pages;
+  const farcasterPages = farcasterQuery.data?.pages;
+
+  // Memoize quorum conversations separately to avoid recreating on every merge
+  const quorumConversations = useMemo(() => {
+    if (!quorumPages) return [];
+    return quorumPages.flatMap((page) => page.conversations).map((conv) => ({
       ...conv,
       source: 'quorum' as const,
     }));
+  }, [quorumPages]);
 
-    const farcasterConversations: Conversation[] =
-      farcasterQuery.data?.pages.flatMap((page) => page.conversations) ?? [];
+  // Memoize farcaster conversations separately
+  // Filter out conversations with no messages (purged on backend)
+  const farcasterConversations = useMemo(() => {
+    if (!farcasterPages) return [];
+    return farcasterPages
+      .flatMap((page) => page.conversations)
+      .filter((conv) => conv.lastMessagePreview != null);
+  }, [farcasterPages]);
 
-    // Merge both lists
-    const all = [...quorumConversations, ...farcasterConversations];
-
-    // Sort by timestamp (newest first)
-    return all.sort((a, b) => b.timestamp - a.timestamp);
-  }, [quorumQuery.data, farcasterQuery.data]);
+  // Merge and sort - only recomputes when either list changes
+  const conversations = useMemo(() => {
+    if (quorumConversations.length === 0 && farcasterConversations.length === 0) {
+      return [];
+    }
+    // Merge both lists and sort by timestamp (newest first)
+    return [...quorumConversations, ...farcasterConversations].sort(
+      (a, b) => b.timestamp - a.timestamp
+    );
+  }, [quorumConversations, farcasterConversations]);
 
   const isLoading = quorumQuery.isLoading || farcasterQuery.isLoading;
   const isRefreshing = quorumQuery.isRefetching || farcasterQuery.isRefetching;

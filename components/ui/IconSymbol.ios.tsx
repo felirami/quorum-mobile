@@ -24,6 +24,7 @@ export function IconSymbol({
         {
           width: size,
           height: size,
+          backgroundColor: 'transparent',
         },
         style,
       ]}

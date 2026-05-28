@@ -1,4 +1,3 @@
-import { logger } from '@quilibrium/quorum-shared';
 import { Dimensions } from 'react-native';
 import type { FeedFilter } from './types';
 
@@ -124,8 +123,8 @@ export async function lookupUserByUsername(username: string): Promise<number | n
       const json = await response.json();
       return json.result?.fid ?? null;
     }
-  } catch (e) {
-    logger.log('[lookupUserByUsername] Failed:', e);
+  } catch {
+    // Username lookup failed — return null below
   }
   return null;
 }

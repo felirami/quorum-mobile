@@ -1,15 +1,18 @@
-import React from 'react';
-import { Text, TouchableOpacity, View } from 'react-native';
+import type { AppTheme } from '@/theme';
+import React, { useMemo } from 'react';
+import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { IconSymbol } from '@/components/ui/IconSymbol';
+import { LikeIcon, getLikeIconType } from './LikeIcon';
 
 interface CastActionsProps {
   castHash: string;
+  castText: string;
   likeCount: number;
   replyCount: number;
   recastCount: number;
   isLiked: boolean;
   isRecast: boolean;
-  theme: any;
+  theme: AppTheme;
   likeStates: Map<string, { liked: boolean; count: number }>;
   onLikeToggle: (castHash: string, currentlyLiked: boolean, currentCount: number) => void;
   onReplyPress?: () => void;
@@ -18,8 +21,9 @@ interface CastActionsProps {
 /**
  * Like, reply, and recast action buttons for a cast.
  */
-export function CastActions({
+export const CastActions = React.memo(function CastActions({
   castHash,
+  castText,
   likeCount,
   replyCount,
   recastCount,
@@ -34,50 +38,71 @@ export function CastActions({
   const liked = optimistic?.liked ?? isLiked;
   const count = optimistic?.count ?? likeCount;
 
+  // Determine the like icon type based on cast text
+  const likeIconType = useMemo(() => getLikeIconType(castText), [castText]);
+
   return (
-    <View style={{ flexDirection: 'row', gap: 16, marginTop: 4 }}>
+    <View style={styles.container}>
       <TouchableOpacity
-        style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}
+        style={styles.actionButton}
         onPress={() => onLikeToggle(castHash, liked, count)}
       >
-        <IconSymbol
-          name={liked ? 'heart.fill' : 'heart'}
-          color={liked ? theme.colors.danger : theme.colors.textMuted}
+        <LikeIcon
+          type={likeIconType}
+          isLiked={liked}
+          color={theme.colors.textMuted}
+          activeColor={theme.colors.danger}
           size={16}
         />
         {count > 0 && (
-          <Text style={{ color: theme.colors.textMuted, fontSize: 13 }}>
+          <Text style={[styles.countText, { color: theme.colors.textMuted }]}>
             {count}
           </Text>
         )}
       </TouchableOpacity>
 
       <TouchableOpacity
-        style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}
+        style={styles.actionButton}
         onPress={onReplyPress}
       >
         <IconSymbol name="bubble.left" color={theme.colors.textMuted} size={16} />
         {replyCount > 0 && (
-          <Text style={{ color: theme.colors.textMuted, fontSize: 13 }}>
+          <Text style={[styles.countText, { color: theme.colors.textMuted }]}>
             {replyCount}
           </Text>
         )}
       </TouchableOpacity>
 
-      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+      <View style={styles.actionButton}>
         <IconSymbol
           name={isRecast ? 'arrowshape.turn.up.right.fill' : 'arrowshape.turn.up.right'}
           color={isRecast ? theme.colors.success : theme.colors.textMuted}
           size={16}
         />
         {recastCount > 0 && (
-          <Text style={{ color: theme.colors.textMuted, fontSize: 13 }}>
+          <Text style={[styles.countText, { color: theme.colors.textMuted }]}>
             {recastCount}
           </Text>
         )}
       </View>
     </View>
   );
-}
+});
+
+const styles = StyleSheet.create({
+  container: {
+    flexDirection: 'row',
+    gap: 16,
+    marginTop: 4,
+  },
+  actionButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  countText: {
+    fontSize: 13,
+  },
+});
 
 export default CastActions;

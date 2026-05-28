@@ -6,7 +6,7 @@ import {
   StyleProp,
   ViewStyle,
 } from 'react-native';
-import { useTheme } from '@/theme';
+import { useTheme, type AppTheme } from '@/theme';
 import { LinearGradient } from 'expo-linear-gradient';
 
 type CardVariant = 'default' | 'gradient' | 'bordered';
@@ -107,7 +107,7 @@ export function Card({
 }
 
 const createStyles = (
-  theme: any,
+  theme: AppTheme,
   isDark: boolean,
   variant: CardVariant,
   padding: CardPadding

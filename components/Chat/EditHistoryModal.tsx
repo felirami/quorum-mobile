@@ -1,0 +1,184 @@
+/**
+ * EditHistoryModal - Shows the edit history for a message with timestamps
+ */
+
+import type { AppTheme } from '@/theme';
+import React, { useMemo } from 'react';
+import {
+  View,
+  Text,
+  StyleSheet,
+  Modal,
+  Pressable,
+  ScrollView,
+  Dimensions,
+} from 'react-native';
+import { IconSymbol } from '@/components/ui/IconSymbol';
+import { formatTime } from './types';
+
+const { width: SCREEN_WIDTH } = Dimensions.get('window');
+
+interface EditEntry {
+  text: string | string[];
+  modifiedDate: number;
+  lastModifiedHash: string;
+}
+
+interface EditHistoryModalProps {
+  visible: boolean;
+  onClose: () => void;
+  originalText: string;
+  originalDate: number;
+  edits: EditEntry[];
+  theme: AppTheme;
+}
+
+export const EditHistoryModal = React.memo(function EditHistoryModal({
+  visible,
+  onClose,
+  originalText,
+  originalDate,
+  edits,
+  theme,
+}: EditHistoryModalProps) {
+  const styles = useMemo(() => createStyles(theme), [theme]);
+
+  // Build timeline: original + all edits, newest first
+  const timeline = useMemo(() => {
+    const entries = [
+      ...edits.map((edit, index) => ({
+        text: Array.isArray(edit.text) ? edit.text.join('\n') : edit.text,
+        date: edit.modifiedDate,
+        isOriginal: false,
+        index: index + 1,
+      })),
+      {
+        text: originalText,
+        date: originalDate,
+        isOriginal: true,
+        index: 0,
+      },
+    ];
+    // Sort newest first
+    entries.sort((a, b) => b.date - a.date);
+    return entries;
+  }, [originalText, originalDate, edits]);
+
+  if (!visible) return null;
+
+  return (
+    <Modal
+      visible={visible}
+      transparent
+      animationType="slide"
+      onRequestClose={onClose}
+    >
+      <View style={styles.overlay}>
+        <Pressable style={styles.backdrop} onPress={onClose} />
+        <View style={styles.container}>
+          <View style={styles.header}>
+            <Text style={styles.headerTitle}>Edit History</Text>
+            <Pressable onPress={onClose} hitSlop={8}>
+              <IconSymbol name="xmark" size={20} color={theme.colors.textMuted} />
+            </Pressable>
+          </View>
+
+          <ScrollView
+            style={styles.scrollView}
+            contentContainerStyle={styles.scrollContent}
+            showsVerticalScrollIndicator={false}
+          >
+            {timeline.map((entry, i) => (
+              <View key={`${entry.date}-${entry.index}`} style={styles.editEntry}>
+                <View style={styles.editHeader}>
+                  <Text style={styles.editLabel}>
+                    {entry.isOriginal ? 'Original' : `Edit #${entry.index}`}
+                  </Text>
+                  <Text style={styles.editTimestamp}>
+                    {formatTime(entry.date)}
+                  </Text>
+                </View>
+                <Text style={styles.editText}>{entry.text}</Text>
+                {i < timeline.length - 1 && <View style={styles.divider} />}
+              </View>
+            ))}
+          </ScrollView>
+        </View>
+      </View>
+    </Modal>
+  );
+});
+
+const createStyles = (theme: AppTheme) =>
+  StyleSheet.create({
+    overlay: {
+      flex: 1,
+      justifyContent: 'flex-end',
+    },
+    backdrop: {
+      ...StyleSheet.absoluteFillObject,
+      backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    },
+    container: {
+      backgroundColor: theme.colors.surface1 ?? theme.colors.background,
+      borderTopLeftRadius: 16,
+      borderTopRightRadius: 16,
+      maxHeight: '70%',
+      width: SCREEN_WIDTH,
+      paddingBottom: 34,
+    },
+    header: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      paddingHorizontal: 20,
+      paddingVertical: 16,
+      borderBottomWidth: 1,
+      borderBottomColor: theme.colors.border ?? theme.colors.surface3,
+    },
+    headerTitle: {
+      fontSize: 18,
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
+      color: theme.colors.textStrong,
+    },
+    scrollView: {
+      flex: 1,
+    },
+    scrollContent: {
+      padding: 16,
+    },
+    editEntry: {
+      marginBottom: 4,
+    },
+    editHeader: {
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      marginBottom: 6,
+    },
+    editLabel: {
+      fontSize: 13,
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
+      color: theme.colors.primary,
+    },
+    editTimestamp: {
+      fontSize: 12,
+      fontFamily: theme.fonts.regular.fontFamily,
+      color: theme.colors.textMuted,
+    },
+    editText: {
+      fontSize: 15,
+      fontFamily: theme.fonts.regular.fontFamily,
+      color: theme.colors.textMain,
+      lineHeight: 22,
+    },
+    divider: {
+      height: 1,
+      backgroundColor: theme.colors.border ?? theme.colors.surface3,
+      marginVertical: 12,
+    },
+  });
+
+export default EditHistoryModal;

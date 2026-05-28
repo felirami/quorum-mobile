@@ -7,15 +7,15 @@
  * - useValidateInvite: Query to validate and preview an invite link
  */
 
-import { logger } from '@quilibrium/quorum-shared';
 import { useAuth } from '@/context';
+import { base64ToHex, numberArrayToBase64 } from '@/utils/encoding';
 import { getQuorumClient } from '@/services/api/quorumClient';
 import { saveSpace, saveSpaceKey } from '@/services/config/spaceStorage';
 import { encryptionStateStorage } from '@/services/crypto/encryption-state-storage';
 import { NativeCryptoProvider } from '@/services/crypto/native-provider';
 import { getDeviceKeyset } from '@/services/onboarding/secureStorage';
 import { getMMKVAdapter } from '@/services/storage/mmkvAdapter';
-import { sha256 } from '@noble/hashes/sha2';
+import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex, hexToBytes, type Space } from '@quilibrium/quorum-shared';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import bs58 from 'bs58';
@@ -26,8 +26,13 @@ import { useEffect, useState } from 'react';
 const VALID_INVITE_PREFIXES = [
   'https://quorummessenger.com/i/',
   'https://www.quorummessenger.com/i/',
+  'https://app.quorummessenger.com/#',
+  'https://app.quorummessenger.com/invite/#',
   'http://localhost:3000/i/',
   'quorummessenger.com/i/',
+  'https://qm.one/',
+  'https://qm.one/invite/',
+  'qm.one/',
 ];
 
 interface ValidatedSpace {
@@ -120,30 +125,6 @@ function parseInviteLink(inviteLink: string): InviteInfo | null {
   }
 
   return null;
-}
-
-/**
- * Convert number array to base64 string
- */
-function numberArrayToBase64(arr: number[]): string {
-  const uint8 = new Uint8Array(arr);
-  let binary = '';
-  for (let i = 0; i < uint8.length; i++) {
-    binary += String.fromCharCode(uint8[i]);
-  }
-  return btoa(binary);
-}
-
-/**
- * Convert base64 string to hex
- */
-function base64ToHex(base64: string): string {
-  const binary = atob(base64);
-  let hex = '';
-  for (let i = 0; i < binary.length; i++) {
-    hex += binary.charCodeAt(i).toString(16).padStart(2, '0');
-  }
-  return hex;
 }
 
 /**
@@ -268,11 +249,84 @@ export function useJoinSpace() {
         new TextDecoder().decode(new Uint8Array(decryptResult))
       ) as Space;
 
+      // 1.5. Check if this is a public invite (missing template, secret, hubKey)
+      // If so, fetch the encrypted evaluation from the server and decrypt it
+      if (!inviteInfo.template && !inviteInfo.secret && !inviteInfo.hubKey) {
+        // Derive config public key from private key
+        const cfgPrivKeyBytes = hexToBytes(inviteInfo.configKey);
+        const cfgPrivKeyBase64 = btoa(String.fromCharCode(...cfgPrivKeyBytes));
+        const cfgPubKeyBase64 = await cryptoProvider.getPublicKeyX448(cfgPrivKeyBase64);
+        const cfgPubKeyBinary = atob(cfgPubKeyBase64);
+        let cfgPubKeyHex = '';
+        for (let i = 0; i < cfgPubKeyBinary.length; i++) {
+          cfgPubKeyHex += cfgPubKeyBinary.charCodeAt(i).toString(16).padStart(2, '0');
+        }
+
+        // Fetch encrypted evaluation from server
+        const evalResponse = await client.getInviteEval(cfgPubKeyHex);
+        if (!evalResponse) {
+          throw new Error('This public invite link is no longer valid.');
+        }
+
+        // The eval may have been encrypted under an ephemeral key DIFFERENT
+        // from the manifest's: every broadcastSpaceUpdate (kicks, role
+        // grants, settings edits, channel bindings) re-encrypts the manifest
+        // with a fresh ephemeral key but leaves the eval untouched. Use the
+        // eval's own eph key when the server provides it; only fall back to
+        // the manifest's key on legacy servers that don't yet return it.
+        const evalEphPubKeyBytes = evalResponse.ephemeralPublicKey
+          ? hexToBytes(evalResponse.ephemeralPublicKey)
+          : ephemeralPublicKeyBytes;
+
+        const evalCiphertext = JSON.parse(evalResponse.ciphertext) as {
+          ciphertext: string;
+          initialization_vector: string;
+          associated_data?: string;
+        };
+
+        const evalDecryptResult = await cryptoProvider.decryptInboxMessage({
+          inbox_private_key: configPrivateKeyBytes,
+          ephemeral_public_key: evalEphPubKeyBytes,
+          ciphertext: {
+            ciphertext: evalCiphertext.ciphertext,
+            initialization_vector: evalCiphertext.initialization_vector,
+            associated_data: evalCiphertext.associated_data,
+          },
+        });
+
+        const evalData = JSON.parse(
+          new TextDecoder().decode(new Uint8Array(evalDecryptResult))
+        ) as {
+          id: number;
+          secret: string;
+          template: string;
+          hubKey: string;
+        };
+
+        // Update inviteInfo with the decrypted values
+        inviteInfo.secret = evalData.secret;
+        inviteInfo.template = evalData.template;
+        inviteInfo.hubKey = evalData.hubKey;
+
+      }
+
       // 2. Save the space (both storages for compatibility)
       saveSpace(space);
       // Also save to mmkvAdapter so useSpaces hook can find it
       const adapter = getMMKVAdapter();
       await adapter.saveSpace(space);
+
+      // Mirror linkedFarcasterChannels (set by owner via Space Settings)
+      // into the local bindings MMKV so the picker hook surfaces them
+      // on first join — without this, only LIVE manifest broadcasts via
+      // WS would populate the bindings, missing the case where the owner
+      // bound a channel before the user joined.
+      const linkedFromManifest = (space as Space & { linkedFarcasterChannels?: unknown }).linkedFarcasterChannels;
+      if (Array.isArray(linkedFromManifest)) {
+        const keys = linkedFromManifest.filter((k): k is string => typeof k === 'string');
+        const { setSpaceBindings } = await import('@/services/space/channelBindings');
+        setSpaceBindings(space.spaceId, keys);
+      }
 
       // 3. Save config key - derive public key from private key
       const cfgPrivKeyBytes = hexToBytes(inviteInfo.configKey);
@@ -290,7 +344,6 @@ export function useJoinSpace() {
         publicKey: cfgPubKeyHex,
         privateKey: inviteInfo.configKey,
       });
-      logger.log('[JoinSpace] Saved config key with derived public key, length:', cfgPubKeyHex.length);
 
       // 4. Save hub key if provided
       if (inviteInfo.hubKey) {
@@ -313,8 +366,6 @@ export function useJoinSpace() {
           publicKey: hubPublicKeyHex,
           privateKey: inviteInfo.hubKey,
         });
-
-        logger.log('[JoinSpace] Saved hub key with derived public key');
       }
 
       // 5. Generate inbox keypair for this space
@@ -373,14 +424,9 @@ export function useJoinSpace() {
             inbox_public_key: inboxPublicKeyHex,
             inbox_signature: inboxSignatureHex,
           });
-
-          logger.log('[JoinSpace] Inbox registered with hub successfully');
         } catch (e) {
-          logger.log('[JoinSpace] Hub registration failed:', e);
-          // Continue without hub registration - can still send but won't receive
+          // Hub registration failed - can still send but won't receive
         }
-      } else {
-        logger.warn('[JoinSpace] Skipping hub registration - missing hubKey or hubAddress');
       }
 
       // 6.5. Save joiner as a member of the space
@@ -391,41 +437,32 @@ export function useJoinSpace() {
           profile_image: user.profileImage,
           inbox_address: inboxAddress,
         });
-        logger.log('[JoinSpace] Joiner saved as space member');
       }
 
       // 7. Process template and secret to build proper encryption state
+      // Track if this was a public invite (template came from server, not URL)
+      const isPublicInvite = !params.inviteLink.includes('template=');
+
       if (inviteInfo.template && inviteInfo.secret) {
         try {
           const conversationId = `${space.spaceId}/${space.spaceId}`;
-          logger.log('[JoinSpace] Processing template/secret for conversationId:', conversationId);
-          logger.log('[JoinSpace] Template hex length:', inviteInfo.template.length);
-          logger.log('[JoinSpace] Secret hex length:', inviteInfo.secret.length);
 
-          // Decode template from hex to JSON (matches desktop InvitationService line 662-664)
-          const templateHex = inviteInfo.template;
-          let templateJson = '';
-          for (let i = 0; i < templateHex.length; i += 2) {
-            templateJson += String.fromCharCode(parseInt(templateHex.substring(i, i + 2), 16));
+          // Decode template based on invite type:
+          // - Public invites: template is already a JSON string
+          // - Private invites: template is hex-encoded JSON (matches desktop InvitationService line 662-664)
+          let templateJson: string;
+          if (isPublicInvite) {
+            // Public invite - template is already JSON
+            templateJson = inviteInfo.template;
+          } else {
+            // Private invite - decode from hex
+            const templateHex = inviteInfo.template;
+            templateJson = '';
+            for (let i = 0; i < templateHex.length; i += 2) {
+              templateJson += String.fromCharCode(parseInt(templateHex.substring(i, i + 2), 16));
+            }
           }
-          logger.log('[JoinSpace] Decoded template JSON length:', templateJson.length);
-          logger.log('[JoinSpace] Template JSON preview:', templateJson.substring(0, 200));
-
           const template = JSON.parse(templateJson);
-          logger.log('[JoinSpace] Parsed template keys:', Object.keys(template));
-
-          // Log peer_id_map to debug AEAD errors
-          if (template.peer_id_map) {
-            logger.log('[JoinSpace] peer_id_map keys (base64):', Object.keys(template.peer_id_map));
-            logger.log('[JoinSpace] peer_id_map entries:', Object.entries(template.peer_id_map).length);
-          } else {
-            logger.warn('[JoinSpace] No peer_id_map in template!');
-          }
-          if (template.id_peer_map) {
-            logger.log('[JoinSpace] id_peer_map keys:', Object.keys(template.id_peer_map));
-          } else {
-            logger.warn('[JoinSpace] No id_peer_map in template!');
-          }
 
           // Generate new keypairs for this session (matches desktop lines 681-682)
           const secretPair = await cryptoProvider.generateX448();
@@ -433,9 +470,7 @@ export function useJoinSpace() {
 
           // Parse and modify dkg_ratchet (matches desktop lines 683-708)
           const ratchet = JSON.parse(template.dkg_ratchet);
-          logger.log('[JoinSpace] Original ratchet.id:', ratchet.id, 'ratchet.total:', ratchet.total);
           ratchet.total++;
-          logger.log('[JoinSpace] After increment, ratchet.total:', ratchet.total);
 
           // Set secret from keypair
           ratchet.secret = btoa(String.fromCharCode(...secretPair.private_key));
@@ -460,25 +495,19 @@ export function useJoinSpace() {
           // This is critical for Triple Ratchet encryption to work
           const deviceKeyset = await getDeviceKeyset();
           if (!deviceKeyset) {
-            logger.log('[JoinSpace] Device keyset not found - cannot set peer_key');
             throw new Error('Device keyset not found');
           }
-          logger.log('[JoinSpace] Setting peer_key from device inbox encryption key, length:', deviceKeyset.inboxEncryptionPrivateKey.length);
 
           // Convert our public key to base64 (same format as peer_id_map keys)
           const ourPublicKeyBase64 = btoa(String.fromCharCode(...deviceKeyset.inboxEncryptionPublicKey));
-          logger.log('[JoinSpace] Our inbox encryption public key (base64):', ourPublicKeyBase64);
 
           // Check if our key is in the peer_id_map
           if (template.peer_id_map) {
             const ourPeerId = template.peer_id_map[ourPublicKeyBase64];
-            if (ourPeerId !== undefined) {
-              logger.log('[JoinSpace] Our key IS in peer_id_map with ID:', ourPeerId);
-            } else {
+            if (ourPeerId === undefined) {
               // Our key is NOT in the peer_id_map - this is expected for generic invite links
               // We need to add ourselves with the ID from our dkg_ratchet
               const ourId = ratchet.id;
-              logger.log('[JoinSpace] Adding ourselves to peer_id_map with ID:', ourId);
 
               // Add our entry to peer_id_map (maps our public key to our ID)
               template.peer_id_map[ourPublicKeyBase64] = ourId;
@@ -493,27 +522,13 @@ export function useJoinSpace() {
                 identity_public_key: btoa(String.fromCharCode(...deviceKeyset.identityPublicKey)),
                 signed_pre_public_key: btoa(String.fromCharCode(...deviceKeyset.preKeyPublicKey)),
               };
-
-              logger.log('[JoinSpace] peer_id_map now has entries:', Object.keys(template.peer_id_map).length);
-              logger.log('[JoinSpace] id_peer_map now has entries:', Object.keys(template.id_peer_map).length);
             }
-          } else {
-            logger.log('[JoinSpace] No peer_id_map in template - cannot set up encryption');
           }
 
           template.peer_key = btoa(String.fromCharCode(...deviceKeyset.inboxEncryptionPrivateKey));
 
           // Set ephemeral private key - Rust expects sending_ephemeral_private_key
-          logger.log('[JoinSpace] Setting sending_ephemeral_private_key, length:', ephPair.private_key.length);
           template.sending_ephemeral_private_key = btoa(String.fromCharCode(...ephPair.private_key));
-
-          // Note: We do NOT add ourselves to receiving_ephemeral_keys
-          // receiving_ephemeral_keys is used to decrypt messages FROM other participants
-          // When we receive a message from the creator, the Rust code will:
-          // 1. See that the sender is not in receiving_ephemeral_keys
-          // 2. Call ratchet_receiver_ephemeral_keys to bootstrap their chain key
-          // 3. This requires receiving_group_key to be set (which should come from template)
-          logger.log('[JoinSpace] receiving_ephemeral_keys has:', template.receiving_ephemeral_keys ? Object.keys(template.receiving_ephemeral_keys).length : 0, 'entries from template');
 
           // Build nested session structure (matches desktop lines 709-714)
           const session = {
@@ -521,44 +536,6 @@ export function useJoinSpace() {
           };
 
           const finalState = JSON.stringify(session);
-          logger.log('[JoinSpace] Final state length:', finalState.length);
-          logger.log('[JoinSpace] Final state preview:', finalState.substring(0, 300));
-
-          // Log critical fields for debugging AEAD errors
-          logger.log('[JoinSpace] DEBUG template keys:', Object.keys(template));
-          logger.log('[JoinSpace] DEBUG root_key exists:', !!template.root_key);
-          logger.log('[JoinSpace] DEBUG root_key preview:', template.root_key?.substring?.(0, 30));
-          logger.log('[JoinSpace] DEBUG root_key length:', template.root_key?.length);
-          logger.log('[JoinSpace] DEBUG peer_key set to length:', template.peer_key?.length);
-          logger.log('[JoinSpace] DEBUG sending_ephemeral_private_key set to length:', template.sending_ephemeral_private_key?.length);
-          logger.log('[JoinSpace] DEBUG receiving_ephemeral_keys:', template.receiving_ephemeral_keys ? Object.keys(template.receiving_ephemeral_keys).length : 'MISSING');
-          logger.log('[JoinSpace] DEBUG receiving_group_key exists:', !!template.receiving_group_key);
-          logger.log('[JoinSpace] DEBUG receiving_group_key preview:', template.receiving_group_key?.substring?.(0, 30));
-          logger.log('[JoinSpace] DEBUG sending_chain_key exists:', !!template.sending_chain_key);
-          logger.log('[JoinSpace] DEBUG sending_chain_key preview:', template.sending_chain_key?.substring?.(0, 30));
-          logger.log('[JoinSpace] DEBUG receiving_chain_key exists:', !!template.receiving_chain_key);
-          logger.log('[JoinSpace] DEBUG receiving_chain_key entries:', template.receiving_chain_key ? Object.keys(template.receiving_chain_key).length : 'MISSING');
-          logger.log('[JoinSpace] DEBUG TEMPLATE current_header_key exists:', !!template.current_header_key);
-          logger.log('[JoinSpace] DEBUG TEMPLATE current_header_key FULL:', template.current_header_key);
-          logger.log('[JoinSpace] DEBUG TEMPLATE current_header_key length:', template.current_header_key?.length);
-          logger.log('[JoinSpace] DEBUG TEMPLATE next_header_key exists:', !!template.next_header_key);
-          logger.log('[JoinSpace] DEBUG TEMPLATE next_header_key FULL:', template.next_header_key);
-          logger.log('[JoinSpace] DEBUG should_ratchet:', template.should_ratchet);
-          // Check async DKG fields - these affect header key changes
-          logger.log('[JoinSpace] DEBUG async_dkg_ratchet:', template.async_dkg_ratchet);
-          logger.log('[JoinSpace] DEBUG async_dkg_pubkey exists:', !!template.async_dkg_pubkey);
-          logger.log('[JoinSpace] DEBUG should_dkg_ratchet:', template.should_dkg_ratchet ? Object.keys(template.should_dkg_ratchet).length : 'N/A');
-          logger.log('[JoinSpace] DEBUG threshold:', template.threshold);
-          logger.log('[JoinSpace] DEBUG dkg_ratchet.id:', ratchet.id);
-          logger.log('[JoinSpace] DEBUG dkg_ratchet.total:', ratchet.total);
-          logger.log('[JoinSpace] DEBUG dkg_ratchet.round:', ratchet.round);
-          logger.log('[JoinSpace] DEBUG dkg_ratchet.threshold:', ratchet.threshold);
-          logger.log('[JoinSpace] DEBUG dkg_ratchet.scalar preview:', ratchet.scalar?.substring?.(0, 30));
-          logger.log('[JoinSpace] DEBUG dkg_ratchet.scalar length:', ratchet.scalar?.length);
-          logger.log('[JoinSpace] DEBUG dkg_ratchet.point type:', typeof ratchet.point);
-          logger.log('[JoinSpace] DEBUG dkg_ratchet.point preview:', JSON.stringify(ratchet.point)?.substring?.(0, 50));
-          logger.log('[JoinSpace] DEBUG dkg_ratchet.secret preview:', ratchet.secret?.substring?.(0, 30));
-          logger.log('[JoinSpace] DEBUG dkg_ratchet.public_key preview:', ratchet.public_key?.substring?.(0, 30));
 
           // Save as double-nested JSON (state contains JSON of session which contains JSON of template)
           encryptionStateStorage.saveEncryptionState({
@@ -570,15 +547,12 @@ export function useJoinSpace() {
 
           // Also save as fallback state - this is the original working state before any evolution
           // Desktop may not advance its ratchet, so we need this for decrypting its messages
-          logger.log('[JoinSpace] Saving initial state as fallback for future decrypts');
           encryptionStateStorage.saveFallbackState({
             conversationId,
             inboxId: inboxAddress,
             state: finalState,
             timestamp: Date.now(),
           });
-
-          logger.log('[JoinSpace] Processed template/secret and saved encryption state');
 
           // 9. Prepare join control message to announce ourselves to other participants
           // This is critical for other members to be able to:
@@ -641,24 +615,13 @@ export function useJoinSpace() {
               signature: signatureBase64,
             };
 
-            logger.log('[JoinSpace] Prepared join participant:', {
-              address: participant.address,
-              id: participant.id,
-              inboxAddress: participant.inboxAddress,
-              pubKeyLength: participant.pubKey.length,
-              inboxKeyLength: participant.inboxKey.length,
-            });
-
             // Create the join message envelope
             const joinMessageEnvelope = await sendJoinMessage({
               spaceId: space.spaceId,
               participant,
             });
 
-            logger.log('[JoinSpace] Join message envelope created, length:', joinMessageEnvelope.length);
-
             // Return the join message to be sent via WebSocket
-            logger.log('[JoinSpace] Successfully joined space:', space.spaceName);
             return {
               spaceId: space.spaceId,
               channelId: space.defaultChannelId,
@@ -666,21 +629,12 @@ export function useJoinSpace() {
               joinMessageEnvelope: joinMessageEnvelope,
             };
           } catch (joinMsgError) {
-            logger.log('[JoinSpace] Failed to create join message:', joinMsgError);
-            // Continue without join message - others won't be able to see us properly
+            // Failed to create join message - others won't be able to see us properly
           }
         } catch (e) {
-          logger.log('[JoinSpace] Failed to process template/secret:', e);
-          if (e instanceof Error) {
-            logger.log('[JoinSpace] Error details:', e.message, e.stack);
-          }
-          // Continue without encryption state - space can still be viewed but not send messages
+          // Failed to process template/secret - space can still be viewed but not send messages
         }
-      } else {
-        logger.warn('[JoinSpace] No template/secret in invite - cannot set up encryption');
       }
-
-      logger.log('[JoinSpace] Successfully joined space:', space.spaceName);
 
       return {
         spaceId: space.spaceId,

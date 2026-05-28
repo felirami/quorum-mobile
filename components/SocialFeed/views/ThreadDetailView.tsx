@@ -1,32 +1,40 @@
-import React, { useState } from 'react';
+import type { AppTheme } from '@/theme';
+import React, { useMemo, useState } from 'react';
 import {
   ActivityIndicator,
-  Image,
   ScrollView,
+  StyleSheet,
   Text,
   TouchableOpacity,
   View,
 } from 'react-native';
+import { CachedAvatar } from '@/components/ui/CachedAvatar';
 import { IconSymbol } from '@/components/ui/IconSymbol';
-import { useFarcasterThread, type FlattenedCast } from '@/hooks/useFarcasterThread';
+import { parseFarcasterUrl, useFarcasterThread, type FlattenedCast } from '@/hooks/useFarcasterThread';
 import type { EmbeddedCast } from '@/hooks/useFarcasterFeed';
-import { ImageViewer, AutoHeightImage, ImageCarousel, VideoPlayer } from '../media';
-import { CastText, LinkPreview, QuoteCast, FrameEmbed } from '../content';
+import { ImageViewer, AutoHeightImage, ImageCarousel, VideoPlayer, YouTubeEmbed, parseYouTubeUrl, extractYouTubeMatchesFromText } from '../media';
+import { CastText, LinkPreview, QuoteCast, FrameEmbed, LikeIcon, getLikeIconType, SnapEmbed, useSnapDetection } from '../content';
+import { QuorumIdentityBadge } from '../content/QuorumIdentityBadge';
 import { SCREEN_HEIGHT, formatTimestamp, lookupUserByUsername } from '../utils';
 
-const AVATAR_FALLBACK = require('@/assets/images/quorum-symbol-bg-blue.png');
 
 interface ThreadDetailViewProps {
   username: string;
   castHashPrefix: string;
   token?: string;
-  theme: any;
+  currentUserFid?: number;
+  theme: AppTheme;
   onClose: () => void;
   onOpenMiniApp: (url: string) => void;
   onOpenProfile: (fid: number, username?: string) => void;
   onOpenChannel: (channelKey: string) => void;
   likeStates: Map<string, { liked: boolean; count: number }>;
   onLikeToggle: (castHash: string, currentlyLiked: boolean, currentCount: number) => void;
+  followStates: Map<number, boolean>;
+  onFollow: (fid: number) => void;
+  /** Report any cast in the thread (main + replies). When undefined the
+   *  flag icon is hidden. */
+  onReport?: (castHash: string, castAuthorFid?: number) => void;
   bottomInset?: number;
 }
 
@@ -34,6 +42,7 @@ export function ThreadDetailView({
   username,
   castHashPrefix,
   token,
+  currentUserFid,
   theme,
   onClose,
   onOpenMiniApp,
@@ -41,16 +50,21 @@ export function ThreadDetailView({
   onOpenChannel,
   likeStates,
   onLikeToggle,
+  followStates,
+  onFollow,
+  onReport,
   bottomInset = 0,
 }: ThreadDetailViewProps) {
-  const { mainCast, replies, isLoading, error, channelContext } = useFarcasterThread({
+  const { parentCasts, mainCast, replies, isLoading, error, channelContext } = useFarcasterThread({
     username,
     castHashPrefix,
     token,
   });
 
-  const [viewerImage, setViewerImage] = useState<string | null>(null);
+  const [viewerState, setViewerState] = useState<{ images: string[]; index: number } | null>(null);
   const [selectedThread, setSelectedThread] = useState<{ username: string; castHashPrefix: string } | null>(null);
+
+  const styles = useMemo(() => createStyles(theme), [theme]);
 
   const handleMentionPress = async (mentionUsername: string) => {
     const fid = await lookupUserByUsername(mentionUsername);
@@ -67,17 +81,26 @@ export function ThreadDetailView({
     const videos = (cast.embeds?.videos ?? []).filter((v) => v.url && v.thumbnailUrl);
     const hasVideos = videos.length > 0;
 
-    const frameEmbeds = (cast.embeds?.urls ?? [])
-      .filter((u) => u.openGraph?.frameEmbedNext?.frameEmbed)
-      .map((u) => ({
-        imageUrl: u.openGraph!.frameEmbedNext!.frameEmbed!.imageUrl!,
-        buttonTitle: u.openGraph!.frameEmbedNext!.frameEmbed!.button?.title ?? 'Open',
-        actionUrl: u.openGraph!.frameEmbedNext!.frameEmbed!.button?.action?.url ?? u.openGraph!.url!,
-      }))
-      .filter((f) => f.imageUrl);
-
+    // Each URL embed renders exactly once: snap detection + frame fallback +
+    // link preview happen inline below, so we don't split into separate lists.
+    const frameEmbeds: { imageUrl: string; buttonTitle: string; actionUrl: string }[] = [];
+    const embeddedCasts = cast.embeds?.casts ?? [];
     const urlPreviews = (cast.embeds?.urls ?? [])
-      .filter((u) => u.openGraph?.title && !u.openGraph?.frameEmbedNext?.frameEmbed);
+      .filter((u) => {
+        if (u.openGraph?.frameEmbedNext?.frameUrl || u.openGraph?.frameEmbedNext?.frameEmbed?.imageUrl) return true;
+        const url = u.openGraph?.url || u.openGraph?.sourceUrl || '';
+        // Drop farcaster.xyz cast links that are already shown as a quote cast
+        if (url.includes('farcaster.xyz/')) {
+          const parsed = parseFarcasterUrl(url);
+          if (parsed) {
+            const alreadyEmbedded = embeddedCasts.some((c: any) =>
+              c?.hash?.toLowerCase().startsWith(parsed.castHashPrefix.toLowerCase())
+            );
+            if (alreadyEmbedded) return false;
+          }
+        }
+        return u.openGraph?.title;
+      });
 
     const isNested = cast.depth > 0;
     const borderWidth = isNested ? Math.min(cast.depth * 2, 6) : 0;
@@ -112,42 +135,52 @@ export function ThreadDetailView({
         }}
       >
         {/* Header row */}
-        <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+        <View style={staticStyles.row}>
           {isMain && (
-            <TouchableOpacity onPress={onClose} style={{ marginRight: 12 }}>
+            <TouchableOpacity onPress={onClose} style={staticStyles.backButton}>
               <IconSymbol name="chevron.left" color={theme.colors.textMain} size={24} />
             </TouchableOpacity>
           )}
-          <TouchableOpacity onPress={() => onOpenProfile(cast.author.fid, cast.author.username)}>
-            <Image
-              source={cast.author.pfp?.url ? { uri: cast.author.pfp.url } : AVATAR_FALLBACK}
-              style={{
-                width: 44,
-                height: 44,
-                borderRadius: 22,
-                marginRight: 12,
-                backgroundColor: theme.colors.surface3,
-              }}
-            />
-          </TouchableOpacity>
-          <View style={{ flex: 1 }}>
-            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+          <View style={staticStyles.avatarContainer}>
+            <TouchableOpacity onPress={() => onOpenProfile(cast.author.fid, cast.author.username)}>
+              <CachedAvatar
+                source={cast.author.pfp?.url ? { uri: cast.author.pfp.url } : null}
+                style={styles.avatar}
+              />
+            </TouchableOpacity>
+            {/* Follow button - show when not following and has valid fid */}
+            {(() => {
+              const isFollowing = followStates.get(cast.author.fid) ?? (cast.author.viewerContext?.following === false ? false : true);
+              return !isFollowing && cast.author.fid > 0 && (
+                <TouchableOpacity
+                  style={styles.followBadge}
+                  onPress={() => onFollow(cast.author.fid)}
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                >
+                  <IconSymbol name="plus" size={10} color="#fff" />
+                </TouchableOpacity>
+              );
+            })()}
+          </View>
+          <View style={staticStyles.flex1}>
+            <View style={staticStyles.rowGap6}>
               <TouchableOpacity onPress={() => onOpenProfile(cast.author.fid, cast.author.username)}>
-                <Text style={{ color: theme.colors.textStrong, fontWeight: '600', fontSize: 15 }}>
+                <Text style={styles.displayName}>
                   {cast.author.displayName}
                 </Text>
               </TouchableOpacity>
               {channelName && (
                 <TouchableOpacity onPress={() => onOpenChannel(channelName)}>
-                  <Text style={{ color: theme.colors.accent, fontSize: 13 }}>
+                  <Text style={styles.channelName}>
                     /{channelName}
                   </Text>
                 </TouchableOpacity>
               )}
             </View>
-            <Text style={{ color: theme.colors.textMuted, fontSize: 13, marginTop: 2 }}>
+            <Text style={styles.usernameTimestamp}>
               @{cast.author.username} • {formatTimestamp(cast.timestamp)}
             </Text>
+            <QuorumIdentityBadge fid={cast.author.fid} theme={theme} compact />
           </View>
         </View>
 
@@ -160,16 +193,16 @@ export function ThreadDetailView({
           if (!showUrlContext && !showUserContext) return null;
 
           return (
-            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+            <View style={staticStyles.rowGap6}>
               <IconSymbol
                 name={showUrlContext ? 'link' : 'arrowshape.turn.up.left'}
                 color={theme.colors.textMuted}
                 size={14}
               />
               {showUrlContext ? (
-                <Text style={{ color: theme.colors.textMuted, fontSize: 13 }} numberOfLines={1}>
+                <Text style={styles.mutedText13} numberOfLines={1}>
                   replying to{' '}
-                  <Text style={{ color: theme.colors.accent }}>
+                  <Text style={styles.accentText}>
                     {(() => {
                       try {
                         return new URL(cast.parentUrl!).hostname.replace('www.', '');
@@ -180,8 +213,8 @@ export function ThreadDetailView({
                   </Text>
                 </Text>
               ) : (
-                <Text style={{ color: theme.colors.textMuted, fontSize: 13 }}>
-                  replying to <Text style={{ color: theme.colors.accent }}>@{cast.parentAuthor!.username}</Text>
+                <Text style={styles.mutedText13}>
+                  replying to <Text style={styles.accentText}>@{cast.parentAuthor!.username}</Text>
                 </Text>
               )}
             </View>
@@ -192,7 +225,7 @@ export function ThreadDetailView({
         {cast.text.length > 0 && (
           <CastText
             text={cast.text}
-            style={{ color: theme.colors.textMain, fontSize: 15, lineHeight: 20 }}
+            style={styles.castText}
             theme={theme}
             onMentionPress={handleMentionPress}
             onChannelPress={onOpenChannel}
@@ -206,15 +239,15 @@ export function ThreadDetailView({
               <AutoHeightImage
                 uri={imageUrls[0]}
                 maxHeight={SCREEN_HEIGHT * 0.8}
-                style={{ backgroundColor: theme.colors.surface3 }}
-                onPress={() => setViewerImage(imageUrls[0])}
+                style={styles.imageBg}
+                onPress={() => setViewerState({ images: imageUrls, index: 0 })}
               />
             ) : (
               <ImageCarousel
                 urls={imageUrls}
                 maxHeight={SCREEN_HEIGHT * 0.8}
                 theme={theme}
-                onImagePress={setViewerImage}
+                onImagePress={(_, index) => setViewerState({ images: imageUrls, index })}
               />
             )}
           </View>
@@ -254,29 +287,31 @@ export function ThreadDetailView({
 
         {/* URL previews */}
         {urlPreviews.length > 0 && (
-          <View style={{ gap: 8 }}>
-            {urlPreviews.map((urlEmbed, index) => {
-              const linkUrl = urlEmbed.openGraph?.url || urlEmbed.openGraph?.sourceUrl;
-              return (
-                <LinkPreview
-                  key={index}
-                  url={linkUrl}
-                  title={urlEmbed.openGraph?.title}
-                  description={urlEmbed.openGraph?.description}
-                  domain={urlEmbed.openGraph?.domain}
-                  image={urlEmbed.openGraph?.image}
-                  useLargeImage={urlEmbed.openGraph?.useLargeImage}
-                  theme={theme}
-                  onPress={linkUrl ? () => onOpenMiniApp(linkUrl) : undefined}
-                />
-              );
-            })}
+          <View style={staticStyles.gap8}>
+            {urlPreviews.map((urlEmbed, index) => (
+              <ThreadUrlEmbed
+                key={index}
+                urlEmbed={urlEmbed}
+                theme={theme}
+                token={token}
+                currentUserFid={currentUserFid}
+                onOpenMiniApp={onOpenMiniApp}
+                onOpenProfile={onOpenProfile}
+              />
+            ))}
           </View>
         )}
 
+        {/* Inline YouTube URLs in cast text (deduped against explicit embeds) */}
+        <InlineYouTubeFromText
+          text={cast.text}
+          excludeUrls={(cast.embeds?.urls ?? []).map((u: any) => u.openGraph?.url ?? u.openGraph?.sourceUrl)}
+          theme={theme}
+        />
+
         {/* Quote casts */}
         {cast.embeds?.casts && cast.embeds.casts.length > 0 && (
-          <View style={{ gap: 8 }}>
+          <View style={staticStyles.gap8}>
             {cast.embeds.casts.map((embeddedCast, index) => (
               <QuoteCast
                 key={index}
@@ -292,63 +327,292 @@ export function ThreadDetailView({
         )}
 
         {/* Stats row */}
-        <View style={{ flexDirection: 'row', gap: 16, marginTop: 4 }}>
+        <View style={staticStyles.statsRow}>
           <TouchableOpacity
-            style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}
+            style={staticStyles.rowGap6}
             onPress={() => onLikeToggle(cast.hash, isLiked, likeCount)}
           >
-            <IconSymbol
-              name={isLiked ? 'heart.fill' : 'heart'}
-              color={isLiked ? theme.colors.danger : theme.colors.textMuted}
+            <LikeIcon
+              type={getLikeIconType(cast.text)}
+              isLiked={isLiked}
+              color={theme.colors.textMuted}
+              activeColor={theme.colors.danger}
               size={16}
             />
             {likeCount > 0 && (
-              <Text style={{ color: theme.colors.textMuted, fontSize: 13 }}>{likeCount}</Text>
+              <Text style={styles.mutedText13}>{likeCount}</Text>
             )}
           </TouchableOpacity>
-          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+          <View style={staticStyles.rowGap6}>
             <IconSymbol name="bubble.left" color={theme.colors.textMuted} size={16} />
             {(cast.replies?.count ?? 0) > 0 && (
-              <Text style={{ color: theme.colors.textMuted, fontSize: 13 }}>{cast.replies?.count}</Text>
+              <Text style={styles.mutedText13}>{cast.replies?.count}</Text>
             )}
           </View>
+          {onReport && (
+            <TouchableOpacity
+              style={staticStyles.rowGap6}
+              onPress={() => onReport(cast.hash, cast.author?.fid)}
+              hitSlop={8}
+            >
+              <IconSymbol name="flag" color={theme.colors.textMuted} size={16} />
+            </TouchableOpacity>
+          )}
         </View>
       </View>
     );
   };
 
   return (
-    <View style={{ flex: 1, backgroundColor: theme.colors.background }}>
-      {isLoading && (
-        <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
-          <ActivityIndicator color={theme.colors.accent} />
+    <View style={styles.container}>
+      {error && !mainCast && (
+        <View style={staticStyles.errorContainer}>
+          <Text style={styles.errorText}>{error}</Text>
         </View>
       )}
 
-      {error && (
-        <View style={{ padding: 20 }}>
-          <Text style={{ color: theme.colors.danger }}>{error}</Text>
-        </View>
-      )}
-
-      {mainCast && (
-        <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: 32 + bottomInset }}>
+      {mainCast ? (
+        <ScrollView style={staticStyles.flex1} contentContainerStyle={{ paddingBottom: 32 + bottomInset }}>
+          {/* Parent chain — when the user taps a reply notification we
+              land on the reply, but they need the conversation context
+              above it to make sense of the thread. Parent casts are
+              rendered above the main cast at depth 0, dimmed slightly
+              by the same `depth` shading the renderer applies to
+              nested replies, so the visual hierarchy is "context →
+              target → discussion". */}
+          {parentCasts.length > 0 && (
+            <View>
+              {parentCasts.map((parent) => renderCast({ ...parent, depth: 0 }))}
+            </View>
+          )}
           {renderCast({ ...mainCast, depth: 0 }, true)}
+          {isLoading && replies.length === 0 && (
+            <View style={{ padding: 24, alignItems: 'center' }}>
+              <ActivityIndicator color={theme.colors.accent} />
+            </View>
+          )}
           {replies.length > 0 && (
             <View>
               {replies.map((reply) => renderCast(reply))}
             </View>
           )}
         </ScrollView>
-      )}
+      ) : isLoading ? (
+        <View style={staticStyles.centered}>
+          <ActivityIndicator color={theme.colors.accent} />
+        </View>
+      ) : null}
 
       <ImageViewer
-        visible={viewerImage !== null}
-        imageUrl={viewerImage}
-        onClose={() => setViewerImage(null)}
+        visible={viewerState !== null}
+        images={viewerState?.images}
+        initialIndex={viewerState?.index}
+        onClose={() => setViewerState(null)}
       />
     </View>
   );
 }
 
 export default ThreadDetailView;
+
+/**
+ * Routes a single URL embed to the right renderer: SnapEmbed if the URL
+ * responds with snap content-type, otherwise FrameEmbed if frame metadata is
+ * present, otherwise a plain LinkPreview.
+ */
+function InlineYouTubeFromText({
+  text,
+  excludeUrls,
+  theme,
+}: {
+  text: string | undefined;
+  excludeUrls: (string | undefined)[];
+  theme: AppTheme;
+}) {
+  const matches = useMemo(
+    () => extractYouTubeMatchesFromText(text, excludeUrls),
+    [text, excludeUrls],
+  );
+  if (matches.length === 0) return null;
+  return (
+    <View style={staticStyles.gap8}>
+      {matches.map(({ url, match }) => (
+        <YouTubeEmbed
+          key={url}
+          videoId={match.videoId}
+          playlistId={match.playlistId}
+          theme={theme}
+        />
+      ))}
+    </View>
+  );
+}
+
+function ThreadUrlEmbed({
+  urlEmbed,
+  theme,
+  token,
+  currentUserFid,
+  onOpenMiniApp,
+  onOpenProfile,
+}: {
+  urlEmbed: any;
+  theme: AppTheme;
+  token?: string;
+  currentUserFid?: number;
+  onOpenMiniApp: (url: string) => void;
+  onOpenProfile: (fid: number, username?: string) => void;
+}) {
+  const linkUrl: string | undefined = urlEmbed.openGraph?.url || urlEmbed.openGraph?.sourceUrl;
+  const snapUrl: string | undefined = urlEmbed.openGraph?.frameEmbedNext?.frameUrl;
+  const candidateUrl = snapUrl || linkUrl;
+  const isSnap = useSnapDetection(candidateUrl);
+
+  if (isSnap === true && candidateUrl) {
+    return (
+      <SnapEmbed
+        url={candidateUrl}
+        theme={theme}
+        token={token}
+        userFid={currentUserFid}
+        onOpenUrl={(u) => onOpenMiniApp(u)}
+        onOpenProfile={(fid) => onOpenProfile(fid)}
+        onOpenMiniApp={(u) => onOpenMiniApp(u)}
+      />
+    );
+  }
+
+  const youTube = parseYouTubeUrl(linkUrl);
+  if (youTube) {
+    return <YouTubeEmbed videoId={youTube.videoId} playlistId={youTube.playlistId} theme={theme} />;
+  }
+
+  const frameEmbed = urlEmbed.openGraph?.frameEmbedNext?.frameEmbed;
+  const frameImageUrl: string | undefined = frameEmbed?.imageUrl;
+  const frameAction: string | undefined = frameEmbed?.button?.action?.url ?? linkUrl;
+  if (frameImageUrl && frameAction) {
+    return (
+      <FrameEmbed
+        imageUrl={frameImageUrl}
+        buttonTitle={frameEmbed?.button?.title ?? 'Open'}
+        actionUrl={frameAction}
+        theme={theme}
+        onPress={() => onOpenMiniApp(frameAction)}
+      />
+    );
+  }
+
+  return (
+    <LinkPreview
+      url={linkUrl}
+      title={urlEmbed.openGraph?.title}
+      description={urlEmbed.openGraph?.description}
+      domain={urlEmbed.openGraph?.domain}
+      image={urlEmbed.openGraph?.image}
+      useLargeImage={urlEmbed.openGraph?.useLargeImage}
+      theme={theme}
+      onPress={linkUrl ? () => onOpenMiniApp(linkUrl) : undefined}
+    />
+  );
+}
+
+const staticStyles = StyleSheet.create({
+  row: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  rowGap6: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  backButton: {
+    marginRight: 12,
+  },
+  avatarContainer: {
+    position: 'relative',
+    marginRight: 12,
+  },
+  flex1: {
+    flex: 1,
+  },
+  gap8: {
+    gap: 8,
+  },
+  statsRow: {
+    flexDirection: 'row',
+    gap: 16,
+    marginTop: 4,
+  },
+  centered: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  errorContainer: {
+    padding: 20,
+  },
+});
+
+function createStyles(theme: AppTheme) {
+  return StyleSheet.create({
+    container: {
+      flex: 1,
+      // Match the rest of the social feed surfaces — using `background`
+      // here left the loading state showing a different color from the
+      // outer feed/thread overlays which use surface1.
+      backgroundColor: theme.colors.surface1,
+    },
+    avatar: {
+      width: 44,
+      height: 44,
+      borderRadius: 22,
+      backgroundColor: theme.colors.surface3,
+    },
+    followBadge: {
+      position: 'absolute',
+      bottom: -2,
+      right: -2,
+      width: 18,
+      height: 18,
+      borderRadius: 9,
+      alignItems: 'center',
+      justifyContent: 'center',
+      backgroundColor: theme.colors.primary,
+      borderWidth: 2,
+      borderColor: theme.colors.background,
+    },
+    displayName: {
+      color: theme.colors.textStrong,
+      fontWeight: '600',
+      fontSize: 15,
+    },
+    channelName: {
+      color: theme.colors.accent,
+      fontSize: 13,
+    },
+    usernameTimestamp: {
+      color: theme.colors.textMuted,
+      fontSize: 13,
+      marginTop: 2,
+    },
+    mutedText13: {
+      color: theme.colors.textMuted,
+      fontSize: 13,
+    },
+    accentText: {
+      color: theme.colors.accent,
+    },
+    castText: {
+      color: theme.colors.textMain,
+      fontSize: 15,
+      lineHeight: 20,
+    },
+    imageBg: {
+      backgroundColor: theme.colors.surface3,
+    },
+    errorText: {
+      color: theme.colors.danger,
+    },
+  });
+}

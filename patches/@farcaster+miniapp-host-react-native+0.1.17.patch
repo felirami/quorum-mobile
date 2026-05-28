@@ -1,0 +1,52 @@
+diff --git a/node_modules/@farcaster/miniapp-host-react-native/dist/webview.js b/node_modules/@farcaster/miniapp-host-react-native/dist/webview.js
+index 40f0483..2fd69b4 100644
+--- a/node_modules/@farcaster/miniapp-host-react-native/dist/webview.js
++++ b/node_modules/@farcaster/miniapp-host-react-native/dist/webview.js
+@@ -27,12 +27,13 @@ export function createWebViewRpcEndpoint(ref, domain) {
+             }
+             console.debug('[webview:res]', data);
+             const dataStr = JSON.stringify(data);
++            // Support both standard domains and LAN IPs with ports
+             return ref.current.injectJavaScript(`
+-        if (location.origin === 'https://${domain}' || location.origin === 'https://www.${domain}') {
++        if (location.hostname === '${domain}' || location.hostname === 'www.${domain}') {
+           console.debug('[webview:res]', ${dataStr});
+           document.dispatchEvent(new MessageEvent('FarcasterFrameCallback', { data: ${dataStr} }));
+         } else {
+-          console.debug('[webview:emit]', 'invalid origin, ignoring')
++          console.debug('[webview:emit]', 'invalid origin, ignoring', location.hostname, '${domain}')
+         }
+       `);
+         },
+@@ -63,12 +64,13 @@ export function createWebViewRpcEndpoint(ref, domain) {
+             }
+             console.debug('[webview:emit]', data);
+             const dataStr = JSON.stringify(data);
++            // Support both standard domains and LAN IPs with ports
+             return ref.current.injectJavaScript(`
+-        if (location.origin === 'https://${domain}' || location.origin === 'https://www.${domain}') {
++        if (location.hostname === '${domain}' || location.hostname === 'www.${domain}') {
+           console.debug('[webview:emit]', ${dataStr});
+           document.dispatchEvent(new MessageEvent('FarcasterFrameEvent', { data: ${dataStr} }));
+         } else {
+-          console.debug('[webview:emit]', 'invalid origin, ignoring')
++          console.debug('[webview:emit]', 'invalid origin, ignoring', location.hostname, '${domain}')
+         }
+       `);
+         },
+@@ -79,12 +81,13 @@ export function createWebViewRpcEndpoint(ref, domain) {
+             console.debug('[emit:ethProvider]', event, params);
+             const wireEvent = { event, params };
+             const dataStr = JSON.stringify(wireEvent);
++            // Support both standard domains and LAN IPs with ports
+             return ref.current.injectJavaScript(`
+-        if (location.origin === 'https://${domain}' || location.origin === 'https://www.${domain}') {
++        if (location.hostname === '${domain}' || location.hostname === 'www.${domain}') {
+           console.debug('[webview:emit:ethProvider]', ${dataStr});
+           document.dispatchEvent(new MessageEvent('FarcasterFrameEthProviderEvent', { data: ${dataStr} }));
+         } else {
+-          console.debug('[webview:emit:ethProvider]', 'invalid origin, ignoring')
++          console.debug('[webview:emit:ethProvider]', 'invalid origin, ignoring', location.hostname, '${domain}')
+         }
+       `);
+         },

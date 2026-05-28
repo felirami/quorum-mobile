@@ -11,10 +11,14 @@
  * - Public: https://qm.one/invite/#spaceId={spaceId}&configKey={configKey}
  */
 
-import { logger } from '@quilibrium/quorum-shared';
-import { getSpaceKey } from '../config/spaceStorage';
+import { base64ToHex, hexToBase64, numberArrayToBase64 } from '@/utils/encoding';
+import { logger, bytesToHex, hexToBytes } from '@quilibrium/quorum-shared';
+import { getQuorumClient } from '../api/quorumClient';
+import { getSpace, getSpaceKey, saveSpace } from '../config/spaceStorage';
 import { encryptionStateStorage } from '../crypto/encryption-state-storage';
-import { bytesToHex } from '@quilibrium/quorum-shared';
+import { NativeCryptoProvider } from '../crypto/native-provider';
+import { broadcastSpaceUpdate } from './broadcastSpaceUpdate';
+import { republishSpace } from './spaceService';
 
 /**
  * Convert a UTF-8 string to hex encoding
@@ -28,7 +32,7 @@ function stringToHex(str: string): string {
 
 // Invite domain configuration
 const INVITE_DOMAINS = {
-  production: 'qm.one',
+  production: 'app.quorummessenger.com',
   staging: 'test.quorummessenger.com',
   development: 'localhost:3000',
 };
@@ -38,6 +42,8 @@ const VALID_INVITE_PREFIXES = [
   'https://qm.one/',
   'https://quorummessenger.com/i/',
   'https://www.quorummessenger.com/i/',
+  'https://app.quorummessenger.com/#',
+  'https://app.quorummessenger.com/invite/#',
   'http://localhost:3000/',
   'http://localhost:3000/i/',
   'qm.one/',
@@ -75,8 +81,6 @@ function getInviteUrlBase(isPublicInvite: boolean = false): string {
  * - hubKey: For registering with the hub
  */
 export async function generatePrivateInviteLink(spaceId: string): Promise<GenerateInviteResult> {
-  logger.log('[InviteService] Generating private invite for space:', spaceId);
-
   // Get required keys
   const configKey = getSpaceKey(spaceId, 'config');
   if (!configKey?.privateKey) {
@@ -86,6 +90,34 @@ export async function generatePrivateInviteLink(spaceId: string): Promise<Genera
   const hubKey = getSpaceKey(spaceId, 'hub');
   if (!hubKey?.privateKey) {
     throw new Error('Hub key not found for space');
+  }
+
+  // Self-heal: ensure the manifest is on the server before handing out an
+  // invite. If the original POST at space-creation time silently failed
+  // (network blip, server transient), the recipient would see "manifest not
+  // found" forever. Re-uploading is idempotent on the server (newer
+  // timestamp wins; same data is a no-op).
+  const space = getSpace(spaceId);
+  logger.debug(`[invite] self-heal: spaceId=${spaceId.slice(0, 12)} hasLocalSpace=${!!space}`);
+  if (space) {
+    try {
+      const client = getQuorumClient();
+      await client.getSpaceManifest(spaceId);
+      logger.debug('[invite] self-heal: manifest already on server, skipping upload');
+    } catch (err: any) {
+      logger.debug(`[invite] self-heal: GET threw status=${err?.status} msg=${err?.message}`);
+      if (err?.status === 404 || /not found/i.test(err?.message ?? '')) {
+        // 404 on the manifest endpoint means the server has no record of
+        // the space at all (registration → hub-membership → manifest must
+        // all be re-published). Manifest-only upload would 404 again on
+        // the missing registration check, so we run the full sequence.
+        logger.debug('[invite] self-heal: republishing space (registration + hub membership + manifest)');
+        await republishSpace(spaceId);
+        logger.debug('[invite] self-heal: republish completed');
+      } else {
+        logger.debug('[invite] self-heal: non-404 error, skipping re-upload');
+      }
+    }
   }
 
   // Get encryption state for template and secret
@@ -98,17 +130,11 @@ export async function generatePrivateInviteLink(spaceId: string): Promise<Genera
 
   const sets = JSON.parse(encryptionStates[0].state);
 
-  // Debug: Log what's in the encryption state
-  logger.log('[InviteService] Encryption state keys:', Object.keys(sets));
-  logger.log('[InviteService] Has template:', !!sets.template);
-  logger.log('[InviteService] Has evals:', !!sets.evals, 'count:', sets.evals?.length);
-  logger.log('[InviteService] Has state:', !!sets.state);
 
   // Check if we have the template and evals
   // The evals pool is created when a space is created (via establishTripleRatchetSessionForSpace)
   // or when a rekey is received from another member who generated new invites
   if (!sets.template) {
-    console.error('[InviteService] Template missing! State structure:', JSON.stringify(sets).substring(0, 500));
     throw new Error('Cannot generate invites from this space. The invite pool was not initialized.');
   }
 
@@ -137,18 +163,6 @@ export async function generatePrivateInviteLink(spaceId: string): Promise<Genera
   state.root_key = parsedState.root_key;
   state.dkg_ratchet = JSON.stringify(ratchet);
 
-  logger.log('[InviteService] Template state (matching desktop):', {
-    has_root_key: !!state.root_key,
-    ratchet_id: ratchet.id,
-  });
-
-  // Debug: Log critical fields in the invite template
-  logger.log('[InviteService] Template sending_chain_key exists:', !!state.sending_chain_key);
-  logger.log('[InviteService] Template sending_chain_key preview:', state.sending_chain_key?.substring?.(0, 30));
-  logger.log('[InviteService] Template receiving_group_key exists:', !!state.receiving_group_key);
-  logger.log('[InviteService] Template receiving_group_key preview:', state.receiving_group_key?.substring?.(0, 30));
-  logger.log('[InviteService] Template current_header_key:', state.current_header_key);
-  logger.log('[InviteService] Template should_ratchet:', state.should_ratchet);
 
   // Convert template to hex
   const template = stringToHex(JSON.stringify(state));
@@ -166,16 +180,6 @@ export async function generatePrivateInviteLink(spaceId: string): Promise<Genera
 
   // Construct private invite link
   const inviteLink = `${getInviteUrlBase(false)}#spaceId=${spaceId}&configKey=${configKey.privateKey}&template=${template}&secret=${secret}&hubKey=${hubKey.privateKey}`;
-
-  logger.log('[InviteService] Generated private invite link');
-  logger.log('[InviteService] Link base:', getInviteUrlBase(false));
-  logger.log('[InviteService] Link total length:', inviteLink.length);
-  logger.log('[InviteService] Link preview:', inviteLink.substring(0, 150));
-  logger.log('[InviteService] spaceId:', spaceId);
-  logger.log('[InviteService] configKey length:', configKey.privateKey?.length);
-  logger.log('[InviteService] template length:', template?.length);
-  logger.log('[InviteService] secret length:', secret?.length);
-  logger.log('[InviteService] hubKey length:', hubKey.privateKey?.length);
 
   return {
     inviteLink,
@@ -199,14 +203,12 @@ export function parseInviteLink(inviteLink: string): InviteParams | null {
   );
 
   if (!isValidPrefix) {
-    logger.warn('[InviteService] Invalid invite link prefix:', trimmed.substring(0, 50));
     return null;
   }
 
   // Find the hash fragment
   const hashIndex = trimmed.indexOf('#');
   if (hashIndex < 0 || hashIndex === trimmed.length - 1) {
-    logger.warn('[InviteService] No hash fragment in invite link');
     return null;
   }
 
@@ -225,7 +227,6 @@ export function parseInviteLink(inviteLink: string): InviteParams | null {
 
   // spaceId and configKey are required
   if (!params.spaceId || !params.configKey) {
-    logger.warn('[InviteService] Missing required params (spaceId or configKey)');
     return null;
   }
 
@@ -265,5 +266,228 @@ export function getShortenedInviteLink(inviteLink: string): string {
 
   // Show just the domain and first 8 chars of spaceId
   const shortSpaceId = params.spaceId.substring(0, 8);
-  return `qm.one/#${shortSpaceId}...`;
+  return `https://app.quorummessenger.com/invite/#${shortSpaceId}...`;
 }
+
+export interface GeneratePublicInviteResult {
+  inviteLink: string;
+  isPublic: true;
+}
+
+/**
+ * Helper to convert int64 to bytes (big-endian)
+ */
+function int64ToBytes(value: number): Uint8Array {
+  const bytes = new Uint8Array(8);
+  const view = new DataView(bytes.buffer);
+  view.setBigUint64(0, BigInt(value), false);
+  return bytes;
+}
+
+/**
+ * Generate a public invite link for a space (reusable, ~200 uses)
+ *
+ * This creates a public link that stores evaluations on the server.
+ * The link only contains spaceId and configKey - evaluations are fetched from server.
+ */
+export async function generatePublicInviteLink(spaceId: string): Promise<GeneratePublicInviteResult> {
+  const cryptoProvider = new NativeCryptoProvider();
+  const client = getQuorumClient();
+
+  const space = getSpace(spaceId);
+  if (!space) {
+    throw new Error('Space not found');
+  }
+
+  // Get required keys
+  const ownerKey = getSpaceKey(spaceId, 'owner');
+  if (!ownerKey?.privateKey) {
+    throw new Error('Owner key not found for space. Only space owners can generate public invites.');
+  }
+
+  const hubKey = getSpaceKey(spaceId, 'hub');
+  if (!hubKey?.privateKey) {
+    throw new Error('Hub key not found for space');
+  }
+
+  // Get encryption state for evaluations
+  const conversationId = `${spaceId}/${spaceId}`;
+  const encryptionStates = encryptionStateStorage.getEncryptionStates(conversationId);
+
+  if (encryptionStates.length === 0) {
+    throw new Error('No encryption state found for space. Cannot generate public invite.');
+  }
+
+  const session = JSON.parse(encryptionStates[0].state);
+
+  if (!session.evals || session.evals.length === 0) {
+    throw new Error('No invite evaluations available. Cannot generate public invite.');
+  }
+
+  if (!session.template) {
+    throw new Error('No template found in encryption state. Cannot generate public invite.');
+  }
+
+
+  // Use the EXISTING space config key (not a new one)
+  // This ensures all space members use the same config key for hub envelope encryption/decryption
+  const configKey = getSpaceKey(spaceId, 'config');
+  if (!configKey?.privateKey || !configKey?.publicKey) {
+    throw new Error('Config key not found for space. Cannot generate public invite.');
+  }
+  const configPrivateKeyHex = configKey.privateKey;
+  const configPublicKeyHex = configKey.publicKey;
+
+  // We still need a config keypair for encryption operations
+  const configPair = {
+    public_key: Array.from(hexToBytes(configPublicKeyHex)),
+    private_key: Array.from(hexToBytes(configPrivateKeyHex)),
+  };
+
+  // Generate ephemeral key for encryption
+  const ephemeralKey = await cryptoProvider.generateX448();
+  const ephemeralPublicKeyHex = bytesToHex(new Uint8Array(ephemeralKey.public_key));
+
+  // Option 2: server now serves the same eval to every joiner instead of
+  // popping one per join, so we only need to upload a single evaluation
+  // here (was previously generating up to 200, draining the local pool by
+  // 200 per public-invite gen and burning ~200x the crypto work for no
+  // functional gain). The retained eval is still per-public-invite-link
+  // — generating a new public invite still creates a fresh eval.
+  const MAX_PUBLIC_EVALS = 1;
+  const evalsToProcess = session.evals.slice(0, MAX_PUBLIC_EVALS);
+  const spaceEvals: string[] = [];
+  let idCounter = 10001 - session.evals.length;
+
+
+  for (const evalData of evalsToProcess) {
+    const sendState = JSON.parse(JSON.stringify(session.template));
+    const ratchet = JSON.parse(sendState.dkg_ratchet);
+
+    ratchet.id = idCounter;
+
+    // Copy root_key from current state
+    if (session.state) {
+      const parsedState = typeof session.state === 'string' ? JSON.parse(session.state) : session.state;
+      sendState.root_key = parsedState.root_key;
+    }
+
+    // Generate keys for this eval
+    const secretPair = await cryptoProvider.generateX448();
+    const ephPair = await cryptoProvider.generateX448();
+
+    // Set ratchet parameters
+    const evalBytes = new Uint8Array(evalData);
+    ratchet.secret = numberArrayToBase64(Array.from(secretPair.private_key));
+    ratchet.scalar = numberArrayToBase64(Array.from(evalBytes));
+
+    // Get the point from the scalar (getPublicKeyX448 returns base64 string directly)
+    const evalPointBase64 = await cryptoProvider.getPublicKeyX448(numberArrayToBase64(Array.from(evalBytes)));
+    ratchet.point = evalPointBase64;
+    ratchet.random_commitment_point = numberArrayToBase64(Array.from(secretPair.public_key));
+
+    sendState.dkg_ratchet = JSON.stringify(ratchet);
+    sendState.next_dkg_ratchet = JSON.stringify(ratchet);
+    sendState.ephemeral_private_key = numberArrayToBase64(Array.from(ephPair.private_key));
+
+    const template = JSON.stringify(sendState);
+
+    const evalPayload = {
+      id: idCounter,
+      template: template,
+      secret: bytesToHex(evalBytes),
+      hubKey: hubKey.privateKey,
+    };
+
+    // Encrypt the payload
+    const plaintextBytes = new TextEncoder().encode(JSON.stringify(evalPayload));
+    const ciphertext = await cryptoProvider.encryptInboxMessage({
+      inbox_public_key: configPair.public_key,
+      ephemeral_private_key: ephemeralKey.private_key,
+      plaintext: Array.from(plaintextBytes),
+    });
+
+    spaceEvals.push(ciphertext);
+    idCounter++;
+  }
+
+
+  // Build the payload to sign (all evals concatenated as UTF-8 bytes)
+  const allEvalsBytes: number[] = [];
+  for (const evalCiphertext of spaceEvals) {
+    const evalBytes = new TextEncoder().encode(evalCiphertext);
+    allEvalsBytes.push(...Array.from(evalBytes));
+  }
+
+  // Sign the payload with owner key
+  const ownerPrivateKeyBase64 = hexToBase64(ownerKey.privateKey);
+  const payloadBase64 = numberArrayToBase64(allEvalsBytes);
+  const signatureBase64 = await cryptoProvider.signEd448(ownerPrivateKeyBase64, payloadBase64);
+  const signatureHex = base64ToHex(signatureBase64);
+
+  // Upload the evaluations to the server
+  try {
+    await client.postInviteEvals({
+      space_address: spaceId,
+      config_public_key: configPublicKeyHex,
+      space_evals: spaceEvals,
+      ephemeral_public_key: ephemeralPublicKeyHex,
+      owner_public_key: ownerKey.publicKey,
+      owner_signature: signatureHex,
+    });
+  } catch (error) {
+    throw new Error('Failed to upload invite evaluations to server');
+  }
+
+  // Also upload the space manifest encrypted with the new config key
+  // Use the same ephemeral key as the evals (matches desktop behavior)
+  const spaceJson = JSON.stringify(space);
+  const spaceBytes = new TextEncoder().encode(spaceJson);
+
+  const manifestCiphertext = await cryptoProvider.encryptInboxMessage({
+    inbox_public_key: configPair.public_key,
+    ephemeral_private_key: ephemeralKey.private_key,
+    plaintext: Array.from(spaceBytes),
+  });
+
+  // Sign the manifest with timestamp (matches desktop)
+  const timestamp = Date.now();
+  const timestampBytes = int64ToBytes(timestamp);
+  const manifestWithTimestamp = new Uint8Array([
+    ...new TextEncoder().encode(manifestCiphertext),
+    ...timestampBytes,
+  ]);
+  const manifestPayloadBase64 = numberArrayToBase64(Array.from(manifestWithTimestamp));
+  const manifestSignatureBase64 = await cryptoProvider.signEd448(ownerPrivateKeyBase64, manifestPayloadBase64);
+  const manifestSignatureHex = base64ToHex(manifestSignatureBase64);
+
+  await client.postSpaceManifest(spaceId, {
+    space_address: spaceId,
+    space_manifest: manifestCiphertext,
+    ephemeral_public_key: ephemeralPublicKeyHex,
+    timestamp,
+    owner_public_key: ownerKey.publicKey,
+    owner_signature: manifestSignatureHex,
+  });
+
+  // Remove the processed evals from the local pool (they're now on the server)
+  session.evals = session.evals.slice(MAX_PUBLIC_EVALS);
+  encryptionStateStorage.saveEncryptionState({
+    ...encryptionStates[0],
+    state: JSON.stringify(session),
+    timestamp: Date.now(),
+  });
+
+  // Construct public invite link
+  const inviteLink = `${getInviteUrlBase(true)}#spaceId=${spaceId}&configKey=${configPrivateKeyHex}`;
+
+  // Update space with new invite URL
+  space.inviteUrl = inviteLink;
+  saveSpace(space);
+
+  return {
+    inviteLink,
+    isPublic: true,
+  };
+}
+

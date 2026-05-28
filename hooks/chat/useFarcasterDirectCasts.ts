@@ -3,7 +3,6 @@
  */
 
 import { useInfiniteQuery, useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { logger } from '@quilibrium/quorum-shared';
 import { useAuth } from '@/context/AuthContext';
 import {
   getDirectCastConversations,
@@ -16,7 +15,7 @@ import {
   type DirectCastMessage,
   type DirectCastMessageMetadata,
 } from '@/services/farcasterClient';
-import type { Conversation } from '@quilibrium/quorum-shared';
+import type { Conversation } from './useConversations';
 
 export type { DirectCastConversation, DirectCastMessage };
 
@@ -39,6 +38,22 @@ function toUnifiedConversation(fc: DirectCastConversation, currentUserFid?: numb
     .filter((p) => p.fid !== currentUserFid)
     .map((p) => p.fid);
 
+  // Extract preview from last message
+  let lastMessagePreview: string | undefined;
+  let lastMessageSenderName: string | undefined;
+  if (fc.lastMessage) {
+    lastMessagePreview = fc.lastMessage.message;
+    // Get sender name - check if it's the current user or someone else
+    if (fc.lastMessage.senderFid === currentUserFid) {
+      lastMessageSenderName = 'You';
+    } else {
+      lastMessageSenderName = fc.lastMessage.senderContext?.displayName
+        ?? fc.lastMessage.senderContext?.username
+        ?? counterParty?.displayName
+        ?? counterParty?.username;
+    }
+  }
+
   return {
     conversationId: `farcaster:${fc.conversationId}`,
     type: fc.isGroup ? 'group' : 'direct',
@@ -51,6 +66,9 @@ function toUnifiedConversation(fc: DirectCastConversation, currentUserFid?: numb
     farcasterFid: counterParty?.fid,
     farcasterUsername: counterParty?.username,
     farcasterParticipantFids: participantFids,
+    lastMessagePreview,
+    lastMessageSenderName,
+    unreadCount: fc.unreadCount,
     // Don't show read status for Farcaster conversations
   };
 }
@@ -85,8 +103,14 @@ export function useFarcasterConversations(options?: { enabled?: boolean }) {
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (lastPage) => lastPage.nextCursor,
     enabled: (options?.enabled ?? true) && hasFarcaster && !!farcasterAuthToken,
-    staleTime: 30000, // 30 seconds
-    refetchInterval: 30000, // Poll every 30 seconds for new conversations/updates
+    staleTime: 15000, // 15 seconds — short enough that the inbox stays
+    // fresh, long enough not to spam the Farcaster API.
+    refetchInterval: 15000,
+    refetchIntervalInBackground: true,
+    // Always refetch when the Messages tab re-mounts so the user sees a
+    // fresh inbox even when the previous mount was minutes ago.
+    refetchOnMount: 'always',
+    refetchOnWindowFocus: true,
   });
 }
 
@@ -126,17 +150,49 @@ export function useFarcasterDirectCastMessages(
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (lastPage) => lastPage.nextCursor,
     enabled: (options?.enabled ?? true) && !!farcasterAuthToken && !!fcConversationId,
-    staleTime: 5000, // 5 seconds
-    refetchInterval: 5000, // Poll every 5 seconds for new messages
+    // Aggressive polling while the chat is actually open — the user
+    // is expecting near-real-time message delivery. The infinite-query
+    // refetchInterval only re-runs page 0, which is exactly what we
+    // want for "newest first" message arrays.
+    staleTime: 3000,
+    refetchInterval: 3000,
+    refetchIntervalInBackground: true,
+    // Forces an immediate refresh when navigating into a chat —
+    // otherwise the user lands on a screen with potentially-minutes-old
+    // state, waits ~3s for the first poll, and only then sees fresh
+    // messages.
+    refetchOnMount: 'always',
+    refetchOnWindowFocus: true,
   });
+}
+
+// Type for infinite query data structure
+interface FarcasterMessagesPage {
+  messages: DirectCastMessage[];
+  nextCursor?: string;
+}
+
+interface InfiniteFarcasterMessagesData {
+  pages: FarcasterMessagesPage[];
+  pageParams: unknown[];
 }
 
 /**
  * Hook to send a Farcaster direct cast
  */
 export function useSendFarcasterDirectCast() {
-  const { farcasterAuthToken } = useAuth();
+  const { farcasterAuthToken, user } = useAuth();
   const queryClient = useQueryClient();
+  const currentUserFid = user?.farcaster?.fid;
+  // FarcasterInfo only carries fid/username/pfpUrl — there's no
+  // farcaster.displayName, so fall back to the Quorum-level display
+  // name. user.profileImage (NOT profilePicture — that field doesn't
+  // exist on UserInfo) is the correct local fallback when
+  // farcaster.pfpUrl is empty; that bug was leaving optimistic sends
+  // pfp-less.
+  const currentUserDisplayName = user?.displayName ?? user?.farcaster?.username;
+  const currentUserUsername = user?.farcaster?.username;
+  const currentUserPfp = user?.farcaster?.pfpUrl ?? user?.profileImage;
 
   return useMutation({
     mutationFn: async ({
@@ -152,14 +208,6 @@ export function useSendFarcasterDirectCast() {
       inReplyToId?: string;
       metadata?: DirectCastMessageMetadata;
     }) => {
-      logger.log('[useSendFarcasterDirectCast] mutationFn called:', {
-        conversationId,
-        recipientFids,
-        messageLength: message.length,
-        hasToken: !!farcasterAuthToken,
-        hasMetadata: !!metadata,
-      });
-
       if (!farcasterAuthToken) {
         throw new Error('Farcaster auth token not available');
       }
@@ -168,8 +216,6 @@ export function useSendFarcasterDirectCast() {
       const fcConversationId = conversationId.startsWith('farcaster:')
         ? conversationId.slice(10)
         : conversationId;
-
-      logger.log('[useSendFarcasterDirectCast] Calling sendDirectCast with fcConversationId:', fcConversationId);
 
       return sendDirectCast({
         token: farcasterAuthToken,
@@ -180,9 +226,89 @@ export function useSendFarcasterDirectCast() {
         metadata,
       });
     },
+
+    onMutate: async (variables) => {
+      const fcConversationId = variables.conversationId.startsWith('farcaster:')
+        ? variables.conversationId.slice(10)
+        : variables.conversationId;
+
+      // Cancel any outgoing refetches
+      await queryClient.cancelQueries({
+        queryKey: farcasterDCQueryKeys.messages(fcConversationId),
+      });
+
+      // Snapshot the previous value
+      const previousData = queryClient.getQueryData<InfiniteFarcasterMessagesData>(
+        farcasterDCQueryKeys.messages(fcConversationId)
+      );
+
+      // Create optimistic message
+      const optimisticMessage: DirectCastMessage = {
+        conversationId: fcConversationId,
+        senderFid: currentUserFid ?? 0,
+        messageId: `optimistic-${Date.now()}`,
+        serverTimestamp: Date.now(),
+        type: 'text',
+        message: variables.message,
+        hasMention: false,
+        reactions: [],
+        isPinned: false,
+        isDeleted: false,
+        senderContext: {
+          fid: currentUserFid ?? 0,
+          username: currentUserUsername,
+          displayName: currentUserDisplayName ?? 'You',
+          pfp: currentUserPfp ? { url: currentUserPfp } : undefined,
+        },
+        // Mark as optimistic for UI to show sending state
+        _optimistic: true,
+      } as DirectCastMessage & { _optimistic?: boolean };
+
+      // Optimistically update the cache
+      // Messages are returned newest-first from API, so we add to the first page
+      queryClient.setQueryData<InfiniteFarcasterMessagesData>(
+        farcasterDCQueryKeys.messages(fcConversationId),
+        (old) => {
+          if (!old) {
+            return {
+              pages: [{ messages: [optimisticMessage], nextCursor: undefined }],
+              pageParams: [undefined],
+            };
+          }
+          return {
+            ...old,
+            pages: old.pages.map((page, index) => {
+              if (index === 0) {
+                // Add to beginning of first page (newest first)
+                return {
+                  ...page,
+                  messages: [optimisticMessage, ...page.messages],
+                };
+              }
+              return page;
+            }),
+          };
+        }
+      );
+
+      return { previousData, optimisticMessage };
+    },
+
+    onError: (error, variables, context) => {
+      // Rollback to previous state on error
+      if (context?.previousData) {
+        const fcConversationId = variables.conversationId.startsWith('farcaster:')
+          ? variables.conversationId.slice(10)
+          : variables.conversationId;
+        queryClient.setQueryData(
+          farcasterDCQueryKeys.messages(fcConversationId),
+          context.previousData
+        );
+      }
+    },
+
     onSuccess: (result, variables) => {
-      logger.log('[useSendFarcasterDirectCast] onSuccess:', result);
-      // Invalidate messages for this conversation
+      // Invalidate messages for this conversation to get the real message from server
       const fcConversationId = variables.conversationId.startsWith('farcaster:')
         ? variables.conversationId.slice(10)
         : variables.conversationId;
@@ -193,9 +319,6 @@ export function useSendFarcasterDirectCast() {
       queryClient.invalidateQueries({
         queryKey: farcasterDCQueryKeys.conversations,
       });
-    },
-    onError: (error, variables) => {
-      logger.log('[useSendFarcasterDirectCast] onError:', error, 'variables:', variables);
     },
   });
 }
@@ -231,6 +354,68 @@ export function useMarkFarcasterConversationRead() {
 }
 
 /**
+ * Apply / undo a reaction in place on a Farcaster message. Operates on
+ * BOTH `reactions` (the aggregate `{reaction,count}[]` array the API
+ * returns) AND `viewerContext.reactions` (the per-viewer list the
+ * client checks to know whether the *current user* reacted), because
+ * the UI keys off the viewerContext list to render the pressed state.
+ */
+function applyFarcasterReactionAdd(message: DirectCastMessage, reaction: string): DirectCastMessage {
+  const viewer = message.viewerContext ?? { reactions: [] };
+  if (viewer.reactions.includes(reaction)) return message; // idempotent
+  const existing = message.reactions.find((r) => r.reaction === reaction);
+  const reactions = existing
+    ? message.reactions.map((r) =>
+        r.reaction === reaction ? { ...r, count: r.count + 1 } : r,
+      )
+    : [...message.reactions, { reaction, count: 1 }];
+  return {
+    ...message,
+    reactions,
+    viewerContext: { ...viewer, reactions: [...viewer.reactions, reaction] },
+  };
+}
+
+function applyFarcasterReactionRemove(message: DirectCastMessage, reaction: string): DirectCastMessage {
+  const viewer = message.viewerContext ?? { reactions: [] };
+  if (!viewer.reactions.includes(reaction)) return message; // idempotent
+  const reactions = message.reactions
+    .map((r) => (r.reaction === reaction ? { ...r, count: r.count - 1 } : r))
+    .filter((r) => r.count > 0);
+  return {
+    ...message,
+    reactions,
+    viewerContext: {
+      ...viewer,
+      reactions: viewer.reactions.filter((r) => r !== reaction),
+    },
+  };
+}
+
+function mutateFarcasterMessageInCache(
+  queryClient: ReturnType<typeof useQueryClient>,
+  fcConversationId: string,
+  messageId: string,
+  transform: (m: DirectCastMessage) => DirectCastMessage,
+): InfiniteFarcasterMessagesData | undefined {
+  const key = farcasterDCQueryKeys.messages(fcConversationId);
+  const previousData = queryClient.getQueryData<InfiniteFarcasterMessagesData>(key);
+  queryClient.setQueryData<InfiniteFarcasterMessagesData>(key, (old) => {
+    if (!old) return old;
+    return {
+      ...old,
+      pages: old.pages.map((page) => ({
+        ...page,
+        messages: page.messages.map((m) =>
+          m.messageId === messageId ? transform(m) : m,
+        ),
+      })),
+    };
+  });
+  return previousData;
+}
+
+/**
  * Hook to add a reaction to a Farcaster direct cast message
  */
 export function useAddFarcasterDirectCastReaction() {
@@ -262,14 +447,36 @@ export function useAddFarcasterDirectCastReaction() {
         reaction,
       });
     },
-    onSuccess: (_, variables) => {
-      const fcConversationId = variables.conversationId.startsWith('farcaster:')
-        ? variables.conversationId.slice(10)
-        : variables.conversationId;
-      queryClient.invalidateQueries({
-        queryKey: farcasterDCQueryKeys.messages(fcConversationId),
-      });
+    onMutate: async ({ conversationId, messageId, reaction }) => {
+      const fcConversationId = conversationId.startsWith('farcaster:')
+        ? conversationId.slice(10)
+        : conversationId;
+      const key = farcasterDCQueryKeys.messages(fcConversationId);
+      // Cancel in-flight refetches so they don't clobber the optimistic
+      // state on resolve.
+      await queryClient.cancelQueries({ queryKey: key });
+      const previousData = mutateFarcasterMessageInCache(
+        queryClient,
+        fcConversationId,
+        messageId,
+        (m) => applyFarcasterReactionAdd(m, reaction),
+      );
+      return { previousData, fcConversationId };
     },
+    onError: (_err, _variables, context) => {
+      if (context?.previousData) {
+        queryClient.setQueryData(
+          farcasterDCQueryKeys.messages(context.fcConversationId),
+          context.previousData,
+        );
+      }
+    },
+    // Intentionally NOT invalidating in onSuccess. The Farcaster API
+    // returns 204 No Content with no payload, so an invalidate-and-
+    // refetch would just rebuild the same state we already applied
+    // optimistically — at the cost of UI flicker if the refetch returns
+    // before the user expects. The next natural refetch (conversation
+    // switch, app foreground) will reconcile if anything drifted.
   });
 }
 
@@ -305,13 +512,27 @@ export function useRemoveFarcasterDirectCastReaction() {
         reaction,
       });
     },
-    onSuccess: (_, variables) => {
-      const fcConversationId = variables.conversationId.startsWith('farcaster:')
-        ? variables.conversationId.slice(10)
-        : variables.conversationId;
-      queryClient.invalidateQueries({
-        queryKey: farcasterDCQueryKeys.messages(fcConversationId),
-      });
+    onMutate: async ({ conversationId, messageId, reaction }) => {
+      const fcConversationId = conversationId.startsWith('farcaster:')
+        ? conversationId.slice(10)
+        : conversationId;
+      const key = farcasterDCQueryKeys.messages(fcConversationId);
+      await queryClient.cancelQueries({ queryKey: key });
+      const previousData = mutateFarcasterMessageInCache(
+        queryClient,
+        fcConversationId,
+        messageId,
+        (m) => applyFarcasterReactionRemove(m, reaction),
+      );
+      return { previousData, fcConversationId };
+    },
+    onError: (_err, _variables, context) => {
+      if (context?.previousData) {
+        queryClient.setQueryData(
+          farcasterDCQueryKeys.messages(context.fcConversationId),
+          context.previousData,
+        );
+      }
     },
   });
 }

@@ -7,40 +7,13 @@
  * Ported from desktop's EstablishTripleRatchetSessionForSpace
  */
 
-import { logger } from '@quilibrium/quorum-shared';
-import { sha256 } from '@noble/hashes/sha2';
+import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex, hexToBytes } from '@quilibrium/quorum-shared';
 import bs58 from 'bs58';
 import * as multihashes from 'multihashes';
 import { NativeCryptoProvider } from './native-provider';
+import { arrayToBase64, base64ToArray } from '@/utils/encoding';
 
-/**
- * Convert number array to base64 string
- */
-function arrayToBase64(arr: number[]): string {
-  const uint8 = new Uint8Array(arr);
-  let binary = '';
-  for (let i = 0; i < uint8.length; i++) {
-    binary += String.fromCharCode(uint8[i]);
-  }
-  return btoa(binary);
-}
-
-/**
- * Convert base64 string to number array
- */
-function base64ToArray(base64: string): number[] {
-  const binary = atob(base64);
-  const arr: number[] = [];
-  for (let i = 0; i < binary.length; i++) {
-    arr.push(binary.charCodeAt(i));
-  }
-  return arr;
-}
-
-/**
- * Derive address from public key using multihash (same as Quorum address derivation)
- */
 function deriveAddress(publicKeyBytes: Uint8Array): string {
   const hash = sha256(publicKeyBytes);
   const mhash = multihashes.encode(hash, 'sha2-256');
@@ -286,12 +259,8 @@ async function newTripleRatchetSession(
     combined.set(identityBytes, inboxBytes.length);
     combined.set(preBytes, inboxBytes.length + identityBytes.length);
 
-    logger.log(`[SpaceSession] Peer key sizes: inbox=${inboxBytes.length}, identity=${identityBytes.length}, pre=${preBytes.length}, total=${combined.length}`);
-
     return Array.from(combined);
   });
-
-  logger.log(`[SpaceSession] Building triple ratchet with ${peerBytes.length} peers, each ${peerBytes[0]?.length || 0} bytes`);
 
   const result = await crypto.newTripleRatchet({
     peers: peerBytes,
@@ -320,8 +289,6 @@ export async function establishTripleRatchetSessionForSpace(
   registration: UserRegistration,
   total: number = 10000
 ): Promise<SpaceSessionResult> {
-  logger.log('[SpaceSession] Establishing triple ratchet session for space, total evals:', total);
-
   // Filter registration to only include current device
   let filteredRegistration = { ...registration };
   if (filteredRegistration.device_registrations.length > 1) {
@@ -386,19 +353,12 @@ export async function establishTripleRatchetSessionForSpace(
   }
 
   // Find participants with id=1 and id=2 (needed for resize)
-  logger.log('[SpaceSession] Looking for DKG participants');
-  for (let i = 0; i < 4; i++) {
-    logger.log(`[SpaceSession] outs[${i}].ratchet_state (first 200):`, outs[i].ratchet_state?.substring(0, 200));
-  }
-
   const index1 = [0, 1, 2, 3].find((i) => {
     try {
       const state = JSON.parse(outs[i].ratchet_state);
       const dkgRatchet = JSON.parse(state.dkg_ratchet);
       return dkgRatchet.id === 1;
     } catch (e) {
-      logger.log(`[SpaceSession] Failed to parse outs[${i}].ratchet_state:`, e);
-      logger.log(`[SpaceSession] Raw value:`, outs[i].ratchet_state?.substring(0, 500));
       return false;
     }
   });
@@ -459,8 +419,6 @@ export async function establishTripleRatchetSessionForSpace(
     2,
     total
   );
-
-  logger.log('[SpaceSession] Generated', evals.length, 'invite evals');
 
   // Build the final state and template
   const state = JSON.parse(commitInitialized[index1].ratchet_state);
@@ -546,16 +504,6 @@ export async function establishTripleRatchetSessionForSpace(
   stateTemplate.previous_receiving_chain_length = {};
 
   stateTemplate.ephemeral_private_key = '<missing gen priv>';
-
-  logger.log('[SpaceSession] Session established successfully');
-
-  // Debug: Log what's in the template at creation time
-  logger.log('[SpaceSession] Template sending_chain_key exists:', !!stateTemplate.sending_chain_key);
-  logger.log('[SpaceSession] Template sending_chain_key preview:', stateTemplate.sending_chain_key?.substring?.(0, 30));
-  logger.log('[SpaceSession] Template root_key exists:', !!stateTemplate.root_key);
-  logger.log('[SpaceSession] Template root_key preview:', stateTemplate.root_key?.substring?.(0, 30));
-  logger.log('[SpaceSession] Template receiving_group_key exists:', !!stateTemplate.receiving_group_key);
-  logger.log('[SpaceSession] Template current_header_key:', stateTemplate.current_header_key);
 
   return {
     state: JSON.stringify(state),

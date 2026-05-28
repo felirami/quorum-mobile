@@ -3,23 +3,27 @@
  *
  * Handles picking and processing images for custom emojis and stickers.
  * Matches desktop behavior for image sizing constraints.
- * Note: Uses ImagePicker with base64 output - no resizing on mobile
- * (picker handles compression, user should provide appropriately sized images)
+ * Images are automatically resized:
+ * - Emojis: 128px on longest axis
+ * - Stickers: 512px on longest axis
  */
 
 import * as ImagePicker from 'expo-image-picker';
+import * as ImageManipulator from 'expo-image-manipulator';
 
 // Configuration matching desktop behavior
 const EMOJI_CONFIG = {
   maxInputSizeMB: 5,
   quality: 0.8,
   maxGifSizeKB: 100,
+  maxSize: 128, // Max 128px on longest axis
 };
 
 const STICKER_CONFIG = {
   maxInputSizeMB: 25,
   quality: 0.8,
   maxGifSizeKB: 750,
+  maxSize: 512, // Max 512px on longest axis
 };
 
 export interface ProcessedAsset {
@@ -59,6 +63,57 @@ function generateId(): string {
 }
 
 /**
+ * Resize an image to fit within maxSize on the longest axis
+ * Preserves aspect ratio and returns base64 data URL
+ */
+async function resizeImage(
+  uri: string,
+  width: number,
+  height: number,
+  maxSize: number,
+  quality: number
+): Promise<{ base64: string; width: number; height: number } | null> {
+  try {
+    // Determine if resizing is needed
+    const longestAxis = Math.max(width, height);
+    if (longestAxis <= maxSize) {
+      // No resize needed, return null to indicate use original
+      return null;
+    }
+
+    // Calculate new dimensions maintaining aspect ratio
+    let newWidth: number;
+    let newHeight: number;
+    if (width >= height) {
+      newWidth = maxSize;
+      newHeight = Math.round((height / width) * maxSize);
+    } else {
+      newHeight = maxSize;
+      newWidth = Math.round((width / height) * maxSize);
+    }
+
+    // Perform the resize
+    const result = await ImageManipulator.manipulateAsync(
+      uri,
+      [{ resize: { width: newWidth, height: newHeight } }],
+      { compress: quality, format: ImageManipulator.SaveFormat.PNG, base64: true }
+    );
+
+    if (!result.base64) {
+      return null;
+    }
+
+    return {
+      base64: result.base64,
+      width: result.width,
+      height: result.height,
+    };
+  } catch (error) {
+    return null;
+  }
+}
+
+/**
  * Pick and process an emoji image
  * - Max input 5MB
  * - Returns base64 data URL
@@ -87,7 +142,6 @@ export async function pickEmoji(): Promise<AssetPickerResult> {
     const asset = result.assets[0];
     return processEmojiAsset(asset);
   } catch (error) {
-    console.error('[CustomAssets] Error picking emoji:', error);
     return {
       success: false,
       error: error instanceof Error ? error.message : 'Failed to pick emoji',
@@ -121,7 +175,6 @@ export async function pickSticker(): Promise<AssetPickerResult> {
     const asset = result.assets[0];
     return processStickerAsset(asset);
   } catch (error) {
-    console.error('[CustomAssets] Error picking sticker:', error);
     return {
       success: false,
       error: error instanceof Error ? error.message : 'Failed to pick sticker',
@@ -131,12 +184,13 @@ export async function pickSticker(): Promise<AssetPickerResult> {
 
 /**
  * Process an image for use as an emoji
+ * Resizes to 128px max on longest axis if needed
  */
-function processEmojiAsset(
+async function processEmojiAsset(
   asset: ImagePicker.ImagePickerAsset
-): AssetPickerResult {
+): Promise<AssetPickerResult> {
   try {
-    const { fileName, fileSize, mimeType, base64 } = asset;
+    const { uri, width, height, fileName, fileSize, mimeType, base64 } = asset;
     const isGif = mimeType === 'image/gif';
 
     if (!base64) {
@@ -155,7 +209,7 @@ function processEmojiAsset(
       };
     }
 
-    // For GIFs, check size constraint
+    // For GIFs, check size constraint (don't resize GIFs)
     if (isGif) {
       const fileSizeKB = (fileSize || 0) / 1024;
       if (fileSizeKB > EMOJI_CONFIG.maxGifSizeKB) {
@@ -164,19 +218,36 @@ function processEmojiAsset(
           error: `GIF too large (max ${EMOJI_CONFIG.maxGifSizeKB}KB)`,
         };
       }
+      // Use original GIF without resizing
+      const id = generateId();
+      const name = sanitizeName(fileName || 'emoji');
+      const imgUrl = `data:${mimeType};base64,${base64}`;
+      return { success: true, asset: { id, name, imgUrl } };
     }
 
-    const finalMimeType = mimeType || 'image/png';
+    // Resize non-GIF images if larger than max size
+    const resized = await resizeImage(
+      uri,
+      width,
+      height,
+      EMOJI_CONFIG.maxSize,
+      EMOJI_CONFIG.quality
+    );
+
     const id = generateId();
     const name = sanitizeName(fileName || 'emoji');
-    const imgUrl = `data:${finalMimeType};base64,${base64}`;
 
-    return {
-      success: true,
-      asset: { id, name, imgUrl },
-    };
+    if (resized) {
+      // Use resized image
+      const imgUrl = `data:image/png;base64,${resized.base64}`;
+      return { success: true, asset: { id, name, imgUrl } };
+    } else {
+      // Use original (already within size limits)
+      const finalMimeType = mimeType || 'image/png';
+      const imgUrl = `data:${finalMimeType};base64,${base64}`;
+      return { success: true, asset: { id, name, imgUrl } };
+    }
   } catch (error) {
-    console.error('[CustomAssets] Error processing emoji:', error);
     return {
       success: false,
       error: error instanceof Error ? error.message : 'Failed to process emoji',
@@ -186,12 +257,13 @@ function processEmojiAsset(
 
 /**
  * Process an image for use as a sticker
+ * Resizes to 512px max on longest axis if needed
  */
-function processStickerAsset(
+async function processStickerAsset(
   asset: ImagePicker.ImagePickerAsset
-): AssetPickerResult {
+): Promise<AssetPickerResult> {
   try {
-    const { fileName, fileSize, mimeType, base64 } = asset;
+    const { uri, width, height, fileName, fileSize, mimeType, base64 } = asset;
     const isGif = mimeType === 'image/gif';
 
     if (!base64) {
@@ -210,7 +282,7 @@ function processStickerAsset(
       };
     }
 
-    // For GIFs, check size constraint
+    // For GIFs, check size constraint (don't resize GIFs)
     if (isGif) {
       const fileSizeKB = (fileSize || 0) / 1024;
       if (fileSizeKB > STICKER_CONFIG.maxGifSizeKB) {
@@ -219,19 +291,36 @@ function processStickerAsset(
           error: `GIF too large (max ${STICKER_CONFIG.maxGifSizeKB}KB)`,
         };
       }
+      // Use original GIF without resizing
+      const id = generateId();
+      const name = sanitizeName(fileName || 'sticker');
+      const imgUrl = `data:${mimeType};base64,${base64}`;
+      return { success: true, asset: { id, name, imgUrl } };
     }
 
-    const finalMimeType = mimeType || 'image/png';
+    // Resize non-GIF images if larger than max size
+    const resized = await resizeImage(
+      uri,
+      width,
+      height,
+      STICKER_CONFIG.maxSize,
+      STICKER_CONFIG.quality
+    );
+
     const id = generateId();
     const name = sanitizeName(fileName || 'sticker');
-    const imgUrl = `data:${finalMimeType};base64,${base64}`;
 
-    return {
-      success: true,
-      asset: { id, name, imgUrl },
-    };
+    if (resized) {
+      // Use resized image
+      const imgUrl = `data:image/png;base64,${resized.base64}`;
+      return { success: true, asset: { id, name, imgUrl } };
+    } else {
+      // Use original (already within size limits)
+      const finalMimeType = mimeType || 'image/png';
+      const imgUrl = `data:${finalMimeType};base64,${base64}`;
+      return { success: true, asset: { id, name, imgUrl } };
+    }
   } catch (error) {
-    console.error('[CustomAssets] Error processing sticker:', error);
     return {
       success: false,
       error: error instanceof Error ? error.message : 'Failed to process sticker',

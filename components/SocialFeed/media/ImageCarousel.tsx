@@ -1,13 +1,42 @@
-import React, { useCallback, useState } from 'react';
-import { ScrollView, View } from 'react-native';
+import type { AppTheme } from '@/theme';
+import React, { useCallback } from 'react';
+import { FlatList, View } from 'react-native';
+import Animated, {
+  useSharedValue,
+  useAnimatedStyle,
+} from 'react-native-reanimated';
 import { AutoHeightImage } from './AutoHeightImage';
 import { SCREEN_WIDTH } from '../utils';
+
+interface PaginationDotProps {
+  index: number;
+  activeIndex: { value: number };
+  activeColor: string;
+  inactiveColor: string;
+}
+
+/** Single pagination dot driven by a Reanimated shared value (no React re-renders). */
+function PaginationDot({ index, activeIndex, activeColor, inactiveColor }: PaginationDotProps) {
+  const animatedStyle = useAnimatedStyle(() => ({
+    backgroundColor: index === activeIndex.value ? activeColor : inactiveColor,
+  }));
+
+  return (
+    <Animated.View
+      style={[
+        { width: 6, height: 6, borderRadius: 3 },
+        animatedStyle,
+      ]}
+    />
+  );
+}
 
 interface ImageCarouselProps {
   urls: string[];
   maxHeight: number;
-  theme: any;
-  onImagePress?: (url: string) => void;
+  theme: AppTheme;
+  /** Called when an image is pressed. Receives the tapped URL and its index. */
+  onImagePress?: (url: string, index: number) => void;
 }
 
 /**
@@ -19,33 +48,45 @@ export function ImageCarousel({
   theme,
   onImagePress,
 }: ImageCarouselProps) {
-  const [activeIndex, setActiveIndex] = useState(0);
+  const activeIndex = useSharedValue(0);
 
-  const handleScroll = useCallback((event: any) => {
+  const handleScroll = useCallback((event: { nativeEvent: { contentOffset: { x: number } } }) => {
     const contentOffsetX = event.nativeEvent.contentOffset.x;
     const index = Math.round(contentOffsetX / SCREEN_WIDTH);
-    setActiveIndex(index);
-  }, []);
+    activeIndex.value = index;
+  }, [activeIndex]);
+
+  const renderItem = useCallback(({ item, index }: { item: string; index: number }) => (
+    <View style={{ width: SCREEN_WIDTH }}>
+      <AutoHeightImage
+        uri={item}
+        maxHeight={maxHeight}
+        maxWidth={SCREEN_WIDTH}
+        style={{ backgroundColor: theme.colors.surface3 }}
+        onPress={onImagePress ? () => onImagePress(item, index) : undefined}
+      />
+    </View>
+  ), [maxHeight, theme.colors.surface3, onImagePress]);
 
   return (
-    <View>
-      <ScrollView
+    <View style={{ width: SCREEN_WIDTH }}>
+      <FlatList
+        data={urls}
+        renderItem={renderItem}
+        keyExtractor={(_, index) => index.toString()}
         horizontal
         pagingEnabled
         showsHorizontalScrollIndicator={false}
         onScroll={handleScroll}
         scrollEventThrottle={16}
-      >
-        {urls.map((url, index) => (
-          <AutoHeightImage
-            key={index}
-            uri={url}
-            maxHeight={maxHeight}
-            style={{ backgroundColor: theme.colors.surface3 }}
-            onPress={onImagePress ? () => onImagePress(url) : undefined}
-          />
-        ))}
-      </ScrollView>
+        getItemLayout={(_, index) => ({
+          length: SCREEN_WIDTH,
+          offset: SCREEN_WIDTH * index,
+          index,
+        })}
+        decelerationRate="fast"
+        snapToAlignment="start"
+      />
       <View
         style={{
           flexDirection: 'row',
@@ -56,17 +97,12 @@ export function ImageCarousel({
         }}
       >
         {urls.map((_, index) => (
-          <View
+          <PaginationDot
             key={index}
-            style={{
-              width: 6,
-              height: 6,
-              borderRadius: 3,
-              backgroundColor:
-                index === activeIndex
-                  ? theme.colors.textMain
-                  : theme.colors.surface4,
-            }}
+            index={index}
+            activeIndex={activeIndex}
+            activeColor={theme.colors.textMain}
+            inactiveColor={theme.colors.surface4}
           />
         ))}
       </View>

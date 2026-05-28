@@ -8,30 +8,46 @@
  * - Fallback to HTTP API when encryption unavailable
  */
 
-import { logger } from '@quilibrium/quorum-shared';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { useStorageAdapter } from '@/context/StorageContext';
 import { useAuth, useWebSocket } from '@/context';
 import { getQuorumClient } from '@/services/api/quorumClient';
 import { encryptionService } from '@/services/crypto/encryption-service';
 import { encryptionStateStorage, type ConversationInboxKeypair } from '@/services/crypto/encryption-state-storage';
-import { getDeviceKeyset } from '@/services/onboarding/secureStorage';
+import { getDeviceKeyset, getPrivateKey, getPublicKey } from '@/services/onboarding/secureStorage';
 import { deriveAddress } from '@/services/onboarding/keyService';
-import { queryKeys, bytesToHex, hexToBytes, type InitializationEnvelope } from '@quilibrium/quorum-shared';
+import { logger, queryKeys, bytesToHex, hexToBytes, type InitializationEnvelope } from '@quilibrium/quorum-shared';
 import type { Message } from '@quilibrium/quorum-shared';
+import { NativeSigningProvider } from '@/services/crypto/native-signing-provider';
+import { sha256 } from '@noble/hashes/sha2.js';
 
 interface SendDirectMessageParams {
   conversationId: string;
   recipientAddress: string;
   text: string;
   repliesToMessageId?: string;
-  /** Recipient encryption info - required for E2E encryption */
+  replyToAuthorAddress?: string;
+  /** Recipient encryption info - required for E2E encryption (deprecated, use allRecipientDevices) */
   recipientInfo?: {
     identityKey: number[];
     signedPreKey: number[];
     inboxAddress: string;
     inboxEncryptionKey: number[];
   };
+  /** All recipient device infos for multi-device support */
+  allRecipientDevices?: Array<{
+    identityKey: number[];
+    signedPreKey: number[];
+    inboxAddress: string;
+    inboxEncryptionKey: number[];
+  }>;
+  /** All sender device infos for multi-device support (messages sent to sender's other devices too) */
+  allSenderDevices?: Array<{
+    identityKey: number[];
+    signedPreKey: number[];
+    inboxAddress: string;
+    inboxEncryptionKey: number[];
+  }>;
   /** Pre-generated message ID and nonce (from onMutate) - internal use only */
   _messageId?: string;
   _nonce?: string;
@@ -46,19 +62,68 @@ interface SendDirectMessageParams {
  * @param conversationId - The conversation ID to reset
  */
 export function resetDMSession(conversationId: string): void {
-  logger.log('[E2E] Manual session reset requested for:', conversationId.substring(0, 30));
   encryptionService.resetSession(conversationId);
 }
 
-interface MessagesPage {
-  messages: Message[];
-  nextCursor?: string | null;
-  prevCursor?: string | null;
+import type { MessagesPage, InfiniteMessagesData } from './queryTypes';
+
+/**
+ * Generate a messageId using SHA-256 hash, matching desktop implementation.
+ * The hash is computed from: nonce + 'post' + senderAddress + messageContent
+ *
+ * @returns Object with messageId (hex string) and messageIdBytes (raw hash for signing)
+ */
+function generateMessageIdHash(
+  nonce: string,
+  senderAddress: string,
+  messageContent: string
+): { messageId: string; messageIdBytes: Uint8Array } {
+  const encoder = new TextEncoder();
+  const input = nonce + 'post' + senderAddress + messageContent;
+  const inputBytes = encoder.encode(input);
+  const hashBytes = sha256(inputBytes);
+  const messageId = bytesToHex(Array.from(hashBytes));
+  return { messageId, messageIdBytes: hashBytes };
 }
 
-interface InfiniteMessagesData {
-  pages: MessagesPage[];
-  pageParams: unknown[];
+/**
+ * Sign a message ID hash with the user's Ed448 private key.
+ * The messageIdBytes are the raw SHA-256 hash bytes (matching desktop behavior).
+ * Returns the signature (hex) and public key (hex) if signing succeeds.
+ */
+async function signMessageIdHash(messageIdBytes: Uint8Array): Promise<{ signature: string; publicKey: string } | null> {
+  try {
+    const privateKeyHex = await getPrivateKey();
+    const publicKeyHex = await getPublicKey();
+
+    if (!privateKeyHex || !publicKeyHex) {
+      return null;
+    }
+
+    // Convert hash bytes to base64 for signing (matching desktop which signs the raw hash)
+    const messageBase64 = btoa(String.fromCharCode(...messageIdBytes));
+
+    // Convert hex private key to base64
+    const privateKeyBytes = hexToBytes(privateKeyHex);
+    const privateKeyBase64 = btoa(String.fromCharCode(...privateKeyBytes));
+
+    // Sign with Ed448
+    const signingProvider = new NativeSigningProvider();
+    const signatureBase64 = await signingProvider.signEd448(privateKeyBase64, messageBase64);
+
+    // Convert signature from base64 to hex
+    const signatureBytes = atob(signatureBase64);
+    const signatureHex = Array.from(signatureBytes)
+      .map(c => c.charCodeAt(0).toString(16).padStart(2, '0'))
+      .join('');
+
+    return {
+      signature: signatureHex,
+      publicKey: publicKeyHex,
+    };
+  } catch (error) {
+    return null;
+  }
 }
 
 export function useSendDirectMessage() {
@@ -74,12 +139,14 @@ export function useSendDirectMessage() {
       recipientAddress,
       text,
       repliesToMessageId,
+      replyToAuthorAddress,
       recipientInfo,
+      allRecipientDevices,
+      allSenderDevices,
       _messageId,
       _nonce,
       _createdDate,
     }: SendDirectMessageParams): Promise<Message> => {
-      logger.log('[E2E] mutationFn starting...');
       const senderId = user?.address ?? 'unknown';
 
       // Use pre-generated values from onMutate, or generate new ones
@@ -89,7 +156,12 @@ export function useSendDirectMessage() {
         return v.toString(16);
       });
       const createdDate = _createdDate ?? Date.now();
-      const messageId = _messageId ?? `${nonce}-${createdDate}`;
+
+      // Generate messageId using SHA-256 hash (matching desktop implementation)
+      // Hash input: nonce + 'post' + senderAddress + messageContent
+      const { messageId, messageIdBytes } = _messageId
+        ? { messageId: _messageId, messageIdBytes: hexToBytes(_messageId) }
+        : generateMessageIdHash(nonce, senderId, text);
 
       // Create message object
       // For DMs, both spaceId and channelId are the recipientAddress
@@ -111,48 +183,42 @@ export function useSendDirectMessage() {
         },
         reactions: [],
         mentions: { memberIds: [], roleIds: [], channelIds: [] },
+        // Add reply metadata for display purposes
+        ...(repliesToMessageId && replyToAuthorAddress
+          ? {
+              replyMetadata: {
+                parentAuthor: replyToAuthorAddress,
+                parentChannelId: recipientAddress,
+              },
+            }
+          : {}),
       };
+
+      // Sign the message hash with the user's Ed448 key (non-repudiation)
+      // This is done before encryption so the signature is included in the encrypted payload
+      const signatureData = await signMessageIdHash(new Uint8Array(messageIdBytes));
+      if (signatureData) {
+        message.signature = signatureData.signature;
+        message.publicKey = signatureData.publicKey;
+      }
 
       // E2E encryption is required for direct messages
       const hasDeviceKeys = encryptionService.hasDeviceKeys();
-      const hasSession = encryptionService.hasSession(conversationId);
 
-      // Log encryption status for debugging
-      logger.log('[E2E] Encryption check:', {
-        hasDeviceKeys,
-        isConnected,
-        hasRecipientInfo: !!recipientInfo,
-        hasSession,
-      });
+      const me = senderId.slice(0, 8);
+      logger.debug(
+        `[DM-send ${me}] starting send to ${recipientAddress.slice(0, 12)}, conv=${conversationId.slice(0, 24)}, hasKeys=${hasDeviceKeys}, isConnected=${isConnected}`,
+      );
 
       // Validate encryption requirements
       if (!hasDeviceKeys) {
+        logger.debug(`[DM-send ${me}] FAIL: no device keys`);
         throw new Error('Device encryption keys not initialized. Please restart the app.');
       }
 
       if (!isConnected) {
+        logger.debug(`[DM-send ${me}] FAIL: not connected`);
         throw new Error('WebSocket not connected. Please check your connection.');
-      }
-
-      // If no session and no recipientInfo provided, try to fetch the registration
-      // This handles race conditions where the UI query hasn't completed yet
-      let finalRecipientInfo = recipientInfo;
-      if (!finalRecipientInfo && !hasSession) {
-        logger.log('[E2E] No recipientInfo provided and no session, fetching registration...');
-        try {
-          const registration = await apiClient.fetchUserRegistration(recipientAddress);
-          if (registration) {
-            const { toRecipientInfo } = await import('./useRecipientRegistration');
-            finalRecipientInfo = toRecipientInfo(registration) ?? undefined;
-            logger.log('[E2E] Fetched registration, recipientInfo:', !!finalRecipientInfo);
-          }
-        } catch (regError) {
-          console.error('[E2E] Failed to fetch recipient registration:', regError);
-        }
-      }
-
-      if (!finalRecipientInfo && !hasSession) {
-        throw new Error('No encryption session available. Recipient registration may be missing.');
       }
 
       // Get our device keyset for the InitializationEnvelope
@@ -161,12 +227,74 @@ export function useSendDirectMessage() {
         throw new Error('Device keyset not found. Please re-register.');
       }
 
-      // Encrypt and send via WebSocket
-      await sendEncryptedMessage(
+      // Collect all target device infos for multi-device support
+      // This includes recipient's devices AND sender's other devices
+      let allTargetDevices: Array<{
+        identityKey: number[];
+        signedPreKey: number[];
+        inboxAddress: string;
+        inboxEncryptionKey: number[];
+      }> = [];
+
+      // If we have the new multi-device params, use them
+      if (allRecipientDevices && allRecipientDevices.length > 0) {
+        allTargetDevices = [...allRecipientDevices];
+      } else if (recipientInfo) {
+        // Legacy fallback: single recipient device
+        allTargetDevices = [recipientInfo];
+      }
+
+      // Add sender's other devices (for multi-device sync)
+      if (allSenderDevices && allSenderDevices.length > 0) {
+        // Filter out our current device (by inbox address)
+        const otherSenderDevices = allSenderDevices.filter(
+          (d) => d.inboxAddress !== deviceKeyset.inboxAddress
+        );
+        allTargetDevices = [...allTargetDevices, ...otherSenderDevices];
+      }
+
+      // If no devices and no existing sessions, try to fetch registrations
+      if (allTargetDevices.length === 0) {
+        const { toAllDeviceInfos } = await import('./useRecipientRegistration');
+
+        try {
+          // Fetch recipient registration
+          const recipientReg = await apiClient.fetchUserRegistration(recipientAddress);
+          if (recipientReg) {
+            const recipientDevices = toAllDeviceInfos(recipientReg);
+            allTargetDevices = [...recipientDevices];
+          }
+
+          // Fetch our own registration (for other devices)
+          const senderReg = await apiClient.fetchUserRegistration(senderId);
+          if (senderReg) {
+            const senderDevices = toAllDeviceInfos(senderReg);
+            const otherSenderDevices = senderDevices.filter(
+              (d) => d.inboxAddress !== deviceKeyset.inboxAddress
+            );
+            allTargetDevices = [...allTargetDevices, ...otherSenderDevices];
+          }
+        } catch (regError) {
+          // Failed to fetch registrations
+        }
+      }
+
+      if (allTargetDevices.length === 0) {
+        logger.debug(`[DM-send ${me}] FAIL: no target devices`);
+        throw new Error('No target devices found. Recipient registration may be missing.');
+      }
+
+      logger.debug(
+        `[DM-send ${me}] about to send to ${allTargetDevices.length} device(s):`,
+        allTargetDevices.map((d) => d.inboxAddress.slice(0, 12)),
+      );
+
+      // Send to all target device inboxes (multi-device support)
+      await sendEncryptedMessageToAllDevices(
         conversationId,
         recipientAddress,
         message,
-        finalRecipientInfo,  // Use finalRecipientInfo (may have been fetched above)
+        allTargetDevices,
         enqueueOutbound,
         subscribe,
         {
@@ -178,8 +306,6 @@ export function useSendDirectMessage() {
         user?.displayName
       );
 
-      logger.log('[E2E] Message sent with encryption, id:', messageId);
-
       return { ...message, sendStatus: 'sent' };
     },
 
@@ -188,8 +314,8 @@ export function useSendDirectMessage() {
       recipientAddress,
       text,
       repliesToMessageId,
+      replyToAuthorAddress,
     }) => {
-      logger.log('[E2E] onMutate starting...');
       // Use the same query key format as useMessages hook (spaceId, channelId = recipientAddress)
       const key = queryKeys.messages.infinite(recipientAddress, recipientAddress);
       const senderId = user?.address ?? 'unknown';
@@ -200,7 +326,7 @@ export function useSendDirectMessage() {
       // Snapshot previous value
       const previousData = queryClient.getQueryData<InfiniteMessagesData>(key);
 
-      // Create optimistic message with a proper ID (not temp) so we can match it later
+      // Create optimistic message with a proper ID using SHA-256 hash (matching desktop)
       const nonce = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
         const r = (Math.random() * 16) | 0;
         const v = c === 'x' ? r : (r & 0x3) | 0x8;
@@ -208,8 +334,11 @@ export function useSendDirectMessage() {
       });
       const createdDate = Date.now();
 
+      // Generate messageId using SHA-256 hash (matching desktop implementation)
+      const { messageId } = generateMessageIdHash(nonce, senderId, text);
+
       const optimisticMessage: Message = {
-        messageId: `${nonce}-${createdDate}`,
+        messageId,
         channelId: recipientAddress,
         spaceId: recipientAddress,
         digestAlgorithm: 'SHA-256',
@@ -226,21 +355,18 @@ export function useSendDirectMessage() {
         reactions: [],
         mentions: { memberIds: [], roleIds: [], channelIds: [] },
         sendStatus: 'sending',
+        // Add reply metadata for display purposes
+        ...(repliesToMessageId && replyToAuthorAddress
+          ? {
+              replyMetadata: {
+                parentAuthor: replyToAuthorAddress,
+                parentChannelId: recipientAddress,
+              },
+            }
+          : {}),
       };
 
-      // Save to storage immediately with 'sending' status
-      // This ensures the message persists even if the app crashes
-      await storage.saveMessage(
-        optimisticMessage,
-        createdDate,
-        recipientAddress,
-        'direct',
-        '',
-        ''
-      );
-      logger.log('[E2E] Saved optimistic message to storage:', optimisticMessage.messageId);
-
-      // Optimistically add to cache
+      // Optimistically add to cache FIRST (before storage) for instant UI feedback
       queryClient.setQueryData<InfiniteMessagesData>(key, (old) => {
         if (!old) {
           return {
@@ -268,12 +394,28 @@ export function useSendDirectMessage() {
         };
       });
 
+      // Defer storage save to next microtask so UI updates instantly
+      // The message will persist after the cache update is reflected
+      queueMicrotask(() => {
+        storage.saveMessage(
+          optimisticMessage,
+          createdDate,
+          recipientAddress,
+          'direct',
+          '',
+          ''
+        ).catch((e) => {});
+      });
+
       return { previousData, optimisticMessage };
     },
 
     onError: async (err, { conversationId, recipientAddress }, context) => {
-      console.error('[E2E] Mutation error:', err);
-
+      const me = (user?.address ?? 'unknown').slice(0, 8);
+      logger.debug(
+        `[DM-send ${me}] MUTATION FAILED conv=${conversationId.slice(0, 24)} recipient=${recipientAddress.slice(0, 12)}:`,
+        err instanceof Error ? err.message : err,
+      );
       // Mark the optimistic message as failed in cache
       if (context?.optimisticMessage) {
         const key = queryKeys.messages.infinite(recipientAddress, recipientAddress);
@@ -307,7 +449,6 @@ export function useSendDirectMessage() {
           '',
           ''
         );
-        logger.log('[E2E] Updated message status to failed:', failedMessage.messageId);
       }
     },
 
@@ -341,26 +482,39 @@ export function useSendDirectMessage() {
         };
       });
 
-      // Persist to local storage with 'sent' status
-      await storage.saveMessage(
-        sentMessage,
-        sentMessage.createdDate,
-        recipientAddress,
-        'direct',
-        '',
-        ''
-      );
-      logger.log('[E2E] Updated message status to sent:', sentMessage.messageId);
+      // Defer storage writes so UI updates instantly
+      queueMicrotask(async () => {
+        try {
+          // Persist to local storage with 'sent' status
+          await storage.saveMessage(
+            sentMessage,
+            sentMessage.createdDate,
+            recipientAddress,
+            'direct',
+            '',
+            ''
+          );
 
-      // Update conversation timestamp
-      const conversation = await storage.getConversation(conversationId);
-      if (conversation) {
-        await storage.saveConversation({
-          ...conversation,
-          timestamp: message.createdDate,
-          lastMessageId: message.messageId,
-        });
-      }
+          // Update conversation timestamp and preview
+          const conversation = await storage.getConversation(conversationId);
+          if (conversation) {
+            // Extract text from message content
+            const content = message.content as any;
+            const previewText = Array.isArray(content?.text)
+              ? content.text.join('')
+              : content?.text || '';
+            await storage.saveConversation({
+              ...conversation,
+              timestamp: message.createdDate,
+              lastMessageId: message.messageId,
+              lastMessagePreview: previewText,
+              lastMessageSenderName: 'You',
+            } as any);
+          }
+        } catch {
+          // Storage write failed — message is already in cache via optimistic update
+        }
+      });
 
       // Invalidate conversations list to update timestamp
       queryClient.invalidateQueries({
@@ -368,31 +522,13 @@ export function useSendDirectMessage() {
       });
     },
 
-    onSettled: (_data, err, { recipientAddress }) => {
-      // Only invalidate/refetch on error - on success we've already updated cache and storage
-      // Invalidating on success causes UI flicker because the query refetches from storage
-      // which may temporarily not include the optimistic update
-      if (err) {
-        queryClient.invalidateQueries({
-          queryKey: queryKeys.messages.infinite(recipientAddress, recipientAddress),
-        });
-      }
-    },
+    // No onSettled invalidate. Trust the optimistic cache + per-handler
+    // disk writes. A refetch here would race with SQLite reads that can
+    // be transiently empty (cold cipher-key cache, migration in flight)
+    // and wipe in-flight messages from the visible state.
   });
 }
 
-/**
- * Send an encrypted message via WebSocket
- *
- * For first message (new session):
- * 1. Double Ratchet encrypt → envelope
- * 2. Wrap in InitializationEnvelope with return inbox info
- * 3. Seal with recipient's inbox_encryption_key using encryptInboxMessage
- *
- * For subsequent messages (existing session):
- * 1. Double Ratchet encrypt → envelope
- * 2. Seal with recipient's inbox_encryption_key using encryptInboxMessage
- */
 async function sendEncryptedMessage(
   conversationId: string,
   recipientAddress: string,
@@ -411,34 +547,27 @@ async function sendEncryptedMessage(
     identityPublicKey: number[];
     inboxAddress: string;
     inboxEncryptionPublicKey: number[];
-    // We need inbox signing keys for the return envelope
-    // For now we'll use simplified flow
   },
   userAddress: string,
   displayName?: string
 ): Promise<void> {
-  // Import the NativeCryptoProvider for encryption
   const { NativeCryptoProvider } = await import(
     '@/services/crypto/native-provider'
   );
   const cryptoProvider = new NativeCryptoProvider();
 
-  // For new sessions, generate the conversation inbox keypair BEFORE enqueuing
-  // so we can properly subscribe to it
   let conversationInboxAddress: string | null = null;
   let conversationInboxKeypair: { public_key: number[]; private_key: number[] } | null = null;
   let conversationSigningKeypair: { public_key: number[]; private_key: number[] } | null = null;
 
   if (recipientInfo) {
-    // === NEW SESSION: Generate inbox keypairs first ===
-    // X448 for encryption, Ed448 for signing (matches desktop's InboxKeyset structure)
+    // X448 for encryption, Ed448 for signing — address derives from the
+    // Ed448 key to match device inbox derivation and allow signature
+    // verification of inbox operations.
     conversationInboxKeypair = await cryptoProvider.generateX448();
     conversationSigningKeypair = await cryptoProvider.generateEd448();
-    // IMPORTANT: Derive address from Ed448 signing key (not X448 encryption key)
-    // This matches device inbox derivation and allows proper signature verification for inbox operations
     conversationInboxAddress = deriveAddress(new Uint8Array(conversationSigningKeypair.public_key));
 
-    // Store the conversation inbox keypair (both encryption and signing keys)
     const storedKeypair: ConversationInboxKeypair = {
       conversationId,
       inboxAddress: conversationInboxAddress,
@@ -448,27 +577,23 @@ async function sendEncryptedMessage(
       signingPrivateKey: conversationSigningKeypair.private_key,
     };
     encryptionStateStorage.saveConversationInboxKeypair(storedKeypair);
-    logger.log('[E2E] Generated conversation-specific inbox:', conversationInboxAddress.substring(0, 12));
 
-    // Save inbox mapping for the conversation inbox (1:1 mapping, no collision)
     encryptionStateStorage.saveInboxMapping(conversationInboxAddress, conversationId);
 
-    // CRITICAL: Subscribe to the conversation inbox BEFORE sending
-    // This ensures we're listening when the reply arrives
-    logger.log('[E2E] Subscribing to conversation inbox:', conversationInboxAddress.substring(0, 12));
+    // Subscribe BEFORE sending so the reply arrives on a listening socket.
     await subscribe([conversationInboxAddress]);
-    logger.log('[E2E] Subscribed to conversation inbox successfully');
   }
 
   enqueueOutbound(async () => {
     const outbounds: string[] = [];
 
     if (recipientInfo && conversationInboxAddress && conversationInboxKeypair) {
-      // === NEW SESSION: First message ===
+      // First message: DR-encrypt and wrap in an InitializationEnvelope with
+      // the return inbox info. ephemeral_public_key lives at the SealedMessage
+      // top level (not in the envelope) and is reused for both sealing and
+      // X3DH session establishment.
       const inboxAddress = recipientInfo.inboxAddress;
 
-      // Step 1: Double Ratchet encrypt the message
-      // Pass the conversation-specific inbox where replies will arrive
       const encrypted = await encryptionService.encryptMessage(
         conversationId,
         {
@@ -476,25 +601,17 @@ async function sendEncryptedMessage(
           identityKey: recipientInfo.identityKey,
           signedPreKey: recipientInfo.signedPreKey,
           inboxAddress: recipientInfo.inboxAddress,
-          inboxEncryptionKey: recipientInfo.inboxEncryptionKey, // For sealing future messages
+          inboxEncryptionKey: recipientInfo.inboxEncryptionKey,
         },
         JSON.stringify(message),
-        conversationInboxAddress  // Our conversation-specific inbox where replies will arrive
+        conversationInboxAddress
       );
 
-      // Step 2: Create InitializationEnvelope with return inbox info
-      // NOTE: Desktop does NOT include ephemeral_public_key inside the InitializationEnvelope!
-      // The ephemeral_public_key goes at the TOP LEVEL of the SealedMessage, and the SAME
-      // ephemeral key is used for BOTH sealing and X3DH.
-      //
-      // The encryption result contains the X3DH ephemeral key that was used for the Double Ratchet.
-      // We need to use THAT SAME KEY for sealing the envelope.
       const x3dhEphemeralKey = encrypted.ephemeralPublicKey;
       if (!x3dhEphemeralKey || x3dhEphemeralKey.length === 0) {
         throw new Error('X3DH ephemeral key not returned from encryption');
       }
 
-      // Convert to proper format
       const x3dhEphemeralKeyBytes = Array.isArray(x3dhEphemeralKey)
         ? x3dhEphemeralKey
         : hexToBytes(x3dhEphemeralKey);
@@ -502,97 +619,52 @@ async function sendEncryptedMessage(
         ? bytesToHex(x3dhEphemeralKey)
         : x3dhEphemeralKey;
 
-      // IMPORTANT: return_inbox_public_key and return_inbox_private_key are Ed448 signing keys
-      // (not X448 encryption keys) to match desktop's InboxKeyset structure
+      // return_inbox_{public,private}_key carry the Ed448 signing keys, not
+      // the X448 encryption keys.
       const initEnvelope: InitializationEnvelope = {
         user_address: userAddress,
-        display_name: displayName || userAddress,  // Use display name if available, fallback to address
+        display_name: displayName || userAddress,
         return_inbox_address: conversationInboxAddress,
         return_inbox_encryption_key: bytesToHex(conversationInboxKeypair.public_key),
-        // Ed448 signing public key (for verification by recipient)
         return_inbox_public_key: conversationSigningKeypair
           ? bytesToHex(conversationSigningKeypair.public_key)
           : '',
-        // Ed448 signing private key (shared with recipient so they can sign replies)
         return_inbox_private_key: conversationSigningKeypair
           ? bytesToHex(conversationSigningKeypair.private_key)
           : '',
         identity_public_key: bytesToHex(deviceKeyset.identityPublicKey),
-        // NOTE: ephemeral_public_key is NOT included inside InitializationEnvelope per desktop impl
         tag: conversationInboxAddress,
         message: encrypted.envelope,
         type: 'direct',
       };
 
-      logger.log('[E2E] Created InitializationEnvelope:', {
-        user_address: initEnvelope.user_address,
-        display_name: initEnvelope.display_name,
-        return_inbox_address: initEnvelope.return_inbox_address,
-        return_inbox_encryption_key_length: initEnvelope.return_inbox_encryption_key?.length,
-        return_inbox_public_key_length: initEnvelope.return_inbox_public_key?.length,
-        return_inbox_private_key_length: initEnvelope.return_inbox_private_key?.length,
-        identity_public_key_length: initEnvelope.identity_public_key?.length,
-        tag: initEnvelope.tag,
-        type: initEnvelope.type,
-        message_preview: initEnvelope.message.substring(0, 50) + '...',
-      });
-
-      // Step 3: Convert to bytes and seal with recipient's inbox encryption key
-      // CRITICAL: Use the SAME ephemeral key for sealing that was used for X3DH!
-      // This is what desktop does - one ephemeral key for both purposes.
       const textEncoder = new TextEncoder();
       const envelopeBytes = Array.from(textEncoder.encode(JSON.stringify(initEnvelope)));
 
-      // Get the X3DH ephemeral PRIVATE key directly from the encryption result
-      // This is the same key used for X3DH session establishment
       const ephemeralPrivateKey = encrypted.ephemeralPrivateKey;
       if (!ephemeralPrivateKey || ephemeralPrivateKey.length === 0) {
         throw new Error('X3DH ephemeral private key not returned from encryption');
       }
 
-      // ephemeralPrivateKey is already number[] from encryptMessage
       const ephemeralPrivateKeyBytes = ephemeralPrivateKey;
 
-      // Encrypt with recipient's inbox encryption key using the X3DH ephemeral key
       const sealedEnvelope = await cryptoProvider.encryptInboxMessage({
         inbox_public_key: recipientInfo.inboxEncryptionKey,
         ephemeral_private_key: ephemeralPrivateKeyBytes,
         plaintext: envelopeBytes,
       });
 
-      // Use the X3DH ephemeral public key for the sealed message
       const ephemeralPublicKeyHex = x3dhEphemeralKeyHex;
 
-      logger.log('[E2E] sealedEnvelope type:', typeof sealedEnvelope);
-      logger.log('[E2E] sealedEnvelope (first 500):', sealedEnvelope.substring(0, 500));
-      logger.log('[E2E] sealedEnvelope starts with quote:', sealedEnvelope.startsWith('"'));
-      logger.log('[E2E] sealedEnvelope starts with brace:', sealedEnvelope.startsWith('{'));
-
-      // Check if the sealedEnvelope is properly formatted JSON with expected fields
-      try {
-        const testParse = JSON.parse(sealedEnvelope);
-        logger.log('[E2E] sealedEnvelope parsed keys:', Object.keys(testParse));
-      } catch (e) {
-        logger.log('[E2E] sealedEnvelope is not valid JSON:', e);
-      }
-
-      logger.log('[E2E] Sealed envelope with inbox encryption');
-
-      // Build the sealed message
       const sealedMessage = {
         type: 'direct',
         inbox_address: inboxAddress,
         ephemeral_public_key: ephemeralPublicKeyHex,
         envelope: sealedEnvelope,
-        inbox_public_key: '',  // Empty for first message
-        inbox_signature: '',   // Empty for first message
+        inbox_public_key: '',
+        inbox_signature: '',
       };
 
-      logger.log('[E2E] Sending sealed message (new session):', {
-        inbox_address: sealedMessage.inbox_address,
-        ephemeral_public_key: sealedMessage.ephemeral_public_key.substring(0, 20) + '...',
-        envelope_preview: sealedMessage.envelope.substring(0, 50) + '...',
-      });
       outbounds.push(JSON.stringify(sealedMessage));
     } else {
       // === EXISTING SESSION: Subsequent message ===
@@ -602,11 +674,6 @@ async function sendEncryptedMessage(
       if (!latestState) {
         throw new Error('No encryption session found for conversation');
       }
-
-      logger.log('[E2E] Using latestState for existing session:', {
-        inboxId: latestState.inboxId.substring(0, 12),
-        timestamp: latestState.timestamp,
-      });
 
       const encryptionState = encryptionStateStorage.getEncryptionState(
         conversationId,
@@ -625,124 +692,83 @@ async function sendEncryptedMessage(
       );
 
       // Check if we have sendingInbox info for proper sealing
-      // If sendingInbox.inbox_public_key is empty, we haven't confirmed the session yet
-      // and need to send with InitializationEnvelope (like desktop's DoubleRatchetInboxEncryptForceSenderInit)
       const sendingInbox = encryptionState.sendingInbox;
       const needsInitEnvelope = !sendingInbox || sendingInbox.inbox_public_key === '';
 
       if (needsInitEnvelope && sendingInbox?.inbox_encryption_key) {
-        // === Unconfirmed session: Wrap in InitializationEnvelope ===
-        // This is like desktop's DoubleRatchetInboxEncryptForceSenderInit
-        logger.log('[E2E] Sending with InitializationEnvelope (session not confirmed yet)');
-
-        // Get our conversation inbox keypair (for return address)
+        // Session not yet confirmed: rewrap in an InitializationEnvelope.
         const ourConversationInbox = encryptionStateStorage.getConversationInboxKeypair(conversationId);
 
-        // CRITICAL: Use the SAME X3DH ephemeral key that was used for session establishment.
-        // The receiver will do X3DH with this ephemeral key to derive the session key.
-        // If we use a different ephemeral key, the receiver gets a different session key
-        // and the Double Ratchet decrypt will fail.
+        // Reuse the X3DH ephemeral key from session establishment so the
+        // receiver derives the matching session key. A fresh ephemeral
+        // would make DR-decrypt fail.
         let ephemeralPrivateKeyBytes: number[];
         let ephemeralPublicKeyHex: string;
 
         if (encryptionState.x3dhEphemeralPublicKey && encryptionState.x3dhEphemeralPrivateKey) {
-          // Reuse stored X3DH ephemeral key
-          logger.log('[E2E] Reusing stored X3DH ephemeral key:', encryptionState.x3dhEphemeralPublicKey.substring(0, 20) + '...');
           ephemeralPublicKeyHex = encryptionState.x3dhEphemeralPublicKey;
           ephemeralPrivateKeyBytes = hexToBytes(encryptionState.x3dhEphemeralPrivateKey);
         } else {
-          // Fallback: Generate new ephemeral key and SAVE it for subsequent messages
-          // This handles sessions created before the ephemeral key storage fix
-          logger.log('[E2E] No stored X3DH ephemeral key, generating and saving new one');
+          // Fallback for sessions created before ephemeral-key storage was
+          // added — generate one and persist for future messages.
           const sealingEphemeralKey = await cryptoProvider.generateX448();
           ephemeralPrivateKeyBytes = sealingEphemeralKey.private_key;
           ephemeralPublicKeyHex = bytesToHex(sealingEphemeralKey.public_key);
 
-          // Save to encryption state for future messages
           const updatedState = {
             ...encryptionState,
             x3dhEphemeralPublicKey: ephemeralPublicKeyHex,
             x3dhEphemeralPrivateKey: bytesToHex(ephemeralPrivateKeyBytes),
           };
           encryptionStateStorage.saveEncryptionState(updatedState, false);
-          logger.log('[E2E] Saved ephemeral key to state:', ephemeralPublicKeyHex.substring(0, 20) + '...');
         }
 
-        // Build the InitializationEnvelope (NO ephemeral_public_key inside!)
-        // IMPORTANT: return_inbox_public_key and return_inbox_private_key are Ed448 signing keys
-        // (not X448 encryption keys) to match desktop's InboxKeyset structure
         const initEnvelope: InitializationEnvelope = {
           user_address: userAddress,
-          display_name: displayName || userAddress,  // Use display name if available, fallback to address
+          display_name: displayName || userAddress,
           return_inbox_address: ourConversationInbox?.inboxAddress || deviceKeyset.inboxAddress,
           return_inbox_encryption_key: ourConversationInbox
             ? bytesToHex(ourConversationInbox.encryptionPublicKey)
             : bytesToHex(deviceKeyset.inboxEncryptionPublicKey),
-          // Ed448 signing public key (for verification)
           return_inbox_public_key: ourConversationInbox?.signingPublicKey
             ? bytesToHex(ourConversationInbox.signingPublicKey)
             : '',
-          // Ed448 signing private key (shared with recipient for their future signatures)
-          // This allows the recipient to verify messages from us
           return_inbox_private_key: ourConversationInbox?.signingPrivateKey
             ? bytesToHex(ourConversationInbox.signingPrivateKey)
             : '',
           identity_public_key: bytesToHex(deviceKeyset.identityPublicKey),
-          // NOTE: ephemeral_public_key is NOT in InitializationEnvelope!
           tag: ourConversationInbox?.inboxAddress || deviceKeyset.inboxAddress,
           message: encrypted.envelope,
           type: 'direct',
         };
 
-        logger.log('[E2E] Created InitializationEnvelope for existing session:', {
-          user_address: initEnvelope.user_address,
-          display_name: initEnvelope.display_name,
-          return_inbox_address: initEnvelope.return_inbox_address.substring(0, 12),
-          sendingTo: sendingInbox.inbox_address.substring(0, 12),
-        });
-
-        // Seal with recipient's inbox encryption key using the X3DH ephemeral key
         const textEncoder = new TextEncoder();
         const envelopeBytes = Array.from(textEncoder.encode(JSON.stringify(initEnvelope)));
 
-        // Parse the recipient's inbox encryption key from hex
         const recipientInboxEncryptionKey = hexToBytes(sendingInbox.inbox_encryption_key);
 
-        // Encrypt with recipient's inbox encryption key using the SAME X3DH ephemeral key
         const sealedEnvelope = await cryptoProvider.encryptInboxMessage({
           inbox_public_key: recipientInboxEncryptionKey,
           ephemeral_private_key: ephemeralPrivateKeyBytes,
           plaintext: envelopeBytes,
         });
 
-        // Use the X3DH ephemeral public key at the TOP LEVEL of SealedMessage
         const sealedMessage = {
           type: 'direct',
           inbox_address: sendingInbox.inbox_address,
-          ephemeral_public_key: ephemeralPublicKeyHex,  // SAME key used for sealing and X3DH
+          ephemeral_public_key: ephemeralPublicKeyHex,
           envelope: sealedEnvelope,
           inbox_public_key: '',
           inbox_signature: '',
         };
 
-        logger.log('[E2E] Sending sealed message (existing session, init envelope):', {
-          inbox_address: sealedMessage.inbox_address.substring(0, 12),
-          ephemeral_key: sealedMessage.ephemeral_public_key.substring(0, 20) + '...',
-        });
         outbounds.push(JSON.stringify(sealedMessage));
       } else if (sendingInbox?.inbox_address) {
-        // === Confirmed session with known sendingInbox: Send to per-conversation inbox ===
-        // The sendingInbox.inbox_address is the recipient's per-conversation inbox
-        // where they receive messages for this specific conversation
-        logger.log('[E2E] Sending to per-conversation inbox (session confirmed)');
-
-        // Generate ephemeral key for sealing
+        // Confirmed session: send to the recipient's per-conversation inbox.
         const sealingEphemeralKey = await cryptoProvider.generateX448();
 
-        // Parse the recipient's inbox encryption key from hex
         const recipientInboxEncryptionKey = hexToBytes(sendingInbox.inbox_encryption_key);
 
-        // Seal the Double Ratchet envelope with recipient's inbox encryption key
         const textEncoder = new TextEncoder();
         const envelopeBytes = Array.from(textEncoder.encode(encrypted.envelope));
 
@@ -754,21 +780,343 @@ async function sendEncryptedMessage(
 
         const existingSessionMsg = {
           type: 'direct',
-          inbox_address: sendingInbox.inbox_address,  // Send to per-conversation inbox!
+          inbox_address: sendingInbox.inbox_address,
           envelope: sealedEnvelope,
           ephemeral_public_key: bytesToHex(sealingEphemeralKey.public_key),
           inbox_public_key: '',
           inbox_signature: '',
         };
-        logger.log('[E2E] Sending message (existing session, sealed):', {
-          inbox_address: existingSessionMsg.inbox_address.substring(0, 12),
-          ephemeral_public_key: existingSessionMsg.ephemeral_public_key.substring(0, 20) + '...',
-        });
         outbounds.push(JSON.stringify(existingSessionMsg));
       } else {
-        // No sendingInbox - this shouldn't happen for established sessions
-        console.error('[E2E] No sendingInbox for existing session - cannot send');
         throw new Error('No sendingInbox available for sending');
+      }
+    }
+
+    return outbounds;
+  });
+}
+
+/**
+ * Send an encrypted message to ALL target device inboxes
+ *
+ * This handles multi-device support by:
+ * 1. Collecting all target inboxes (recipient's devices + sender's other devices)
+ * 2. For each inbox, checking if we have an existing session
+ * 3. Creating new sessions for new inboxes, using existing sessions for known ones
+ * 4. Enqueueing all encrypted messages together
+ */
+export async function sendEncryptedMessageToAllDevices(
+  conversationId: string,
+  recipientAddress: string,
+  message: Message,
+  allTargetDevices: Array<{
+    identityKey: number[];
+    signedPreKey: number[];
+    inboxAddress: string;
+    inboxEncryptionKey: number[];
+  }>,
+  enqueueOutbound: (prepareMessage: () => Promise<string[]>) => void,
+  subscribe: (inboxAddresses: string[]) => Promise<void>,
+  deviceKeyset: {
+    identityPublicKey: number[];
+    inboxAddress: string;
+    inboxEncryptionPublicKey: number[];
+  },
+  userAddress: string,
+  displayName?: string
+): Promise<void> {
+  // Import the NativeCryptoProvider for encryption
+  const { NativeCryptoProvider } = await import('@/services/crypto/native-provider');
+  const cryptoProvider = new NativeCryptoProvider();
+
+  // Get all existing encryption states for this conversation
+  const existingStates = encryptionStateStorage.getEncryptionStates(conversationId);
+  const existingInboxTags = new Set(existingStates.map((s) => s.tag).filter(Boolean));
+
+  // Determine which devices need new sessions vs existing sessions
+  const devicesNeedingNewSession: typeof allTargetDevices = [];
+  const devicesWithExistingSession: Array<{
+    device: typeof allTargetDevices[0];
+    state: ReturnType<typeof encryptionStateStorage.getEncryptionState>;
+  }> = [];
+
+  for (const device of allTargetDevices) {
+    // Skip our own current device inbox
+    if (device.inboxAddress === deviceKeyset.inboxAddress) {
+      continue;
+    }
+
+    // Check if we have an existing session for this device's inbox (by tag)
+    const existingState = existingStates.find((s) => s.tag === device.inboxAddress);
+    if (existingState) {
+      devicesWithExistingSession.push({ device, state: existingState });
+    } else {
+      devicesNeedingNewSession.push(device);
+    }
+  }
+
+  // For new sessions, generate conversation inbox keypairs BEFORE enqueuing
+  // so we can properly subscribe to them
+  // Generate all keypairs in parallel for better performance
+  const newSessionPrepData = await Promise.all(
+    devicesNeedingNewSession.map(async (device) => {
+      // Generate X448 for encryption, Ed448 for signing - in parallel
+      const [conversationInboxKeypair, conversationSigningKeypair] = await Promise.all([
+        cryptoProvider.generateX448(),
+        cryptoProvider.generateEd448(),
+      ]);
+      // Derive address from Ed448 signing key
+      const conversationInboxAddress = deriveAddress(new Uint8Array(conversationSigningKeypair.public_key));
+
+      // Store the conversation inbox keypair
+      const storedKeypair: ConversationInboxKeypair = {
+        conversationId,
+        inboxAddress: conversationInboxAddress,
+        encryptionPublicKey: conversationInboxKeypair.public_key,
+        encryptionPrivateKey: conversationInboxKeypair.private_key,
+        signingPublicKey: conversationSigningKeypair.public_key,
+        signingPrivateKey: conversationSigningKeypair.private_key,
+      };
+      encryptionStateStorage.saveConversationInboxKeypair(storedKeypair);
+
+      // Save inbox mapping
+      encryptionStateStorage.saveInboxMapping(conversationInboxAddress, conversationId);
+
+      return {
+        device,
+        conversationInboxAddress,
+        conversationInboxKeypair,
+        conversationSigningKeypair,
+      };
+    })
+  );
+
+  // Subscribe to all conversation inboxes in parallel
+  const inboxAddresses = newSessionPrepData.map((p) => p.conversationInboxAddress);
+  if (inboxAddresses.length > 0) {
+    await subscribe(inboxAddresses);
+  }
+
+  // Enqueue all outbound messages
+  enqueueOutbound(async () => {
+    const outbounds: string[] = [];
+
+    // === Handle new sessions ===
+    for (const prep of newSessionPrepData) {
+      const { device, conversationInboxAddress, conversationInboxKeypair, conversationSigningKeypair } = prep;
+
+      // Encrypt with Double Ratchet using the new device method
+      // This forces a new session to be established for this specific device
+      const encrypted = await encryptionService.encryptMessageForNewDevice(
+        conversationId,
+        {
+          address: recipientAddress,
+          identityKey: device.identityKey,
+          signedPreKey: device.signedPreKey,
+          inboxAddress: device.inboxAddress,
+          inboxEncryptionKey: device.inboxEncryptionKey,
+        },
+        JSON.stringify(message),
+        conversationInboxAddress,
+        device.inboxAddress  // Use device's inbox as the tag
+      );
+
+      // Get X3DH ephemeral key
+      const x3dhEphemeralKey = encrypted.ephemeralPublicKey;
+      if (!x3dhEphemeralKey || x3dhEphemeralKey.length === 0) {
+        continue;
+      }
+
+      const x3dhEphemeralKeyBytes = Array.isArray(x3dhEphemeralKey) ? x3dhEphemeralKey : hexToBytes(x3dhEphemeralKey);
+      const x3dhEphemeralKeyHex = Array.isArray(x3dhEphemeralKey) ? bytesToHex(x3dhEphemeralKey) : x3dhEphemeralKey;
+
+      // Build InitializationEnvelope
+      const initEnvelope: InitializationEnvelope = {
+        user_address: userAddress,
+        display_name: displayName || userAddress,
+        return_inbox_address: conversationInboxAddress,
+        return_inbox_encryption_key: bytesToHex(conversationInboxKeypair.public_key),
+        return_inbox_public_key: bytesToHex(conversationSigningKeypair.public_key),
+        return_inbox_private_key: bytesToHex(conversationSigningKeypair.private_key),
+        identity_public_key: bytesToHex(deviceKeyset.identityPublicKey),
+        tag: conversationInboxAddress,
+        message: encrypted.envelope,
+        type: 'direct',
+      };
+
+      // Seal with recipient's inbox encryption key
+      const textEncoder = new TextEncoder();
+      const envelopeBytes = Array.from(textEncoder.encode(JSON.stringify(initEnvelope)));
+
+      const ephemeralPrivateKey = encrypted.ephemeralPrivateKey;
+      if (!ephemeralPrivateKey || ephemeralPrivateKey.length === 0) {
+        continue;
+      }
+
+      const sealedEnvelope = await cryptoProvider.encryptInboxMessage({
+        inbox_public_key: device.inboxEncryptionKey,
+        ephemeral_private_key: ephemeralPrivateKey,
+        plaintext: envelopeBytes,
+      });
+
+      const sealedMessage = {
+        type: 'direct',
+        inbox_address: device.inboxAddress,
+        ephemeral_public_key: x3dhEphemeralKeyHex,
+        envelope: sealedEnvelope,
+        inbox_public_key: '',
+        inbox_signature: '',
+      };
+
+      outbounds.push(JSON.stringify(sealedMessage));
+    }
+
+    // === Handle existing sessions ===
+    for (const { device, state } of devicesWithExistingSession) {
+      if (!state) continue;
+
+      // Validate state has required fields
+      if (!state.inboxId || !state.state) {
+        continue;
+      }
+
+      // Check if session is confirmed or needs InitializationEnvelope
+      const sendingInbox = state.sendingInbox;
+      const needsInitEnvelope = !sendingInbox || sendingInbox.inbox_public_key === '';
+
+      if (needsInitEnvelope && sendingInbox?.inbox_encryption_key) {
+        // CRITICAL: Unconfirmed session means the receiver never got our previous messages
+        // or never acknowledged them. We need to send as a NEW session so the receiver
+        // can do X3DH and derive the same initial ratchet state.
+        //
+        // If we use the existing (advanced) ratchet state, the receiver will do X3DH
+        // to get the initial state, and won't be able to decrypt our message.
+        //
+        // Treat this like devicesNeedingNewSession - establish a fresh X3DH session.
+
+        // Get or create conversation inbox for this device
+        let convInboxAddress: string;
+        let convInboxKeypair: { public_key: number[]; private_key: number[] };
+        let convSigningKeypair: { public_key: number[]; private_key: number[] };
+
+        const existingConvInbox = encryptionStateStorage.getConversationInboxKeypair(conversationId);
+        if (existingConvInbox) {
+          convInboxAddress = existingConvInbox.inboxAddress;
+          convInboxKeypair = {
+            public_key: existingConvInbox.encryptionPublicKey,
+            private_key: existingConvInbox.encryptionPrivateKey,
+          };
+          convSigningKeypair = {
+            public_key: existingConvInbox.signingPublicKey,
+            private_key: existingConvInbox.signingPrivateKey,
+          };
+        } else {
+          // Generate new conversation inbox
+          convInboxKeypair = await cryptoProvider.generateX448();
+          convSigningKeypair = await cryptoProvider.generateEd448();
+          convInboxAddress = deriveAddress(new Uint8Array(convSigningKeypair.public_key));
+
+          const storedKeypair: ConversationInboxKeypair = {
+            conversationId,
+            inboxAddress: convInboxAddress,
+            encryptionPublicKey: convInboxKeypair.public_key,
+            encryptionPrivateKey: convInboxKeypair.private_key,
+            signingPublicKey: convSigningKeypair.public_key,
+            signingPrivateKey: convSigningKeypair.private_key,
+          };
+          encryptionStateStorage.saveConversationInboxKeypair(storedKeypair);
+          encryptionStateStorage.saveInboxMapping(convInboxAddress, conversationId);
+        }
+
+        // Force a new X3DH session for this device
+        const encrypted = await encryptionService.encryptMessageForNewDevice(
+          conversationId,
+          {
+            address: recipientAddress,
+            identityKey: device.identityKey,
+            signedPreKey: device.signedPreKey,
+            inboxAddress: device.inboxAddress,
+            inboxEncryptionKey: device.inboxEncryptionKey,
+          },
+          JSON.stringify(message),
+          convInboxAddress,
+          device.inboxAddress  // Tag with device inbox
+        );
+
+        const x3dhEphemeralKey = encrypted.ephemeralPublicKey;
+        if (!x3dhEphemeralKey || x3dhEphemeralKey.length === 0) {
+          continue;
+        }
+
+        const x3dhEphemeralKeyHex = Array.isArray(x3dhEphemeralKey) ? bytesToHex(x3dhEphemeralKey) : x3dhEphemeralKey;
+
+        const initEnvelope: InitializationEnvelope = {
+          user_address: userAddress,
+          display_name: displayName || userAddress,
+          return_inbox_address: convInboxAddress,
+          return_inbox_encryption_key: bytesToHex(convInboxKeypair.public_key),
+          return_inbox_public_key: bytesToHex(convSigningKeypair.public_key),
+          return_inbox_private_key: bytesToHex(convSigningKeypair.private_key),
+          identity_public_key: bytesToHex(deviceKeyset.identityPublicKey),
+          tag: convInboxAddress,
+          message: encrypted.envelope,
+          type: 'direct',
+        };
+
+        const textEncoder = new TextEncoder();
+        const envelopeBytes = Array.from(textEncoder.encode(JSON.stringify(initEnvelope)));
+
+        const ephemeralPrivateKey = encrypted.ephemeralPrivateKey;
+        if (!ephemeralPrivateKey || ephemeralPrivateKey.length === 0) {
+          continue;
+        }
+
+        const sealedEnvelope = await cryptoProvider.encryptInboxMessage({
+          inbox_public_key: device.inboxEncryptionKey,
+          ephemeral_private_key: ephemeralPrivateKey,
+          plaintext: envelopeBytes,
+        });
+
+        const sealedMessage = {
+          type: 'direct',
+          inbox_address: device.inboxAddress,
+          ephemeral_public_key: x3dhEphemeralKeyHex,
+          envelope: sealedEnvelope,
+          inbox_public_key: '',
+          inbox_signature: '',
+        };
+
+        outbounds.push(JSON.stringify(sealedMessage));
+      } else if (sendingInbox?.inbox_address && sendingInbox?.inbox_encryption_key) {
+        // Confirmed session - encrypt with existing session and send directly
+        const encrypted = await encryptWithExistingSession(
+          conversationId,
+          state.inboxId,
+          JSON.stringify(message)
+        );
+
+        const sealingEphemeralKey = await cryptoProvider.generateX448();
+        const recipientInboxEncryptionKey = hexToBytes(sendingInbox.inbox_encryption_key);
+
+        const textEncoder = new TextEncoder();
+        const envelopeBytes = Array.from(textEncoder.encode(encrypted.envelope));
+
+        const sealedEnvelope = await cryptoProvider.encryptInboxMessage({
+          inbox_public_key: recipientInboxEncryptionKey,
+          ephemeral_private_key: sealingEphemeralKey.private_key,
+          plaintext: envelopeBytes,
+        });
+
+        const existingSessionMsg = {
+          type: 'direct',
+          inbox_address: sendingInbox.inbox_address,
+          envelope: sealedEnvelope,
+          ephemeral_public_key: bytesToHex(sealingEphemeralKey.public_key),
+          inbox_public_key: '',
+          inbox_signature: '',
+        };
+
+        outbounds.push(JSON.stringify(existingSessionMsg));
       }
     }
 
@@ -793,6 +1141,10 @@ async function encryptWithExistingSession(
     throw new Error('No encryption state found');
   }
 
+  if (!encryptionState.state) {
+    throw new Error('Encryption state has no ratchet state');
+  }
+
   // Use the encryption service's internal encrypt method
   // Since we have an existing session, we don't need recipient info
   const textEncoder = new TextEncoder();
@@ -808,8 +1160,6 @@ async function encryptWithExistingSession(
   // The ratchet_state contains sending_ephemeral_private_key which we need to derive the public key from
   // Parse the ratchet state (it's always stored as a JSON string)
   let ratchetState: Record<string, unknown>;
-  logger.log('[E2E] Encryption state type:', typeof encryptionState.state, 'starts with:',
-    encryptionState.state.substring(0, 50));
 
   // Check for corrupted state
   let stateStr = encryptionState.state;
@@ -819,7 +1169,6 @@ async function encryptWithExistingSession(
   // Handle double-escaped JSON (starts with {\" which appears as {\\ in JS)
   // This happens when JSON was stringified twice
   if (stateStr.includes('\\"') || stateStr.includes('\\\\')) {
-    logger.log('[E2E] State appears double-escaped, unescaping');
     // Unescape: \" -> " and \\ -> \
     stateStr = stateStr.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
   }

@@ -7,7 +7,6 @@
  * - Sign message capability for API requests (ed448)
  */
 
-import { logger } from '@quilibrium/quorum-shared';
 import React, {
   createContext,
   useContext,
@@ -16,13 +15,15 @@ import React, {
   useMemo,
   useEffect,
 } from 'react';
+import { InteractionManager } from 'react-native';
 import { mmkvStorage, clearAllMMKVStorage } from '../services/offline/storage';
-import { getPrivateKey, getDeviceKeyset, clearAllSecureStorage, getFarcasterAuthToken, getFarcasterCustodyKey, storeFarcasterAuthToken } from '../services/onboarding/secureStorage';
+import { getPrivateKey, getDeviceKeyset, clearAllSecureStorage, getFarcasterAuthToken, getFarcasterCustodyKey, storeFarcasterAuthToken, storeFarcasterCustodyKey, storeFarcasterSignerKey, storeFarcasterFid, getMnemonic } from '../services/onboarding/secureStorage';
+import { deriveFarcasterKeys, lookupFarcasterAccount, validateFarcasterMnemonic } from '../services/onboarding/farcasterService';
 import { refreshFarcasterAuthToken } from '../services/onboarding/farcasterService';
-import { initializeEncryptionKeys, uploadUserRegistration } from '../services/onboarding/keyService';
+import { initializeEncryptionKeys, uploadUserRegistration, deriveQuilibriumAddressWithMnemonic, ensurePrivateKey } from '../services/onboarding/keyService';
 import { NativeSigningProvider } from '../services/crypto';
 import { getConfig, saveConfig } from '../services/config';
-
+import { logger } from '@quilibrium/quorum-shared';
 // Auth state types
 export type AuthState = 'loading' | 'unauthenticated' | 'onboarding' | 'authenticated';
 
@@ -37,12 +38,15 @@ export interface FarcasterInfo {
 }
 
 export interface UserInfo {
-  address: string;
+  address: string;              // Qm... style Quorum address
+  quilibriumAddress: string;    // 0x-prefixed Quilibrium address for QNS
   publicKey: string;
   displayName?: string;
-  username?: string;
+  username?: string;            // Deprecated, use primaryUsername
+  primaryUsername?: string;     // QNS username set as primary (e.g., "alice" for @alice)
   bio?: string;
   profileImage?: string;
+  isProfilePublic?: boolean;    // Whether profile is visible to anyone (opt-in)
   privacyLevel: PrivacyLevel;
   farcaster?: FarcasterInfo;
 }
@@ -60,6 +64,17 @@ interface AuthContextValue {
   signOut: () => Promise<void>;
   updateProfile: (updates: Partial<UserInfo>) => void;
   signMessage: (message: string) => Promise<string>;
+  /**
+   * Attempt to refresh the Farcaster auth token via the stored
+   * custody key. Returns a result tuple so surfaces can distinguish
+   * "got a token" from the various ways it can fail (no credentials,
+   * mnemonic recovery failed, API rejected, network error). Each
+   * branch maps to a different UI affordance — see feed/index.tsx.
+   */
+  refreshFarcasterToken: () => Promise<
+    | { token: string }
+    | { error: 'no-credentials' | 'derivation-failed' | 'api-rejected' | 'unknown'; detail?: string }
+  >;
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null);
@@ -86,114 +101,160 @@ export function AuthProvider({ children }: AuthProviderProps) {
         const storedState = mmkvStorage.getItem(STORAGE_KEYS.AUTH_STATE);
 
         if (storedUser && storedState === 'authenticated') {
-          const parsedUser = JSON.parse(storedUser) as UserInfo;
+          let parsedUser = JSON.parse(storedUser) as UserInfo;
+
+          // Auto-derive quilibriumAddress for existing accounts that don't have it
+          if (!parsedUser.quilibriumAddress) {
+            const [mnemonic, privateKey] = await Promise.all([
+              getMnemonic(),
+              getPrivateKey(),
+            ]);
+            if (mnemonic || privateKey) {
+              parsedUser = {
+                ...parsedUser,
+                quilibriumAddress: deriveQuilibriumAddressWithMnemonic(mnemonic, privateKey),
+              };
+              // Save updated user with quilibriumAddress
+              mmkvStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(parsedUser));
+            }
+          }
+
           setUser(parsedUser);
           setAuthState('authenticated');
 
-          // Ensure encryption keys exist and registration is uploaded
-          // (for users who onboarded before E2E or registration upload was added)
-          const keyset = await getDeviceKeyset();
-          const privateKey = await getPrivateKey();
+          // Load Farcaster auth token FIRST - it's quick and needed for API calls
+          try {
+            const farcasterToken = await getFarcasterAuthToken();
+            logger.debug('[AuthContext] Farcaster token from storage:', farcasterToken ? 'found' : 'not found');
+            if (farcasterToken) {
+              setFarcasterAuthToken(farcasterToken);
+            }
+          } catch (tokenError) {
+            logger.debug('[AuthContext] Error loading Farcaster token:', tokenError);
+            // Ignore - will try to refresh later
+          }
 
-          if (!keyset && parsedUser.publicKey) {
-            logger.log('[Auth] Initializing missing encryption keys...');
-            try {
-              const deviceKeyset = await initializeEncryptionKeys(parsedUser.publicKey);
-              logger.log('[Auth] Encryption keys initialized successfully');
+          // Defer heavy background tasks to not block UI rendering
+          // These operations involve crypto and network calls that can freeze the UI
+          InteractionManager.runAfterInteractions(async () => {
+            logger.debug('[AuthContext] Deferred tasks starting...');
+            // Small delay to ensure UI has fully rendered
+            await new Promise(resolve => setTimeout(resolve, 500));
 
-              // Upload registration to server
-              if (privateKey) {
+            // Run encryption setup and independent network tasks in parallel
+            const encryptionTask = (async () => {
+              // ensurePrivateKey self-heals: if the Ed448 key was lost from
+              // secure storage but the mnemonic is still there, re-derive and
+              // re-persist it. Without this, uploadUserRegistration below is
+              // skipped, the current device inbox never reaches the server,
+              // and this user becomes unreachable over DM.
+              const [keyset, privateKey] = await Promise.all([
+                getDeviceKeyset(),
+                ensurePrivateKey(),
+              ]);
+
+              const meAddr = parsedUser.address.slice(0, 8);
+              logger.debug(
+                `[AuthContext ${meAddr}] startup encryption task: hasKeyset=${!!keyset}, hasPrivateKey=${!!privateKey}, hasPublicKey=${!!parsedUser.publicKey}`,
+              );
+
+              if (!keyset && parsedUser.publicKey) {
+                logger.debug(`[AuthContext ${meAddr}] no keyset — initializing new keys`);
+                try {
+                  const deviceKeyset = await initializeEncryptionKeys(parsedUser.publicKey);
+                  if (privateKey) {
+                    try {
+                      await uploadUserRegistration(
+                        parsedUser.address,
+                        parsedUser.publicKey,
+                        privateKey,
+                        deviceKeyset
+                      );
+                    } catch (uploadError) {
+                      logger.debug(
+                        `[AuthContext ${meAddr}] post-init upload failed:`,
+                        uploadError instanceof Error ? uploadError.message : uploadError,
+                      );
+                    }
+                  } else {
+                    logger.debug(`[AuthContext ${meAddr}] SKIP upload after key init: no privateKey`);
+                  }
+                } catch (keyError) {
+                  logger.debug(
+                    `[AuthContext ${meAddr}] initializeEncryptionKeys failed:`,
+                    keyError instanceof Error ? keyError.message : keyError,
+                  );
+                }
+              } else if (keyset && privateKey && parsedUser.publicKey) {
                 try {
                   await uploadUserRegistration(
                     parsedUser.address,
                     parsedUser.publicKey,
                     privateKey,
-                    deviceKeyset
+                    keyset
                   );
-                  logger.log('[Auth] Registration uploaded successfully');
                 } catch (uploadError) {
-                  console.error('[Auth] Failed to upload registration:', uploadError);
-                }
-              }
-            } catch (keyError) {
-              console.error('[Auth] Failed to initialize encryption keys:', keyError);
-            }
-          } else if (keyset && privateKey && parsedUser.publicKey) {
-            // Keys exist but registration may not be uploaded yet
-            // Try to upload registration (server will handle duplicates)
-            logger.log('[Auth] Checking registration upload for existing keyset...');
-            try {
-              await uploadUserRegistration(
-                parsedUser.address,
-                parsedUser.publicKey,
-                privateKey,
-                keyset
-              );
-              logger.log('[Auth] Registration uploaded/verified successfully');
-            } catch (uploadError) {
-              // Don't log error as 409 Conflict is expected if already registered
-              const errorMsg = uploadError instanceof Error ? uploadError.message : String(uploadError);
-              if (!errorMsg.includes('409') && !errorMsg.includes('conflict')) {
-                console.error('[Auth] Failed to upload registration:', uploadError);
-              }
-            }
-          }
-
-          // Sync user config from server (profile name, settings, etc.)
-          try {
-            const config = await getConfig(parsedUser.address);
-            logger.log('[Auth] Config synced:', {
-              hasName: !!config.name,
-              hasProfileImage: !!config.profile_image,
-              allowSync: config.allowSync,
-            });
-
-            // Update local user info with synced profile data
-            if (config.name || config.profile_image) {
-              const updatedUser = {
-                ...parsedUser,
-                displayName: config.name || parsedUser.displayName,
-                profileImage: config.profile_image || parsedUser.profileImage,
-              };
-              setUser(updatedUser);
-              mmkvStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(updatedUser));
-            }
-          } catch (configError) {
-            logger.log('[Auth] Config sync failed (non-fatal):', configError);
-          }
-
-          // Load Farcaster auth token if available
-          try {
-            let farcasterToken = await getFarcasterAuthToken();
-            if (farcasterToken) {
-              setFarcasterAuthToken(farcasterToken);
-              logger.log('[Auth] Farcaster auth token loaded');
-            } else {
-              logger.log('[Auth] No Farcaster auth token found in storage, attempting refresh...');
-              // Try to refresh using stored custody key
-              const custodyKey = await getFarcasterCustodyKey();
-              if (custodyKey) {
-                logger.log('[Auth] Custody key found, refreshing auth token...');
-                farcasterToken = await refreshFarcasterAuthToken(custodyKey);
-                if (farcasterToken) {
-                  await storeFarcasterAuthToken(farcasterToken);
-                  setFarcasterAuthToken(farcasterToken);
-                  logger.log('[Auth] Farcaster auth token refreshed and stored');
-                } else {
-                  logger.log('[Auth] Failed to refresh Farcaster auth token');
+                  const errorMsg = uploadError instanceof Error ? uploadError.message : String(uploadError);
+                  if (!errorMsg.includes('409') && !errorMsg.includes('conflict')) {
+                    logger.debug(
+                      `[AuthContext ${meAddr}] startup registration upload error:`,
+                      errorMsg,
+                    );
+                  }
                 }
               } else {
-                logger.log('[Auth] No custody key available, cannot refresh auth token');
+                logger.debug(
+                  `[AuthContext ${meAddr}] SKIP registration: missing one of keyset(${!!keyset}), privateKey(${!!privateKey}), publicKey(${!!parsedUser.publicKey})`,
+                );
               }
-            }
-          } catch (tokenError) {
-            logger.log('[Auth] Failed to load Farcaster auth token (non-fatal):', tokenError);
-          }
+            })();
+
+            // Config sync runs in parallel with encryption setup
+            const configTask = (async () => {
+              try {
+                const config = await getConfig(parsedUser.address);
+                if (config.name || config.profile_image) {
+                  const updatedUser = {
+                    ...parsedUser,
+                    displayName: config.name || parsedUser.displayName,
+                    profileImage: config.profile_image || parsedUser.profileImage,
+                  };
+                  setUser(updatedUser);
+                  mmkvStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(updatedUser));
+                }
+              } catch (configError) {
+              }
+            })();
+
+            // Farcaster token refresh runs in parallel with encryption setup
+            const tokenTask = (async () => {
+              try {
+                let farcasterToken = await getFarcasterAuthToken();
+                logger.debug('[AuthContext] Deferred token check:', farcasterToken ? 'found' : 'not found');
+                if (!farcasterToken) {
+                  const custodyKey = await getFarcasterCustodyKey();
+                  logger.debug('[AuthContext] Custody key for refresh:', custodyKey ? 'found' : 'not found');
+                  if (custodyKey) {
+                    farcasterToken = await refreshFarcasterAuthToken(custodyKey);
+                    logger.debug('[AuthContext] Refreshed token:', farcasterToken ? 'success' : 'failed');
+                    if (farcasterToken) {
+                      await storeFarcasterAuthToken(farcasterToken);
+                      setFarcasterAuthToken(farcasterToken);
+                    }
+                  }
+                }
+              } catch (tokenError) {
+                logger.debug('[AuthContext] Token refresh error:', tokenError);
+              }
+            })();
+
+            // Wait for all tasks to complete
+            await Promise.all([encryptionTask, configTask, tokenTask]);
+          });
         } else {
           setAuthState('unauthenticated');
         }
       } catch (error) {
-        console.error('Failed to load auth state:', error);
         setAuthState('unauthenticated');
       }
     };
@@ -210,7 +271,6 @@ export function AuthProvider({ children }: AuthProviderProps) {
       setUser(userInfo);
       setAuthState('authenticated');
     } catch (error) {
-      console.error('Failed to sign in:', error);
       throw error;
     }
   }, []);
@@ -226,7 +286,6 @@ export function AuthProvider({ children }: AuthProviderProps) {
       setUser(null);
       setAuthState('unauthenticated');
     } catch (error) {
-      console.error('Failed to sign out:', error);
       throw error;
     }
   }, []);
@@ -243,12 +302,18 @@ export function AuthProvider({ children }: AuthProviderProps) {
         try {
           const config = await getConfig(prev.address);
           if (config.allowSync) {
-            const configUpdates: { name?: string; profile_image?: string } = {};
+            const configUpdates: { name?: string; profile_image?: string; bio?: string; isProfilePublic?: boolean } = {};
             if (updates.displayName !== undefined) {
               configUpdates.name = updates.displayName;
             }
             if (updates.profileImage !== undefined) {
               configUpdates.profile_image = updates.profileImage;
+            }
+            if (updates.bio !== undefined) {
+              configUpdates.bio = updates.bio;
+            }
+            if (updates.isProfilePublic !== undefined) {
+              configUpdates.isProfilePublic = updates.isProfilePublic;
             }
 
             if (Object.keys(configUpdates).length > 0) {
@@ -256,11 +321,10 @@ export function AuthProvider({ children }: AuthProviderProps) {
                 ...config,
                 ...configUpdates,
               });
-              logger.log('[Auth] Profile changes synced to server');
             }
           }
-        } catch (error) {
-          console.error('[Auth] Failed to sync profile changes:', error);
+        } catch {
+          // Config sync is best-effort — profile update is already saved locally
         }
       })();
 
@@ -282,7 +346,9 @@ export function AuthProvider({ children }: AuthProviderProps) {
       throw new Error('User not authenticated');
     }
 
-    const privateKey = await getPrivateKey();
+    // ensurePrivateKey transparently re-derives from mnemonic if the Ed448
+    // key is missing from secure storage.
+    const privateKey = await ensurePrivateKey();
     if (!privateKey) {
       throw new Error('Private key not found');
     }
@@ -290,6 +356,72 @@ export function AuthProvider({ children }: AuthProviderProps) {
     // Sign with ed448 using native module
     return signingProvider.signEd448(privateKey, message);
   }, [signingProvider]);
+
+  const refreshFarcasterToken = useCallback(async (): Promise<
+    | { token: string }
+    | { error: 'no-credentials' | 'derivation-failed' | 'api-rejected' | 'unknown'; detail?: string }
+  > => {
+    try {
+      const stored = await getFarcasterAuthToken();
+      if (stored) {
+        if (stored !== farcasterAuthToken) setFarcasterAuthToken(stored);
+        return { token: stored };
+      }
+      let custodyKey = await getFarcasterCustodyKey();
+
+      // Recovery: derive Farcaster keys from the stored mnemonic when
+      // SecureStore has drifted out of sync with MMKV. Track WHY each
+      // step fails so the caller can surface a meaningful message.
+      let recoveryDetail: string | undefined;
+      if (!custodyKey) {
+        const mnemonic = await getMnemonic();
+        if (!mnemonic) {
+          recoveryDetail = 'no mnemonic in secure storage';
+        } else if (!validateFarcasterMnemonic(mnemonic)) {
+          recoveryDetail = `mnemonic invalid for Farcaster (length ${mnemonic.length})`;
+        } else {
+          try {
+            const keys = deriveFarcasterKeys(mnemonic);
+            const account = await lookupFarcasterAccount(
+              keys.custodyAddress,
+              keys.custodyPrivateKey,
+            );
+            if (account?.fid) {
+              await Promise.all([
+                storeFarcasterCustodyKey(keys.custodyPrivateKey),
+                storeFarcasterSignerKey(keys.signerPrivateKey),
+                storeFarcasterFid(account.fid),
+              ]);
+              custodyKey = keys.custodyPrivateKey;
+              if (account.authToken) {
+                await storeFarcasterAuthToken(account.authToken);
+                setFarcasterAuthToken(account.authToken);
+                return { token: account.authToken };
+              }
+            } else {
+              recoveryDetail =
+                'mnemonic derives a Farcaster custody address but lookup returned no FID — this account was likely created with a different seed phrase';
+            }
+          } catch (e) {
+            recoveryDetail = `derivation/lookup threw: ${(e as Error)?.message ?? 'unknown'}`;
+          }
+        }
+      }
+
+      if (!custodyKey) {
+        return { error: 'no-credentials', detail: recoveryDetail };
+      }
+      const fresh = await refreshFarcasterAuthToken(custodyKey);
+      if (fresh) {
+        await storeFarcasterAuthToken(fresh);
+        setFarcasterAuthToken(fresh);
+        return { token: fresh };
+      }
+      return { error: 'api-rejected', detail: 'farcaster.xyz returned no token (auth rejected or rate-limited)' };
+    } catch (e) {
+      return { error: 'unknown', detail: (e as Error)?.message };
+    }
+  }, [farcasterAuthToken]);
 
   const value = useMemo<AuthContextValue>(
     () => ({
@@ -302,8 +434,9 @@ export function AuthProvider({ children }: AuthProviderProps) {
       signOut,
       updateProfile,
       signMessage,
+      refreshFarcasterToken,
     }),
-    [authState, user, farcasterAuthToken, signIn, signOut, updateProfile, signMessage]
+    [authState, user, farcasterAuthToken, signIn, signOut, updateProfile, signMessage, refreshFarcasterToken]
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

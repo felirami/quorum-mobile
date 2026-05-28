@@ -1,9 +1,14 @@
 import { BaseModal } from '@/components/shared';
 import { IconSymbol } from '@/components/ui/IconSymbol';
 import { DefaultAvatar } from '@/components/ui/DefaultAvatar';
-import { useTheme } from '@/theme';
-import React from 'react';
+import { useTheme, type AppTheme } from '@/theme';
+import type { EdgeInsets } from 'react-native-safe-area-context';
+import { truncateAddress } from '@/utils/formatAddress';
+import { useAssignRole, useRemoveFromRole, useSpaces } from '@/hooks/chat';
+import React, { useMemo, useState } from 'react';
 import {
+  ActivityIndicator,
+  Alert,
   Image,
   ScrollView,
   StyleSheet,
@@ -12,12 +17,20 @@ import {
   View,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import * as Clipboard from 'expo-clipboard';
+import type { Role } from '@quilibrium/quorum-shared';
 
 export interface UserProfileInfo {
   userId: string;
   userName: string;
   userAvatar?: string;
   bio?: string;
+  primaryUsername?: string;
+  /** Farcaster linkage carried in the user's update-profile broadcast
+   *  for this space. Surfaced as a tappable row that routes into the
+   *  Farcaster feed at this user's profile. */
+  farcasterFid?: number;
+  farcasterUsername?: string;
 }
 
 interface UserProfileModalProps {
@@ -25,6 +38,15 @@ interface UserProfileModalProps {
   onClose: () => void;
   user: UserProfileInfo | null;
   onStartDM?: (userId: string) => void;
+  onMuteUser?: (userId: string) => void;
+  isUserMuted?: boolean;
+  spaceId?: string;
+  roles?: Role[];
+  isSpaceOwner?: boolean;
+  /** Optional: caller routes into the Farcaster feed profile view when
+   *  the user taps the linked-Farcaster row. Omit to hide the row's
+   *  chevron / make it non-interactive. */
+  onOpenFarcasterProfile?: (params: { fid: number; username?: string }) => void;
 }
 
 export default function UserProfileModal({
@@ -32,21 +54,89 @@ export default function UserProfileModal({
   onClose,
   user,
   onStartDM,
+  onMuteUser,
+  isUserMuted,
+  spaceId,
+  roles,
+  isSpaceOwner,
+  onOpenFarcasterProfile,
 }: UserProfileModalProps) {
   const { theme, isDark } = useTheme();
   const insets = useSafeAreaInsets();
+  const [loadingRoles, setLoadingRoles] = useState<Set<string>>(new Set());
+
+  const assignRoleMutation = useAssignRole();
+  const removeRoleMutation = useRemoveFromRole();
 
   const styles = createStyles(theme, isDark, insets);
 
-  // Format address for display (truncate middle)
-  const formatAddress = (address: string) => {
-    if (!address) return '';
-    if (address.length <= 16) return address;
-    return `${address.slice(0, 8)}...${address.slice(-6)}`;
+  // Roles the user currently has
+  const userRoles = useMemo(() => {
+    if (!roles || !user) return [];
+    return roles.filter(r => r.members.includes(user.userId));
+  }, [roles, user]);
+
+  // Roles available to assign (ones the user doesn't have)
+  const availableRoles = useMemo(() => {
+    if (!roles || !user) return [];
+    return roles.filter(r => !r.members.includes(user.userId));
+  }, [roles, user]);
+
+  // Shared spaces
+  const { data: mySpaces } = useSpaces();
+
+  const handleAssignRole = async (roleId: string) => {
+    if (!spaceId || !user) return;
+    setLoadingRoles(prev => new Set(prev).add(roleId));
+    try {
+      await assignRoleMutation.mutateAsync({
+        spaceId,
+        roleId,
+        userAddress: user.userId,
+      });
+    } catch {
+      Alert.alert('Error', 'Failed to assign role');
+    } finally {
+      setLoadingRoles(prev => {
+        const next = new Set(prev);
+        next.delete(roleId);
+        return next;
+      });
+    }
+  };
+
+  const handleRemoveRole = async (roleId: string) => {
+    if (!spaceId || !user) return;
+    setLoadingRoles(prev => new Set(prev).add(roleId));
+    try {
+      await removeRoleMutation.mutateAsync({
+        spaceId,
+        roleId,
+        userAddress: user.userId,
+      });
+    } catch {
+      Alert.alert('Error', 'Failed to remove role');
+    } finally {
+      setLoadingRoles(prev => {
+        const next = new Set(prev);
+        next.delete(roleId);
+        return next;
+      });
+    }
+  };
+
+
+  // Copy address to clipboard
+  const handleCopyAddress = async () => {
+    if (!user?.userId) return;
+    await Clipboard.setStringAsync(user.userId);
+    Alert.alert('Copied', 'Address copied to clipboard');
   };
 
   // Check if avatar is a valid data URI
   const hasValidAvatar = user?.userAvatar?.startsWith('data:');
+
+  const showRolesSection = roles && roles.length > 0 && (userRoles.length > 0 || isSpaceOwner);
 
   if (!user) return null;
 
@@ -54,7 +144,7 @@ export default function UserProfileModal({
     <BaseModal
       visible={visible}
       onClose={onClose}
-      height={0.5}
+      height={0.55}
     >
       <ScrollView showsVerticalScrollIndicator={false} style={styles.scrollContent}>
         {/* Profile Header */}
@@ -67,18 +157,99 @@ export default function UserProfileModal({
             )}
           </View>
           <Text style={styles.displayName}>{user.userName}</Text>
-          <Text style={styles.userId}>{formatAddress(user.userId)}</Text>
+          {user.primaryUsername && (
+            <Text style={styles.username}>@{user.primaryUsername}</Text>
+          )}
+          <TouchableOpacity onPress={handleCopyAddress} style={styles.addressRow}>
+            <Text style={styles.userId}>{truncateAddress(user.userId)}</Text>
+            <IconSymbol name="doc.on.doc" size={12} color={theme.colors.textMuted} />
+          </TouchableOpacity>
+          {user.farcasterFid && user.farcasterFid > 0 ? (
+            <TouchableOpacity
+              onPress={() => {
+                if (onOpenFarcasterProfile && user.farcasterFid) {
+                  onOpenFarcasterProfile({ fid: user.farcasterFid, username: user.farcasterUsername });
+                }
+              }}
+              disabled={!onOpenFarcasterProfile}
+              style={styles.farcasterRow}
+            >
+              <IconSymbol name="globe" size={12} color={theme.colors.primary} />
+              <Text style={styles.farcasterText}>
+                {user.farcasterUsername ? `@${user.farcasterUsername}` : `FID ${user.farcasterFid}`}
+                {user.farcasterUsername ? ` · FID ${user.farcasterFid}` : ''}
+              </Text>
+              {onOpenFarcasterProfile ? (
+                <IconSymbol name="chevron.right" size={12} color={theme.colors.textMuted} />
+              ) : null}
+            </TouchableOpacity>
+          ) : null}
         </View>
 
-        {/* Bio Section */}
-        {user.bio && (
+        {/* Roles Section */}
+        {showRolesSection && (
           <View style={styles.section}>
-            <Text style={styles.sectionTitle}>Bio</Text>
-            <View style={styles.bioContainer}>
-              <Text style={styles.bioText}>{user.bio}</Text>
-            </View>
+            <Text style={styles.sectionTitle}>Roles</Text>
+
+            {/* Current roles */}
+            {userRoles.length > 0 && (
+              <View style={styles.rolesRow}>
+                {userRoles.map(role => (
+                  <View key={role.roleId} style={[styles.roleBadge, { borderColor: role.color }]}>
+                    {loadingRoles.has(role.roleId) ? (
+                      <ActivityIndicator size={10} color={role.color} />
+                    ) : null}
+                    <Text style={[styles.roleBadgeText, { color: role.color }]}>
+                      {role.displayName}
+                    </Text>
+                    {isSpaceOwner && (
+                      <TouchableOpacity
+                        onPress={() => handleRemoveRole(role.roleId)}
+                        disabled={loadingRoles.has(role.roleId)}
+                        hitSlop={6}
+                      >
+                        <IconSymbol name="xmark" size={10} color={role.color} />
+                      </TouchableOpacity>
+                    )}
+                  </View>
+                ))}
+              </View>
+            )}
+
+            {/* Available roles to assign (owner only) */}
+            {isSpaceOwner && availableRoles.length > 0 && (
+              <View style={styles.rolesRow}>
+                {availableRoles.map(role => (
+                  <TouchableOpacity
+                    key={role.roleId}
+                    style={styles.addRoleBadge}
+                    onPress={() => handleAssignRole(role.roleId)}
+                    disabled={loadingRoles.has(role.roleId)}
+                  >
+                    {loadingRoles.has(role.roleId) ? (
+                      <ActivityIndicator size={10} color={theme.colors.textMuted} />
+                    ) : (
+                      <IconSymbol name="plus" size={10} color={theme.colors.textMuted} />
+                    )}
+                    <Text style={styles.addRoleBadgeText}>
+                      {role.roleTag}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            )}
           </View>
         )}
+
+        {/* Bio Section */}
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Bio</Text>
+          <View style={styles.bioContainer}>
+            <Text style={[styles.bioText, !user.bio && styles.bioPlaceholder]}>
+              {user.bio || 'No bio yet'}
+            </Text>
+          </View>
+        </View>
 
         {/* Actions */}
         <View style={styles.actionsContainer}>
@@ -94,13 +265,31 @@ export default function UserProfileModal({
               <Text style={styles.actionButtonText}>Message</Text>
             </TouchableOpacity>
           )}
+          {onMuteUser && (
+            <TouchableOpacity
+              style={[styles.actionButton, styles.muteButton]}
+              onPress={() => {
+                onMuteUser(user.userId);
+                onClose();
+              }}
+            >
+              <IconSymbol
+                name={isUserMuted ? 'bell.fill' : 'bell.slash.fill'}
+                size={20}
+                color="#fff"
+              />
+              <Text style={styles.actionButtonText}>
+                {isUserMuted ? 'Unmute' : 'Mute'}
+              </Text>
+            </TouchableOpacity>
+          )}
         </View>
       </ScrollView>
     </BaseModal>
   );
 }
 
-const createStyles = (theme: any, isDark: boolean, insets: any) =>
+const createStyles = (theme: AppTheme, isDark: boolean, insets: EdgeInsets) =>
   StyleSheet.create({
     scrollContent: {
       paddingHorizontal: 20,
@@ -126,10 +315,36 @@ const createStyles = (theme: any, isDark: boolean, insets: any) =>
       marginBottom: 4,
       textAlign: 'center',
     },
+    username: {
+      fontSize: 15,
+      fontFamily: theme.fonts.regular.fontFamily,
+      color: theme.colors.primary,
+      marginBottom: 4,
+      textAlign: 'center',
+    },
     userId: {
       fontSize: 14,
       color: theme.colors.textMuted,
       textAlign: 'center',
+    },
+    addressRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 6,
+    },
+    farcasterRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 6,
+      marginTop: 8,
+      paddingVertical: 6,
+      paddingHorizontal: 12,
+      borderRadius: 16,
+      backgroundColor: theme.colors.surface2,
+    },
+    farcasterText: {
+      fontSize: 13,
+      color: theme.colors.textMain,
     },
     section: {
       marginBottom: 24,
@@ -151,8 +366,49 @@ const createStyles = (theme: any, isDark: boolean, insets: any) =>
       color: theme.colors.textMain,
       lineHeight: 20,
     },
+    bioPlaceholder: {
+      color: theme.colors.textMuted,
+      fontStyle: 'italic',
+    },
+    rolesRow: {
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      gap: 8,
+      marginBottom: 8,
+    },
+    roleBadge: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 6,
+      borderWidth: 1,
+      borderRadius: 14,
+      paddingVertical: 4,
+      paddingHorizontal: 10,
+    },
+    roleBadgeText: {
+      fontSize: 13,
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
+    },
+    addRoleBadge: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 4,
+      borderWidth: 1,
+      borderColor: theme.colors.surface4,
+      borderStyle: 'dashed',
+      borderRadius: 14,
+      paddingVertical: 4,
+      paddingHorizontal: 10,
+    },
+    addRoleBadgeText: {
+      fontSize: 13,
+      fontFamily: theme.fonts.regular.fontFamily,
+      color: theme.colors.textMuted,
+    },
     actionsContainer: {
       marginBottom: 24,
+      gap: 10,
     },
     actionButton: {
       flexDirection: 'row',
@@ -163,6 +419,9 @@ const createStyles = (theme: any, isDark: boolean, insets: any) =>
       paddingHorizontal: 24,
       borderRadius: 12,
       gap: 8,
+    },
+    muteButton: {
+      backgroundColor: theme.colors.surface4,
     },
     actionButtonText: {
       fontSize: 16,

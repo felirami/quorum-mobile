@@ -2,6 +2,8 @@
  * DirectMessageView - Shows messages and input for a DM conversation
  */
 
+import type { AppTheme } from '@/theme';
+import type { EdgeInsets } from 'react-native-safe-area-context';
 import React, { useCallback, useMemo, useState } from 'react';
 import {
   View,
@@ -25,7 +27,7 @@ interface DirectMessageViewProps {
   messages: DisplayMessage[];
   onBack: () => void;
   onSendMessage: (text: string) => void;
-  theme: any;
+  theme: AppTheme;
   isLoading?: boolean;
   isRefreshing?: boolean;
   isLoadingMore?: boolean;
@@ -136,7 +138,7 @@ export function DirectMessageView({
   );
 }
 
-const createStyles = (theme: any, insets: any) =>
+const createStyles = (theme: AppTheme, insets: EdgeInsets) =>
   StyleSheet.create({
     container: {
       flex: 1,

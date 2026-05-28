@@ -8,7 +8,7 @@
 
 import React, { useState } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, Alert, Image, ActivityIndicator } from 'react-native';
-import { useTheme } from '@/theme';
+import { useTheme, type AppTheme } from '@/theme';
 import { useOnboarding, useAuth } from '@/context';
 import { OnboardingLayout } from '@/components/onboarding';
 import { IconSymbol } from '@/components/ui/IconSymbol';
@@ -233,7 +233,7 @@ export default function AccountSetupScreen() {
   );
 }
 
-const createStyles = (theme: any) =>
+const createStyles = (theme: AppTheme) =>
   StyleSheet.create({
     content: {
       flex: 1,

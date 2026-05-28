@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, ReactNode } from 'react';
+import React, { createContext, useCallback, useContext, useMemo, useState, ReactNode } from 'react';
 import { useColorScheme as useDeviceColorScheme } from 'react-native';
 import { Theme } from '@react-navigation/native';
 import { LightTheme, DarkTheme, createTheme, AccentColor } from './themes';
@@ -37,33 +37,33 @@ export const CustomThemeProvider: React.FC<ThemeProviderProps> = ({
   const [isDarkOverride, setIsDarkOverride] = useState<boolean | null>(null);
   const [accentColor, setAccentColor] = useState<AccentColor>(defaultAccentColor);
 
-  const isDark = forceTheme 
+  const isDark = forceTheme
     ? forceTheme === 'dark'
-    : isDarkOverride !== null 
-      ? isDarkOverride 
+    : isDarkOverride !== null
+      ? isDarkOverride
       : deviceColorScheme === 'dark';
 
-  const theme = createTheme(isDark, accentColor);
+  const theme = useMemo(() => createTheme(isDark, accentColor), [isDark, accentColor]);
 
-  const toggleTheme = () => {
+  const toggleTheme = useCallback(() => {
     setIsDarkOverride(prev => prev === null ? !isDark : !prev);
-  };
+  }, [isDark]);
 
-  const setIsDark = (dark: boolean) => {
+  const setIsDarkCb = useCallback((dark: boolean) => {
     setIsDarkOverride(dark);
-  };
+  }, []);
+
+  const value = useMemo(() => ({
+    theme,
+    isDark,
+    accentColor,
+    setIsDark: setIsDarkCb,
+    setAccentColor,
+    toggleTheme,
+  }), [theme, isDark, accentColor, setIsDarkCb, setAccentColor, toggleTheme]);
 
   return (
-    <ThemeContext.Provider 
-      value={{
-        theme,
-        isDark,
-        accentColor,
-        setIsDark,
-        setAccentColor,
-        toggleTheme,
-      }}
-    >
+    <ThemeContext.Provider value={value}>
       {children}
     </ThemeContext.Provider>
   );

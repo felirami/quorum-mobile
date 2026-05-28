@@ -20,14 +20,23 @@ platform :ios, podfile_properties['ios.deploymentTarget'] || '15.1'
 
 prepare_react_native_project!
 
-target 'quorummobile' do
+target 'Quorum' do
   use_expo_modules!
+
+  # QuorumCrypto declares this as a dependency but it lives in the
+  # same module folder rather than a separate package — make the path
+  # explicit so CocoaPods can resolve it. The NSE target also pulls
+  # it in directly below.
+  pod 'QuorumChannelFFI', :path => '../modules/quorum-crypto/ios'
 
   if ENV['EXPO_USE_COMMUNITY_AUTOLINKING'] == '1'
     config_command = ['node', '-e', "process.argv=['', '', 'config'];require('@react-native-community/cli').run()"];
   else
     config_command = [
-      'npx',
+      'node',
+      '--no-warnings',
+      '--eval',
+      'require(\'expo/bin/autolinking\')',
       'expo-modules-autolinking',
       'react-native-config',
       '--json',
@@ -57,4 +66,20 @@ target 'quorummobile' do
       :ccache_enabled => ccache_enabled?(podfile_properties),
     )
   end
+end
+
+# Notification Service Extension. Pulls in the minimal QuorumChannelFFI
+# pod (MMKV + Channel.xcframework + uniffi channel.swift) so the NSE
+# can decrypt incoming hub-log pushes locally and suppress
+# notifications for control-type messages (update-profile,
+# edit-message, remove-message). Deliberately does NOT pull in
+# ExpoModulesCore — extensions can't safely link the full RN/Expo
+# stack, and we only need raw Swift + Rust here.
+target 'QuorumNotificationService' do
+  # MMKV ships as an Obj-C pod; without modular headers it can't be
+  # imported as a Swift module, which HubLogClassifier.swift relies
+  # on. The main app target gets this implicitly via use_native_modules!,
+  # but the NSE target doesn't, so we opt in explicitly.
+  use_modular_headers!
+  pod 'QuorumChannelFFI', :path => '../modules/quorum-crypto/ios'
 end

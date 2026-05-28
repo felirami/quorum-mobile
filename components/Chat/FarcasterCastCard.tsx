@@ -7,7 +7,8 @@
 
 import { IconSymbol } from '@/components/ui/IconSymbol';
 import { useFarcasterThread, parseFarcasterUrl, type ThreadCast } from '@/hooks/useFarcasterThread';
-import { useTheme } from '@/theme';
+import { useTheme, type AppTheme } from '@/theme';
+import { isScamCast } from '@/services/farcaster/scamFilter';
 import React from 'react';
 import {
   Image,
@@ -89,32 +90,54 @@ function formatRelativeTime(timestamp: number): string {
 }
 
 interface FarcasterCastCardProps {
-  url: string;
+  /** Either supply a URL (the card will fetch the cast)… */
+  url?: string;
+  /** …or pass an already-fetched cast object directly. */
+  cast?: any;
+  /** Optional channel-key tag shown above the author when supplied. */
+  channelKey?: string;
+  /** When true, the card stretches to fill its container instead of capping
+   *  at 320px. Used for top-level chat-stream items so they align flush. */
+  fullWidth?: boolean;
   onPress?: (username: string, castHashPrefix: string) => void;
+  /** Long-press handler — used by the chat stream to open the action sheet. */
+  onLongPress?: () => void;
 }
 
-export function FarcasterCastCard({ url, onPress }: FarcasterCastCardProps) {
+export function FarcasterCastCard({ url, cast: providedCast, channelKey, fullWidth = false, onPress, onLongPress }: FarcasterCastCardProps) {
   const { theme } = useTheme();
   const styles = createStyles(theme);
 
-  // Parse the URL to get username and cast hash
-  const parsed = parseFarcasterCastUrl(url);
+  // Parse the URL to get username and cast hash (only when a URL was provided)
+  const parsed = url ? parseFarcasterCastUrl(url) : null;
 
-  // Fetch the cast data
+  // Fetch the cast data only if we don't already have one
   const { mainCast, isLoading, error } = useFarcasterThread({
     username: parsed?.username ?? '',
     castHashPrefix: parsed?.castHash ?? '',
-    enabled: !!parsed,
+    enabled: !!parsed && !providedCast,
   });
 
-  // Use the main cast from the thread
-  const cast = mainCast;
+  // Use the supplied cast first, fall back to fetched
+  const cast = providedCast ?? mainCast;
+
+  // Suppress wallet-drainer typo-squat casts (hyrpia.xyz). See
+  // services/farcaster/scamFilter.ts. This is the chat-stream embed
+  // path; list-level paths (feed, thread) filter the source array.
+  if (cast && isScamCast(cast as unknown as Parameters<typeof isScamCast>[0])) {
+    return null;
+  }
 
   const handlePress = () => {
-    if (onPress && parsed) {
-      onPress(parsed.username, parsed.castHash);
-    } else {
-      // Fallback to opening URL if no callback provided
+    if (onPress) {
+      const username = cast?.author?.username ?? parsed?.username;
+      const castHash = cast?.hash ?? parsed?.castHash;
+      if (username && castHash) {
+        onPress(username, castHash.slice(0, 10));
+        return;
+      }
+    }
+    if (url) {
       Linking.openURL(url);
     }
   };
@@ -149,7 +172,19 @@ export function FarcasterCastCard({ url, onPress }: FarcasterCastCardProps) {
   const imageUrl = hasImage ? cast.embeds?.images?.[0]?.url : null;
 
   return (
-    <TouchableOpacity style={styles.container} onPress={handlePress} activeOpacity={0.8}>
+    <TouchableOpacity
+      style={[styles.container, fullWidth && { maxWidth: undefined, width: '100%' }]}
+      onPress={handlePress}
+      onLongPress={onLongPress}
+      delayLongPress={300}
+      activeOpacity={0.8}
+    >
+      {channelKey && (
+        <View style={styles.channelTag}>
+          <IconSymbol name="number" size={11} color={theme.colors.accent} />
+          <Text style={styles.channelTagText}>/{channelKey}</Text>
+        </View>
+      )}
       {/* Header with author info */}
       <View style={styles.header}>
         <Image
@@ -207,7 +242,7 @@ export function FarcasterCastCard({ url, onPress }: FarcasterCastCardProps) {
   );
 }
 
-const createStyles = (theme: any) =>
+const createStyles = (theme: AppTheme) =>
   StyleSheet.create({
     container: {
       backgroundColor: theme.colors.surface2,
@@ -217,6 +252,19 @@ const createStyles = (theme: any) =>
       overflow: 'hidden',
       marginTop: 8,
       maxWidth: 320,
+    },
+    channelTag: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 4,
+      paddingHorizontal: 12,
+      paddingTop: 8,
+    },
+    channelTagText: {
+      fontSize: 11,
+      fontWeight: '600',
+      color: theme.colors.accent,
+      letterSpacing: 0.3,
     },
     header: {
       flexDirection: 'row',

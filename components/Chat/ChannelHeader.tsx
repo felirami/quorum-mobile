@@ -1,4 +1,5 @@
 import { IconSymbol } from '@/components/ui/IconSymbol';
+import type { AppTheme } from '@/theme';
 import React from 'react';
 import { Dimensions, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 
@@ -10,15 +11,23 @@ interface ChannelHeaderProps {
   onShowSidebars: () => void;
   onInvite?: () => void;
   onOpenSettings?: () => void;
-  theme: any;
+  onOpenPinnedMessages?: () => void;
+  onOpenBookmarks?: () => void;
+  onOpenSearch?: () => void;
+  pinnedCount?: number;
+  theme: AppTheme;
 }
 
-export function ChannelHeader({
+export const ChannelHeader = React.memo(function ChannelHeader({
   channelName,
   sidebarsVisible,
   onShowSidebars,
   onInvite,
   onOpenSettings,
+  onOpenPinnedMessages,
+  onOpenBookmarks,
+  onOpenSearch,
+  pinnedCount = 0,
   theme,
 }: ChannelHeaderProps) {
   const styles = createStyles(theme);
@@ -35,6 +44,21 @@ export function ChannelHeader({
         <Text style={styles.title}>{channelName}</Text>
       </View>
       <View style={styles.right}>
+        {onOpenSearch && (
+          <TouchableOpacity style={styles.headerIconButton} onPress={onOpenSearch}>
+            <IconSymbol name="magnifyingglass" color={theme.colors.textMuted} size={18} />
+          </TouchableOpacity>
+        )}
+        {onOpenPinnedMessages && (
+          <TouchableOpacity style={styles.headerIconButton} onPress={onOpenPinnedMessages}>
+            <IconSymbol name="pin.fill" color={pinnedCount > 0 ? theme.colors.primary : theme.colors.textMuted} size={18} />
+          </TouchableOpacity>
+        )}
+        {onOpenBookmarks && (
+          <TouchableOpacity style={styles.headerIconButton} onPress={onOpenBookmarks}>
+            <IconSymbol name="bookmark" color={theme.colors.textMuted} size={18} />
+          </TouchableOpacity>
+        )}
         {onInvite && (
           <TouchableOpacity style={styles.headerIconButton} onPress={onInvite}>
             <IconSymbol name="person.badge.plus" color={theme.colors.textMuted} size={18} />
@@ -48,9 +72,9 @@ export function ChannelHeader({
       </View>
     </View>
   );
-}
+});
 
-const createStyles = (theme: any) => StyleSheet.create({
+const createStyles = (theme: AppTheme) => StyleSheet.create({
   container: {
     flexDirection: 'row',
     alignItems: 'center',

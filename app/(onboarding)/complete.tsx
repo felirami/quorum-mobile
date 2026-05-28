@@ -4,7 +4,6 @@
  * Shows summary of setup and provides entry to main app.
  */
 
-import { logger } from '@quilibrium/quorum-shared';
 import { OnboardingLayout } from '@/components/onboarding';
 import { Button } from '@/components/ui/Button';
 import { Card } from '@/components/ui/Card';
@@ -12,7 +11,7 @@ import { IconSymbol } from '@/components/ui/IconSymbol';
 import { useAuth, useOnboarding } from '@/context';
 import { formatAddress, initializeEncryptionKeys, uploadUserRegistration } from '@/services/onboarding/keyService';
 import { getPrivateKey } from '@/services/onboarding/secureStorage';
-import { useTheme } from '@/theme';
+import { useTheme, type AppTheme } from '@/theme';
 import React, { useCallback, useRef } from 'react';
 import { Alert, StyleSheet, Text, View } from 'react-native';
 
@@ -38,8 +37,8 @@ export default function CompleteScreen() {
             try {
               await signOut();
               setError(null);
-            } catch (e) {
-              console.error('[Complete] Failed to reset:', e);
+            } catch {
+              // Sign-out cleanup failed — UI will still reset via navigation
             }
           },
         },
@@ -56,8 +55,8 @@ export default function CompleteScreen() {
     try {
       setError(null);
       let userInfo = await completeOnboarding();
+
       if (!userInfo) {
-        console.error('[Complete] completeOnboarding returned null');
         setError('Failed to complete setup. Please try again or start over.');
         setIsNavigating(false);
         hasNavigatedRef.current = false;
@@ -71,13 +70,10 @@ export default function CompleteScreen() {
         // This generates X448 pre-keys and stores them securely
         try {
           const deviceKeyset = await initializeEncryptionKeys(userInfo.publicKey);
-          logger.log('[Complete] Encryption keys initialized');
 
           // Get the private key from secure storage for signing the registration
           const privateKey = await getPrivateKey();
-          if (!privateKey) {
-            console.error('[Complete] Private key not found in secure storage');
-          } else {
+          if (privateKey) {
             // Upload registration to server so others can find us
             await uploadUserRegistration(
               userInfo.address,
@@ -85,15 +81,11 @@ export default function CompleteScreen() {
               privateKey,
               deviceKeyset
             );
-            logger.log('[Complete] User registration uploaded');
           }
         } catch (encryptionError) {
-          // Log but don't block sign-in - encryption can be initialized later
-          console.error('[Complete] Failed to initialize encryption keys:', encryptionError);
+          // Non-blocking - encryption can be initialized later
         }
       } else {
-        logger.log('[Complete] Imported account - keys and config already synced during import');
-
         // Use synced profile data from import
         if (state.syncedConfig) {
           userInfo = {
@@ -106,9 +98,7 @@ export default function CompleteScreen() {
 
       await signIn(userInfo);
       // AuthRouter in _layout.tsx will handle the redirect to home
-      logger.log("signIn complete, AuthRouter will redirect");
     } catch (err) {
-      console.error('[Complete] Error completing onboarding:', err);
       setError('An error occurred while completing setup. Please try again or start over.');
       setIsNavigating(false);
       hasNavigatedRef.current = false;
@@ -245,7 +235,7 @@ export default function CompleteScreen() {
   );
 }
 
-const createStyles = (theme: any) =>
+const createStyles = (theme: AppTheme) =>
   StyleSheet.create({
     container: {
       flex: 1,

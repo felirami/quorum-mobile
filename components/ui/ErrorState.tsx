@@ -6,7 +6,7 @@ import {
   View,
   ViewStyle,
 } from 'react-native';
-import { useTheme } from '@/theme';
+import { useTheme, type AppTheme } from '@/theme';
 import { IconSymbol } from './IconSymbol';
 
 interface ErrorStateProps {
@@ -71,7 +71,7 @@ export function ErrorState({
   );
 }
 
-const createStyles = (theme: any) =>
+const createStyles = (theme: AppTheme) =>
   StyleSheet.create({
     container: {
       alignItems: 'center',

@@ -1,13 +1,39 @@
-import React from 'react';
-import { Image, Text, TouchableOpacity, View } from 'react-native';
+import type { AppTheme } from '@/theme';
+import React, { useMemo } from 'react';
+import { Image, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { IconSymbol } from '@/components/ui/IconSymbol';
 import { SCREEN_WIDTH } from '../utils';
+
+const staticStyles = StyleSheet.create({
+  container: {
+    overflow: 'hidden',
+  },
+  image: {
+    width: SCREEN_WIDTH,
+    height: SCREEN_WIDTH * 0.525, // Standard frame aspect ratio
+  },
+  buttonRow: {
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderTopWidth: 1,
+  },
+  buttonText: {
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  iconMargin: {
+    marginLeft: 6,
+  },
+});
 
 interface FrameEmbedProps {
   imageUrl: string;
   buttonTitle: string;
   actionUrl: string;
-  theme: any;
+  theme: AppTheme;
   onPress: () => void;
 }
 
@@ -21,47 +47,32 @@ export function FrameEmbed({
   theme,
   onPress,
 }: FrameEmbedProps) {
+  const styles = useMemo(() => ({
+    image: [staticStyles.image, { backgroundColor: theme.colors.surface3 }],
+    buttonRow: [staticStyles.buttonRow, { backgroundColor: theme.colors.surface2, borderTopColor: theme.colors.surface3 }],
+    buttonText: [staticStyles.buttonText, { color: theme.colors.textStrong }],
+  }), [theme.colors.surface2, theme.colors.surface3, theme.colors.textStrong]);
+
   return (
     <TouchableOpacity
       onPress={onPress}
       activeOpacity={0.9}
-      style={{ overflow: 'hidden' }}
+      style={staticStyles.container}
     >
       <Image
         source={{ uri: imageUrl }}
-        style={{
-          width: SCREEN_WIDTH,
-          height: SCREEN_WIDTH * 0.525, // Standard frame aspect ratio
-          backgroundColor: theme.colors.surface3,
-        }}
+        style={styles.image}
         resizeMode="cover"
       />
-      <View
-        style={{
-          backgroundColor: theme.colors.surface2,
-          paddingVertical: 12,
-          paddingHorizontal: 16,
-          flexDirection: 'row',
-          alignItems: 'center',
-          justifyContent: 'center',
-          borderTopWidth: 1,
-          borderTopColor: theme.colors.surface3,
-        }}
-      >
-        <Text
-          style={{
-            color: theme.colors.textStrong,
-            fontSize: 15,
-            fontWeight: '600',
-          }}
-        >
+      <View style={styles.buttonRow}>
+        <Text style={styles.buttonText}>
           {buttonTitle}
         </Text>
         <IconSymbol
           name="arrow.up.right"
           color={theme.colors.textMuted}
           size={14}
-          style={{ marginLeft: 6 }}
+          style={staticStyles.iconMargin}
         />
       </View>
     </TouchableOpacity>

@@ -7,7 +7,8 @@
  * Uses types from @quilibrium/quorum-shared for cross-platform compatibility.
  */
 
-import { createMMKV, type MMKV } from 'react-native-mmkv';
+import { type MMKV } from 'react-native-mmkv';
+import { createMirroredMMKV } from '@/services/storage/mirroredMMKV';
 import {
   type EncryptionState,
   type InboxMapping,
@@ -28,13 +29,18 @@ export type {
 } from '@quilibrium/quorum-shared';
 
 /**
- * MMKVStorageProvider - MMKV implementation of KeyValueStorageProvider
+ * MMKVStorageProvider - MMKV implementation of KeyValueStorageProvider.
+ *
+ * Uses createMirroredMMKV so writes are mirrored into the iOS App
+ * Group container; the NSE reads the mirror to decrypt incoming
+ * pushes locally. On Android / when App Group is unavailable the
+ * mirror is a silent no-op.
  */
 class MMKVStorageProvider implements KeyValueStorageProvider {
   private mmkv: MMKV;
 
   constructor(id: string) {
-    this.mmkv = createMMKV({ id });
+    this.mmkv = createMirroredMMKV({ id });
   }
 
   getString(key: string): string | null {
@@ -60,28 +66,95 @@ class MMKVStorageProvider implements KeyValueStorageProvider {
 
 /**
  * EncryptionStateStorage - MMKV-backed storage for encryption states
+ *
+ * Uses batched writes to avoid blocking the UI thread during message sync.
+ * State updates are queued and flushed every 100ms or when 10 updates accumulate.
  */
 class EncryptionStateStorage {
   private storage: KeyValueStorageProvider;
+
+  // Batched write queue for performance
+  private pendingWrites: Map<string, string> = new Map();
+  private flushTimeout: ReturnType<typeof setTimeout> | null = null;
+  private readonly FLUSH_DELAY_MS = 100;
+  private readonly MAX_PENDING_WRITES = 10;
+
+  // In-memory index: inboxId -> Set of conversationIds for O(1) lookup
+  private inboxIndex: Map<string, Set<string>> | null = null;
 
   constructor() {
     // Separate MMKV instance for encryption states (encrypted at rest)
     this.storage = new MMKVStorageProvider('quorum-encryption');
   }
 
-  // ============ Encryption States ============
+  /**
+   * Queue a write operation for batched execution
+   * This prevents UI jank during heavy sync operations
+   */
+  private queueWrite(key: string, value: string): void {
+    this.pendingWrites.set(key, value);
+
+    // Flush immediately if we've accumulated enough writes
+    if (this.pendingWrites.size >= this.MAX_PENDING_WRITES) {
+      this.flushWrites();
+      return;
+    }
+
+    // Otherwise schedule a flush
+    if (!this.flushTimeout) {
+      this.flushTimeout = setTimeout(() => this.flushWrites(), this.FLUSH_DELAY_MS);
+    }
+  }
+
+  /**
+   * Flush all pending writes to storage
+   * Called automatically after delay or when max pending reached
+   */
+  private flushWrites(): void {
+    if (this.flushTimeout) {
+      clearTimeout(this.flushTimeout);
+      this.flushTimeout = null;
+    }
+
+    if (this.pendingWrites.size === 0) return;
+
+    // Batch write all pending updates
+    for (const [key, value] of this.pendingWrites) {
+      this.storage.set(key, value);
+    }
+    this.pendingWrites.clear();
+  }
+
+  /**
+   * Force flush pending writes (call before reading updated state)
+   */
+  flushPendingWrites(): void {
+    this.flushWrites();
+  }
+
+  // Encryption States
 
   /**
    * Get encryption state for a specific conversation+inbox pair
    */
   getEncryptionState(conversationId: string, inboxId: string): EncryptionState | null {
     const key = `${KEYS.ENCRYPTION_STATE}${conversationId}:${inboxId}`;
+
+    // Check pending writes first (most recent state)
+    const pendingData = this.pendingWrites.get(key);
+    if (pendingData) {
+      try {
+        return JSON.parse(pendingData) as EncryptionState;
+      } catch {
+        // Pending write data is malformed — fall through to storage read
+      }
+    }
+
     const data = this.storage.getString(key);
     if (!data) return null;
     try {
       return JSON.parse(data) as EncryptionState;
     } catch {
-      console.error('Failed to parse encryption state:', key);
       return null;
     }
   }
@@ -107,10 +180,19 @@ class EncryptionStateStorage {
    * Save encryption state
    * @param updateLatest - Whether to update the "latest state" tracker (used for determining where to send).
    *                       Set to false when saving state after receiving/decrypting a message.
+   * @param immediate - If true, writes immediately instead of batching (use for critical sends)
    */
-  saveEncryptionState(state: EncryptionState, updateLatest: boolean = true): void {
+  saveEncryptionState(state: EncryptionState, updateLatest: boolean = true, immediate: boolean = false): void {
     const key = `${KEYS.ENCRYPTION_STATE}${state.conversationId}:${state.inboxId}`;
-    this.storage.set(key, JSON.stringify(state));
+    const value = JSON.stringify(state);
+
+    if (immediate) {
+      // Immediate write for critical operations (e.g., before sending)
+      this.storage.set(key, value);
+    } else {
+      // Batched write for performance during sync
+      this.queueWrite(key, value);
+    }
 
     // Update conversation inbox list
     this.addInboxToConversation(state.conversationId, state.inboxId);
@@ -149,9 +231,12 @@ class EncryptionStateStorage {
 
     // Clear latest state
     this.storage.remove(`${KEYS.LATEST_STATE}${conversationId}`);
+
+    // Invalidate in-memory index
+    this.inboxIndex = null;
   }
 
-  // ============ Inbox Mapping ============
+  // Inbox Mapping
 
   /**
    * Get conversation ID for an inbox
@@ -184,7 +269,7 @@ class EncryptionStateStorage {
     this.storage.remove(key);
   }
 
-  // ============ Latest State ============
+  // Latest State
 
   /**
    * Get latest state for a conversation
@@ -212,7 +297,7 @@ class EncryptionStateStorage {
     }
   }
 
-  // ============ Conversation Inbox List ============
+  // Conversation Inbox List
 
   /**
    * Get all inbox IDs for a conversation
@@ -237,6 +322,8 @@ class EncryptionStateStorage {
       inboxIds.push(inboxId);
       const key = `${KEYS.CONVERSATION_INBOXES}${conversationId}`;
       this.storage.set(key, JSON.stringify(inboxIds));
+      // Invalidate in-memory index
+      this.inboxIndex = null;
     }
   }
 
@@ -254,10 +341,12 @@ class EncryptionStateStorage {
       } else {
         this.storage.remove(key);
       }
+      // Invalidate in-memory index
+      this.inboxIndex = null;
     }
   }
 
-  // ============ Conversation Inbox Keypairs ============
+  // Conversation Inbox Keypairs
 
   /**
    * Save a per-conversation inbox keypair
@@ -316,6 +405,29 @@ class EncryptionStateStorage {
   }
 
   /**
+   * Get every stored conversation inbox keypair in a single sweep.
+   * Callers that need both the address and the keypair should use this
+   * instead of calling getAllConversationInboxAddresses() and then
+   * getConversationInboxKeypairByAddress() per address — the latter is
+   * O(N) per lookup and turns the natural loop into O(N²).
+   */
+  getAllConversationInboxKeypairs(): ConversationInboxKeypair[] {
+    const out: ConversationInboxKeypair[] = [];
+    const allKeys = this.storage.getAllKeys();
+    for (const key of allKeys) {
+      if (!key.startsWith(KEYS.CONVERSATION_INBOX_KEY)) continue;
+      const data = this.storage.getString(key);
+      if (!data) continue;
+      try {
+        out.push(JSON.parse(data) as ConversationInboxKeypair);
+      } catch {
+        // Skip malformed entries
+      }
+    }
+    return out;
+  }
+
+  /**
    * Get all conversation inbox addresses
    * Used for resubscribing to all inboxes we created when initiating conversations
    */
@@ -338,13 +450,15 @@ class EncryptionStateStorage {
     return addresses;
   }
 
-  // ============ Utility ============
+  // Utility
 
   /**
    * Clear all encryption storage (for sign out)
    */
   clearAll(): void {
     this.storage.clearAll();
+    // Invalidate in-memory index
+    this.inboxIndex = null;
   }
 
   /**
@@ -356,6 +470,32 @@ class EncryptionStateStorage {
   }
 
   /**
+   * Build the in-memory index mapping inboxId -> Set of conversationIds.
+   * Called lazily on first getStatesByInboxId after invalidation.
+   */
+  private buildInboxIndex(): Map<string, Set<string>> {
+    const index = new Map<string, Set<string>>();
+    const allKeys = this.storage.getAllKeys();
+
+    for (const key of allKeys) {
+      if (key.startsWith(KEYS.CONVERSATION_INBOXES)) {
+        const conversationId = key.substring(KEYS.CONVERSATION_INBOXES.length);
+        const inboxIds = this.getConversationInboxIds(conversationId);
+        for (const iid of inboxIds) {
+          let convSet = index.get(iid);
+          if (!convSet) {
+            convSet = new Set<string>();
+            index.set(iid, convSet);
+          }
+          convSet.add(conversationId);
+        }
+      }
+    }
+
+    return index;
+  }
+
+  /**
    * Get all encryption states that have a specific inbox ID
    * This is used for trial decryption on the device inbox
    * since multiple conversations can share the same device inbox
@@ -363,36 +503,26 @@ class EncryptionStateStorage {
    * Returns array of (conversationId, state) pairs
    */
   getStatesByInboxId(inboxId: string): Array<{ conversationId: string; state: EncryptionState }> {
-    const results: Array<{ conversationId: string; state: EncryptionState }> = [];
-
-    // Get all inbox mappings to find which conversations use this inbox
-    // We need to iterate through all keys to find conversations
-    const allKeys = this.storage.getAllKeys();
-
-    // Find all conversation inbox lists
-    const conversationIds = new Set<string>();
-    for (const key of allKeys) {
-      if (key.startsWith(KEYS.CONVERSATION_INBOXES)) {
-        const conversationId = key.substring(KEYS.CONVERSATION_INBOXES.length);
-        conversationIds.add(conversationId);
-      }
+    // Build index lazily on first call (or after invalidation)
+    if (!this.inboxIndex) {
+      this.inboxIndex = this.buildInboxIndex();
     }
 
-    // Check each conversation for this inbox
+    const conversationIds = this.inboxIndex.get(inboxId);
+    if (!conversationIds) return [];
+
+    const results: Array<{ conversationId: string; state: EncryptionState }> = [];
     for (const conversationId of conversationIds) {
-      const inboxIds = this.getConversationInboxIds(conversationId);
-      if (inboxIds.includes(inboxId)) {
-        const state = this.getEncryptionState(conversationId, inboxId);
-        if (state) {
-          results.push({ conversationId, state });
-        }
+      const state = this.getEncryptionState(conversationId, inboxId);
+      if (state) {
+        results.push({ conversationId, state });
       }
     }
 
     return results;
   }
 
-  // ============ Ephemeral Key State Cache ============
+  // Ephemeral Key State Cache
   // Used to cache ratchet states by sender's ephemeral public key.
   // This handles the case where multiple init envelopes arrive with the same
   // ephemeral key (e.g., messages sent before receiver's reply arrives).
@@ -420,7 +550,6 @@ class EncryptionStateStorage {
     try {
       return JSON.parse(data) as EncryptionState;
     } catch {
-      console.error('Failed to parse ephemeral key state:', key);
       return null;
     }
   }
@@ -433,7 +562,7 @@ class EncryptionStateStorage {
     this.storage.remove(key);
   }
 
-  // ============ Fallback State (for header key sync issues) ============
+  // Fallback State (for header key sync issues)
 
   /**
    * Save a fallback encryption state that can be used if decrypt fails with the current state.
@@ -441,7 +570,8 @@ class EncryptionStateStorage {
    */
   saveFallbackState(state: EncryptionState): void {
     const key = `${KEYS.ENCRYPTION_STATE}${state.conversationId}:${state.inboxId}:fallback`;
-    this.storage.set(key, JSON.stringify(state));
+    // Use batched write for fallback states (non-critical)
+    this.queueWrite(key, JSON.stringify(state));
   }
 
   /**
@@ -454,7 +584,6 @@ class EncryptionStateStorage {
     try {
       return JSON.parse(data) as EncryptionState;
     } catch {
-      console.error('Failed to parse fallback encryption state:', key);
       return null;
     }
   }

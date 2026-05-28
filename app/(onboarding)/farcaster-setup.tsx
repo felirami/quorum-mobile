@@ -5,7 +5,7 @@
  * This derives the Ethereum custody address and looks up the FID.
  */
 
-import React, { useState } from 'react';
+import React, { useCallback, useState } from 'react';
 import {
   View,
   Text,
@@ -14,7 +14,8 @@ import {
   TouchableOpacity,
   ScrollView,
 } from 'react-native';
-import { useTheme } from '@/theme';
+import * as Clipboard from 'expo-clipboard';
+import { useTheme, type AppTheme } from '@/theme';
 import { useOnboarding } from '@/context';
 import { OnboardingLayout, StepNavigation } from '@/components/onboarding';
 import { IconSymbol } from '@/components/ui/IconSymbol';
@@ -39,11 +40,17 @@ export default function FarcasterSetupScreen() {
 
   const [wordCount, setWordCount] = useState<12 | 24>(12);
   const [words, setWords] = useState<string[]>(Array(12).fill(''));
+  const [pasteMode, setPasteMode] = useState(true);
+  const [pasteText, setPasteText] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
-  const filledCount = words.filter(w => w.trim().length > 0).length;
-  const isComplete = filledCount === wordCount;
+  const filledCount = pasteMode
+    ? pasteText.trim().split(/\s+/).filter(w => w.length > 0).length
+    : words.filter(w => w.trim().length > 0).length;
+  const isComplete = pasteMode
+    ? (filledCount === 12 || filledCount === 24)
+    : filledCount === wordCount;
 
   const handleWordCountChange = (count: 12 | 24) => {
     setWordCount(count);
@@ -79,6 +86,25 @@ export default function FarcasterSetupScreen() {
     setError(null);
   };
 
+  const handlePasteFromClipboard = useCallback(async () => {
+    try {
+      const text = await Clipboard.getStringAsync();
+      if (!text || !text.trim()) {
+        setError('Clipboard is empty');
+        return;
+      }
+      setPasteText(text.trim());
+      setError(null);
+    } catch {
+      setError('Failed to read clipboard');
+    }
+  }, []);
+
+  const handlePasteTextChange = useCallback((text: string) => {
+    setPasteText(text);
+    setError(null);
+  }, []);
+
   const handleSubmit = async () => {
     if (!isComplete || isSubmitting) return;
 
@@ -86,8 +112,10 @@ export default function FarcasterSetupScreen() {
     setError(null);
 
     try {
-      // Validate mnemonic
-      const cleanWords = words.map(w => w.toLowerCase().trim());
+      // Get words from either paste mode or individual inputs
+      const cleanWords = pasteMode
+        ? pasteText.trim().split(/\s+/).map(w => w.toLowerCase().trim())
+        : words.map(w => w.toLowerCase().trim());
       if (!validateFarcasterMnemonic(cleanWords)) {
         setError('Invalid recovery phrase. Please check your words.');
         setIsSubmitting(false);
@@ -153,21 +181,22 @@ export default function FarcasterSetupScreen() {
         </Text>
       </View>
 
+      {/* Input mode toggle */}
       <View style={styles.wordCountToggle}>
         <TouchableOpacity
-          style={[styles.wordCountOption, wordCount === 12 && styles.wordCountOptionActive]}
-          onPress={() => handleWordCountChange(12)}
+          style={[styles.wordCountOption, pasteMode && styles.wordCountOptionActive]}
+          onPress={() => setPasteMode(true)}
         >
-          <Text style={[styles.wordCountText, wordCount === 12 && styles.wordCountTextActive]}>
-            12 words
+          <Text style={[styles.wordCountText, pasteMode && styles.wordCountTextActive]}>
+            Paste phrase
           </Text>
         </TouchableOpacity>
         <TouchableOpacity
-          style={[styles.wordCountOption, wordCount === 24 && styles.wordCountOptionActive]}
-          onPress={() => handleWordCountChange(24)}
+          style={[styles.wordCountOption, !pasteMode && styles.wordCountOptionActive]}
+          onPress={() => setPasteMode(false)}
         >
-          <Text style={[styles.wordCountText, wordCount === 24 && styles.wordCountTextActive]}>
-            24 words
+          <Text style={[styles.wordCountText, !pasteMode && styles.wordCountTextActive]}>
+            Word by word
           </Text>
         </TouchableOpacity>
       </View>
@@ -179,31 +208,73 @@ export default function FarcasterSetupScreen() {
         </View>
       )}
 
-      <ScrollView style={styles.scrollView} showsVerticalScrollIndicator={false}>
-        <View style={styles.wordGrid}>
-          {words.map((word, index) => (
-            <View key={index} style={styles.wordInputContainer}>
-              <Text style={styles.wordNumber}>{index + 1}</Text>
-              <TextInput
-                style={styles.wordInput}
-                value={word}
-                onChangeText={text => handleWordChange(index, text)}
-                placeholder="word"
-                placeholderTextColor={theme.colors.textMuted}
-                autoCapitalize="none"
-                autoCorrect={false}
-                editable={!isSubmitting}
-              />
-            </View>
-          ))}
+      {pasteMode ? (
+        <View style={styles.pasteContainer}>
+          <TextInput
+            style={styles.pasteInput}
+            value={pasteText}
+            onChangeText={handlePasteTextChange}
+            placeholder="Enter or paste your recovery phrase here..."
+            placeholderTextColor={theme.colors.textMuted}
+            autoCapitalize="none"
+            autoCorrect={false}
+            multiline
+            textAlignVertical="top"
+            editable={!isSubmitting}
+          />
+          <TouchableOpacity style={styles.pasteButton} onPress={handlePasteFromClipboard}>
+            <IconSymbol name="doc.on.clipboard" size={18} color={theme.colors.primary} />
+            <Text style={styles.pasteButtonText}>Paste from clipboard</Text>
+          </TouchableOpacity>
+          <View style={styles.footer}>
+            <Text style={styles.progressText}>
+              {filledCount} word{filledCount !== 1 ? 's' : ''} detected
+              {filledCount === 12 || filledCount === 24 ? ' ✓' : ''}
+            </Text>
+          </View>
         </View>
-      </ScrollView>
-
-      <View style={styles.footer}>
-        <Text style={styles.progressText}>
-          {filledCount} of {wordCount} words entered
-        </Text>
-      </View>
+      ) : (
+        <>
+          <View style={styles.wordCountToggleSecondary}>
+            <TouchableOpacity
+              style={[styles.wordCountOptionSmall, wordCount === 12 && styles.wordCountOptionActive]}
+              onPress={() => handleWordCountChange(12)}
+            >
+              <Text style={[styles.wordCountTextSmall, wordCount === 12 && styles.wordCountTextActive]}>12</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.wordCountOptionSmall, wordCount === 24 && styles.wordCountOptionActive]}
+              onPress={() => handleWordCountChange(24)}
+            >
+              <Text style={[styles.wordCountTextSmall, wordCount === 24 && styles.wordCountTextActive]}>24</Text>
+            </TouchableOpacity>
+          </View>
+          <ScrollView style={styles.scrollView} showsVerticalScrollIndicator={false}>
+            <View style={styles.wordGrid}>
+              {words.map((word, index) => (
+                <View key={index} style={styles.wordInputContainer}>
+                  <Text style={styles.wordNumber}>{index + 1}</Text>
+                  <TextInput
+                    style={styles.wordInput}
+                    value={word}
+                    onChangeText={text => handleWordChange(index, text)}
+                    placeholder="word"
+                    placeholderTextColor={theme.colors.textMuted}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    editable={!isSubmitting}
+                  />
+                </View>
+              ))}
+            </View>
+          </ScrollView>
+          <View style={styles.footer}>
+            <Text style={styles.progressText}>
+              {filledCount} of {wordCount} words entered
+            </Text>
+          </View>
+        </>
+      )}
 
       <StepNavigation
         onBack={goBack}
@@ -220,9 +291,9 @@ export default function FarcasterSetupScreen() {
   );
 }
 
-// ============ Styles ============
+// Styles
 
-const createStyles = (theme: any) =>
+const createStyles = (theme: AppTheme) =>
   StyleSheet.create({
     header: {
       alignItems: 'center',
@@ -322,6 +393,51 @@ const createStyles = (theme: any) =>
       fontFamily: theme.fonts.regular.fontFamily,
       marginLeft: 8,
       flex: 1,
+    },
+    pasteContainer: {
+      flex: 1,
+    },
+    pasteInput: {
+      backgroundColor: theme.colors.surface3,
+      borderRadius: 12,
+      padding: 16,
+      fontSize: 16,
+      color: theme.colors.textStrong,
+      fontFamily: theme.fonts.regular.fontFamily,
+      minHeight: 120,
+      lineHeight: 24,
+    },
+    pasteButton: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 8,
+      marginTop: 12,
+      paddingVertical: 12,
+      backgroundColor: theme.colors.primary + '15',
+      borderRadius: 10,
+    },
+    pasteButtonText: {
+      fontSize: 15,
+      color: theme.colors.primary,
+      fontFamily: theme.fonts.medium.fontFamily,
+    },
+    wordCountToggleSecondary: {
+      flexDirection: 'row',
+      gap: 8,
+      marginBottom: 12,
+      justifyContent: 'center',
+    },
+    wordCountOptionSmall: {
+      paddingVertical: 6,
+      paddingHorizontal: 16,
+      borderRadius: 8,
+      backgroundColor: theme.colors.surface3,
+    },
+    wordCountTextSmall: {
+      fontSize: 13,
+      color: theme.colors.textMuted,
+      fontFamily: theme.fonts.medium.fontFamily,
     },
     footer: {
       marginTop: 'auto',

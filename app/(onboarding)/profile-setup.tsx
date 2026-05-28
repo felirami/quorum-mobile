@@ -3,7 +3,6 @@
  *
  * Optional profile configuration:
  * - Avatar (camera/gallery)
- * - Username (@handle)
  * - Display name
  * - Bio
  */
@@ -21,7 +20,7 @@ import {
   Platform,
 } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
-import { useTheme } from '@/theme';
+import { useTheme, type AppTheme } from '@/theme';
 import { useOnboarding } from '@/context';
 import { OnboardingLayout, StepNavigation } from '@/components/onboarding';
 import { IconSymbol } from '@/components/ui/IconSymbol';
@@ -31,7 +30,6 @@ export default function ProfileSetupScreen() {
   const { state, updateProfile, skipProfile, goBack } = useOnboarding();
   const styles = createStyles(theme);
 
-  const [username, setUsername] = useState(state.profile.username ?? '');
   const [displayName, setDisplayName] = useState(state.profile.displayName ?? '');
   const [bio, setBio] = useState(state.profile.bio ?? '');
   const [profileImage, setProfileImage] = useState<string | undefined>(state.profile.profileImageUri);
@@ -44,9 +42,6 @@ export default function ProfileSetupScreen() {
     }
     if (!profileImage && state.profile.profileImageUri) {
       setProfileImage(state.profile.profileImageUri);
-    }
-    if (!username && state.profile.username) {
-      setUsername(state.profile.username);
     }
     if (!bio && state.profile.bio) {
       setBio(state.profile.bio);
@@ -91,7 +86,6 @@ export default function ProfileSetupScreen() {
 
   const handleContinue = () => {
     updateProfile({
-      username: username.trim() || undefined,
       displayName: displayName.trim() || undefined,
       bio: bio.trim() || undefined,
       profileImageUri: profileImage,
@@ -103,13 +97,7 @@ export default function ProfileSetupScreen() {
     skipProfile();
   };
 
-  // Format username to lowercase and remove spaces
-  const handleUsernameChange = (text: string) => {
-    const formatted = text.toLowerCase().replace(/[^a-z0-9_]/g, '');
-    setUsername(formatted);
-  };
-
-  const hasAnyInput = username.trim() || displayName.trim() || bio.trim() || profileImage;
+  const hasAnyInput = displayName.trim() || bio.trim() || profileImage;
 
   return (
     <OnboardingLayout currentStep="profile-setup">
@@ -164,26 +152,6 @@ export default function ProfileSetupScreen() {
           {/* Form Fields */}
           <View style={styles.form}>
             <View style={styles.inputGroup}>
-              <Text style={styles.inputLabel}>Username</Text>
-              <View style={styles.usernameInputContainer}>
-                <Text style={styles.usernamePrefix}>@</Text>
-                <TextInput
-                  style={styles.usernameInput}
-                  value={username}
-                  onChangeText={handleUsernameChange}
-                  placeholder="username"
-                  placeholderTextColor={theme.colors.textMuted}
-                  autoCapitalize="none"
-                  autoCorrect={false}
-                  maxLength={20}
-                />
-              </View>
-              <Text style={styles.inputHint}>
-                Lowercase letters, numbers, and underscores only
-              </Text>
-            </View>
-
-            <View style={styles.inputGroup}>
               <Text style={styles.inputLabel}>Display Name</Text>
               <TextInput
                 style={styles.textInput}
@@ -227,7 +195,7 @@ export default function ProfileSetupScreen() {
   );
 }
 
-const createStyles = (theme: any) =>
+const createStyles = (theme: AppTheme) =>
   StyleSheet.create({
     keyboardView: {
       flex: 1,
@@ -322,31 +290,6 @@ const createStyles = (theme: any) =>
       padding: 16,
       fontSize: 16,
       color: theme.colors.textStrong,
-      fontFamily: theme.fonts.regular.fontFamily,
-    },
-    usernameInputContainer: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      backgroundColor: theme.colors.surface3,
-      borderRadius: 12,
-      paddingHorizontal: 16,
-    },
-    usernamePrefix: {
-      fontSize: 16,
-      color: theme.colors.textMuted,
-      fontFamily: theme.fonts.regular.fontFamily,
-      marginRight: 2,
-    },
-    usernameInput: {
-      flex: 1,
-      paddingVertical: 16,
-      fontSize: 16,
-      color: theme.colors.textStrong,
-      fontFamily: theme.fonts.regular.fontFamily,
-    },
-    inputHint: {
-      fontSize: 12,
-      color: theme.colors.textMuted,
       fontFamily: theme.fonts.regular.fontFamily,
     },
     bioInput: {

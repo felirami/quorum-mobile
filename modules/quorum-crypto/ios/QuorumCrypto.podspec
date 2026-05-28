@@ -16,22 +16,12 @@ Pod::Spec.new do |s|
   s.static_framework = true
 
   s.dependency 'ExpoModulesCore'
+  # MMKV + Channel.xcframework + uniffi channel.swift live in
+  # QuorumChannelFFI so the iOS Notification Service Extension can
+  # link just the Rust crypto surface without pulling in Expo.
+  s.dependency 'QuorumChannelFFI'
 
-  # Swift sources - Expo module and uniffi-generated bindings
-  s.source_files = "*.swift", "Bindings/*.swift"
-
-  # Channel Rust library (uniffi-generated XCFramework)
-  s.vendored_frameworks = 'Frameworks/Channel.xcframework'
-
-  # Module map for FFI headers (channelFFI module from uniffi)
-  s.preserve_paths = 'Bindings/module.modulemap', 'Bindings/channelFFI.h'
-  s.pod_target_xcconfig = {
-    'SWIFT_INCLUDE_PATHS' => '$(PODS_TARGET_SRCROOT)/Bindings',
-    'HEADER_SEARCH_PATHS' => '$(PODS_TARGET_SRCROOT)/Bindings',
-    'OTHER_CFLAGS' => '-fmodule-map-file="$(PODS_TARGET_SRCROOT)/Bindings/module.modulemap"'
-  }
-  s.user_target_xcconfig = {
-    'SWIFT_INCLUDE_PATHS' => '$(PODS_ROOT)/../../modules/quorum-crypto/ios/Bindings',
-    'HEADER_SEARCH_PATHS' => '$(PODS_ROOT)/../../modules/quorum-crypto/ios/Bindings'
-  }
+  # Swift sources - just the Expo module here. FFI bindings come
+  # from QuorumChannelFFI.
+  s.source_files = "*.swift"
 end

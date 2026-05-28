@@ -14,40 +14,68 @@
  * - Account: Profile in this space, notification settings (with leave option)
  */
 
-import React, { useState, useCallback, useMemo, useEffect } from 'react';
+import { KickUserModal } from '@/components/KickUserModal';
+import SpaceChannelBindingPicker from '@/components/SpaceChannelBindingPicker';
+import ShareInviteSheet from '@/components/ShareInviteSheet';
+import { BaseModal } from '@/components/shared';
+import { IconSymbol, type IconSymbolName } from '@/components/ui/IconSymbol';
+import { IconPicker } from '@/components/ui/IconPicker';
+import { useAuth, useWebSocket } from '@/context';
+import { getMMKVAdapter } from '@/services/storage/mmkvAdapter';
+import { maybeSendUpdateProfileMessage } from '@/services/space/spaceMessageService';
+import * as ImagePicker from 'expo-image-picker';
+import { useGenerateInvite, useGeneratePublicInvite } from '@/hooks/chat/useInviteManagement';
 import {
-  View,
-  Text,
-  TextInput,
-  StyleSheet,
-  TouchableOpacity,
+  useAddRole,
+  useDeleteRole,
+  useRoles,
+  useUpdateRole,
+} from '@/hooks/chat/useRoleManagement';
+import {
+  useAddChannel,
+  useUpdateChannel,
+  useDeleteChannel,
+  useAddGroup,
+  useUpdateGroup,
+  useDeleteGroup,
+  useMoveChannel,
+  useReorderChannels,
+} from '@/hooks/chat';
+import { useSpaceMembers } from '@/hooks/chat/useSpaces';
+import { useDeleteSpace, useLeaveSpace, useUpdateSpace } from '@/hooks/chat/useSpaceSettings';
+import { getSpace, getSpaceKey } from '@/services/config/spaceStorage';
+import {
+  getChannelNotificationsEnabled,
+  getSpaceNotificationsEnabled,
+  setChannelNotificationsEnabled,
+  setSpaceNotificationsEnabled,
+} from '@/services/notifications/notificationPrefs';
+// NativeCryptoProvider and getApiConfig imported dynamically in handlePublishToDirectory
+// to avoid module-level import failures on some devices
+import { pickEmoji, pickSticker } from '@/services/media/customAssets';
+import { pickImage, compressAvatarImage } from '@/services/media/imageAttachment';
+import { useTheme, type AppTheme } from '@/theme';
+import type { EdgeInsets } from 'react-native-safe-area-context';
+import { truncateAddress } from '@/utils/formatAddress';
+import { hexToBytes, type Emoji, type Permission, type Role, type Space, type Sticker } from '@quilibrium/quorum-shared';
+import * as Clipboard from 'expo-clipboard';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import {
   ActivityIndicator,
+  Alert,
+  Dimensions,
   Image,
   ScrollView,
-  Alert,
+  StyleSheet,
   Switch,
-  Share,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import * as Clipboard from 'expo-clipboard';
-import { BaseModal } from '@/components/shared';
-import { IconSymbol } from '@/components/ui/IconSymbol';
-import { KickUserModal } from '@/components/KickUserModal';
-import { useTheme } from '@/theme';
-import { useAuth } from '@/context';
-import { useUpdateSpace, useDeleteSpace, useLeaveSpace } from '@/hooks/chat/useSpaceSettings';
-import {
-  useRoles,
-  useAddRole,
-  useUpdateRole,
-  useDeleteRole,
-} from '@/hooks/chat/useRoleManagement';
-import { useGenerateInvite, useShareInvite } from '@/hooks/chat/useInviteManagement';
-import { useSpaceMembers } from '@/hooks/chat/useSpaces';
-import { getSpace, getSpaceKey } from '@/services/config/spaceStorage';
-import { pickImage } from '@/services/media/imageAttachment';
-import { pickEmoji, pickSticker } from '@/services/media/customAssets';
-import type { Space, Role, Permission, Emoji, Sticker, SpaceMember } from '@quilibrium/quorum-shared';
+import { logger } from '@quilibrium/quorum-shared';
+const { height: SCREEN_HEIGHT } = Dimensions.get('window');
 
 interface SpaceSettingsModalProps {
   visible: boolean;
@@ -55,9 +83,11 @@ interface SpaceSettingsModalProps {
   spaceId: string;
   onSpaceDeleted?: () => void;
   onSpaceLeft?: () => void;
+  isUserMuted?: (userId: string) => boolean;
+  onToggleMuteUser?: (userId: string) => void;
 }
 
-type TabType = 'general' | 'account' | 'members' | 'roles' | 'emojis' | 'stickers' | 'invites' | 'danger';
+type TabType = 'general' | 'account' | 'members' | 'channels' | 'linked' | 'roles' | 'emojis' | 'stickers' | 'invites' | 'danger';
 
 // Validation constants
 const MIN_NAME_LENGTH = 2;
@@ -90,8 +120,8 @@ const AVAILABLE_PERMISSIONS: { value: Permission; label: string }[] = [
 interface RoleEditorProps {
   role: Role;
   spaceId: string;
-  theme: any;
-  styles: any;
+  theme: AppTheme;
+  styles: ReturnType<typeof createStyles>;
   onDelete: () => void;
 }
 
@@ -108,7 +138,7 @@ function RoleEditor({ role, spaceId, theme, styles, onDelete }: RoleEditorProps)
     return (
       displayName !== role.displayName ||
       roleTag !== role.roleTag ||
-      JSON.stringify(permissions.sort()) !== JSON.stringify([...role.permissions].sort()) ||
+      JSON.stringify([...permissions].sort()) !== JSON.stringify([...role.permissions].sort()) ||
       isPublic !== (role.isPublic !== false)
     );
   }, [displayName, roleTag, permissions, isPublic, role]);
@@ -125,10 +155,21 @@ function RoleEditor({ role, spaceId, theme, styles, onDelete }: RoleEditorProps)
         isPublic,
       });
     } catch (error) {
-      console.error('[RoleEditor] Save failed:', error);
       Alert.alert('Error', 'Failed to save role');
     }
   }, [spaceId, role.roleId, displayName, roleTag, permissions, isPublic, hasChanges, updateRoleMutation]);
+
+  // Auto-save when permissions or isPublic change (toggle actions)
+  const isInitialMount = React.useRef(true);
+  React.useEffect(() => {
+    if (isInitialMount.current) {
+      isInitialMount.current = false;
+      return;
+    }
+    if (hasChanges) {
+      handleSave();
+    }
+  }, [permissions, isPublic]);
 
   const togglePermission = useCallback((perm: Permission) => {
     setPermissions(prev =>
@@ -168,8 +209,6 @@ function RoleEditor({ role, spaceId, theme, styles, onDelete }: RoleEditorProps)
             style={styles.roleActionButton}
             onPress={() => {
               setIsPublic(!isPublic);
-              // Save after state update
-              setTimeout(() => handleSave(), 0);
             }}
           >
             <IconSymbol
@@ -210,8 +249,6 @@ function RoleEditor({ role, spaceId, theme, styles, onDelete }: RoleEditorProps)
               style={styles.permissionItem}
               onPress={() => {
                 togglePermission(perm.value);
-                // Save after state update
-                setTimeout(() => handleSave(), 0);
               }}
             >
               <View style={[
@@ -243,11 +280,14 @@ export default function SpaceSettingsModal({
   spaceId,
   onSpaceDeleted,
   onSpaceLeft,
+  isUserMuted,
+  onToggleMuteUser,
 }: SpaceSettingsModalProps) {
   const { theme } = useTheme();
   const insets = useSafeAreaInsets();
   const styles = createStyles(theme, insets);
   const { user } = useAuth();
+  const { enqueueOutbound } = useWebSocket();
 
   // Determine if user is space owner
   const isSpaceOwner = useMemo(() => {
@@ -263,6 +303,216 @@ export default function SpaceSettingsModal({
       setSpace(loadedSpace);
     }
   }, [visible, spaceId]);
+
+  // Per-space notification preference. Anyone can mute/unmute their
+  // own copy of a space — this is a local user setting, not a
+  // space-wide config. Persisted in MMKV; gates
+  // showMessageNotification at presentation time.
+  const [spaceNotificationsOn, setSpaceNotificationsOn] = useState<boolean>(() =>
+    getSpaceNotificationsEnabled(spaceId),
+  );
+  useEffect(() => {
+    if (visible && spaceId) {
+      setSpaceNotificationsOn(getSpaceNotificationsEnabled(spaceId));
+    }
+  }, [visible, spaceId]);
+  const handleToggleSpaceNotifications = useCallback((next: boolean) => {
+    setSpaceNotificationsOn(next);
+    setSpaceNotificationsEnabled(spaceId, next);
+  }, [spaceId]);
+
+  // Per-channel notification preferences. Map keyed by channelId
+  // mirrors what's in MMKV; we re-read on open so a fresh modal
+  // shows current state. Channel-level mute is independent of the
+  // space-level toggle — if the space is muted nothing notifies
+  // regardless of channel toggle (gating is in
+  // services/notifications/pushReceivedTask.ts).
+  const [channelNotifMap, setChannelNotifMap] = useState<Record<string, boolean>>({});
+  useEffect(() => {
+    if (!visible || !spaceId || !space) return;
+    const next: Record<string, boolean> = {};
+    for (const group of space.groups ?? []) {
+      for (const ch of group.channels ?? []) {
+        next[ch.channelId] = getChannelNotificationsEnabled(spaceId, ch.channelId);
+      }
+    }
+    setChannelNotifMap(next);
+  }, [visible, spaceId, space]);
+  const handleToggleChannelNotifications = useCallback(
+    (channelId: string, next: boolean) => {
+      setChannelNotifMap(prev => ({ ...prev, [channelId]: next }));
+      setChannelNotificationsEnabled(spaceId, channelId, next);
+    },
+    [spaceId],
+  );
+
+  // Per-space profile — overrides the user's global profile for this
+  // space only. Stored on the SpaceMember record keyed by
+  // (spaceId, userAddress). The receive-side update-profile handler
+  // is upsert-aware (only writes fields that are present), so we
+  // only broadcast fields the user actually edited.
+  const [spaceProfileDisplayName, setSpaceProfileDisplayName] = useState<string>('');
+  const [spaceProfileBio, setSpaceProfileBio] = useState<string>('');
+  const [spaceProfileImage, setSpaceProfileImage] = useState<string>('');
+  // Snapshot of the values that are currently on the SpaceMember
+  // record — used to compute "did anything actually change" so we
+  // only broadcast when the user pressed Save after editing
+  // something. Also lets the Save button disable itself when
+  // there's nothing to send.
+  const [spaceProfileBaseline, setSpaceProfileBaseline] = useState<{
+    displayName: string;
+    bio: string;
+    profileImage: string;
+  }>({ displayName: '', bio: '', profileImage: '' });
+  const [spaceProfileSaving, setSpaceProfileSaving] = useState(false);
+
+  useEffect(() => {
+    if (!visible || !spaceId || !user?.address) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const adapter = getMMKVAdapter();
+        const member = await adapter.getSpaceMember(spaceId, user.address);
+        if (cancelled) return;
+        const displayName = member?.display_name ?? '';
+        const bio = member?.bio ?? '';
+        const profileImage = member?.profile_image ?? '';
+        setSpaceProfileDisplayName(displayName);
+        setSpaceProfileBio(bio);
+        setSpaceProfileImage(profileImage);
+        setSpaceProfileBaseline({ displayName, bio, profileImage });
+      } catch {
+        // Member record missing or unreadable — leave fields empty.
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [visible, spaceId, user?.address]);
+
+  const handlePickSpaceProfileImage = useCallback(async () => {
+    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (status !== 'granted') {
+      Alert.alert('Permission Required', 'Photo library access is needed to change your space avatar.');
+      return;
+    }
+    // base64 deferred to compressAvatarImage which enforces a hard
+    // size cap so a giant phone photo can't bloat the broadcast or
+    // the public-profile JSON for this user.
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ['images'],
+      allowsEditing: true,
+      aspect: [1, 1],
+      quality: 0.8,
+      base64: false,
+    });
+    if (!result.canceled && result.assets[0]) {
+      const asset = result.assets[0];
+      const compressed = await compressAvatarImage(
+        asset.uri,
+        asset.width ?? 512,
+        asset.height ?? 512,
+      );
+      if (!compressed) {
+        Alert.alert('Could not process image', 'Try a smaller photo.');
+        return;
+      }
+      setSpaceProfileImage(compressed.dataUri);
+    }
+  }, []);
+
+  const spaceProfileDirty =
+    spaceProfileDisplayName !== spaceProfileBaseline.displayName ||
+    spaceProfileBio !== spaceProfileBaseline.bio ||
+    spaceProfileImage !== spaceProfileBaseline.profileImage;
+
+  const handleSaveSpaceProfile = useCallback(async () => {
+    if (!user?.address || !space || !spaceProfileDirty || spaceProfileSaving) return;
+    setSpaceProfileSaving(true);
+    try {
+      // Optimistically update the local SpaceMember so the UI
+      // reflects the new values immediately. Receivers apply the
+      // same fields on their end when our update-profile broadcast
+      // lands. Note: clearing fields (e.g. removing the avatar)
+      // works locally but the current update-profile wire shape
+      // skips empty fields, so other members keep seeing the old
+      // value until we add a clear-field signal. Tracked as a known
+      // limitation; flag if you hit it.
+      const adapter = getMMKVAdapter();
+      const existing = await adapter.getSpaceMember(spaceId, user.address);
+      const merged = {
+        ...(existing ?? {}),
+        address: user.address,
+        inbox_address: existing?.inbox_address ?? '',
+        display_name: spaceProfileDisplayName,
+        bio: spaceProfileBio,
+        profile_image: spaceProfileImage,
+      };
+      await adapter.saveSpaceMember(spaceId, merged as never);
+
+      // Broadcast — only fields that actually changed since baseline
+      // get included so we don't clobber stale fields with empty
+      // values. maybeSendUpdateProfileMessage gates duplicate sends.
+      const channelId = space.defaultChannelId;
+      const params: {
+        spaceId: string;
+        channelId: string;
+        senderAddress: string;
+        displayName?: string;
+        userIcon?: string;
+        bio?: string;
+        farcasterFid?: number;
+        farcasterUsername?: string;
+      } = {
+        spaceId,
+        channelId,
+        senderAddress: user.address,
+      };
+      if (spaceProfileDisplayName !== spaceProfileBaseline.displayName) {
+        params.displayName = spaceProfileDisplayName || undefined;
+      }
+      if (spaceProfileBio !== spaceProfileBaseline.bio) {
+        params.bio = spaceProfileBio;
+      }
+      if (spaceProfileImage !== spaceProfileBaseline.profileImage) {
+        params.userIcon = spaceProfileImage || undefined;
+      }
+      // Auto-include Farcaster linkage whenever the user has one.
+      // The broadcast gate (maybeSendUpdateProfileMessage) dedupes
+      // against the previous signature, so re-saving without
+      // Farcaster changes won't re-send. Receivers persist these
+      // onto SpaceMember for use in UserProfileModal.
+      if (user.farcaster?.fid && user.farcaster.fid > 0) {
+        params.farcasterFid = user.farcaster.fid;
+        if (user.farcaster.username) {
+          params.farcasterUsername = user.farcaster.username;
+        }
+      }
+      const res = await maybeSendUpdateProfileMessage(params);
+      if (res) {
+        enqueueOutbound(async () => [res.wsEnvelope]);
+      }
+
+      setSpaceProfileBaseline({
+        displayName: spaceProfileDisplayName,
+        bio: spaceProfileBio,
+        profileImage: spaceProfileImage,
+      });
+    } catch (e) {
+      Alert.alert('Save failed', e instanceof Error ? e.message : 'Could not update your profile for this space.');
+    } finally {
+      setSpaceProfileSaving(false);
+    }
+  }, [
+    user?.address,
+    space,
+    spaceId,
+    spaceProfileDirty,
+    spaceProfileSaving,
+    spaceProfileDisplayName,
+    spaceProfileBio,
+    spaceProfileImage,
+    spaceProfileBaseline,
+    enqueueOutbound,
+  ]);
 
   // Tab state - default to 'account' for non-owners
   const [activeTab, setActiveTab] = useState<TabType>(isSpaceOwner ? 'general' : 'account');
@@ -288,12 +538,22 @@ export default function SpaceSettingsModal({
   const updateRoleMutation = useUpdateRole();
   const deleteRoleMutation = useDeleteRole();
 
+  // Channels
+  const addChannelMutation = useAddChannel();
+  const updateChannelMutation = useUpdateChannel();
+  const deleteChannelMutation = useDeleteChannel();
+  const addGroupMutation = useAddGroup();
+  const updateGroupMutation = useUpdateGroup();
+  const deleteGroupMutation = useDeleteGroup();
+  const moveChannelMutation = useMoveChannel();
+  const reorderChannelsMutation = useReorderChannels();
+
   // Members
   const { data: members = [] } = useSpaceMembers(spaceId, { enabled: !!spaceId });
 
   // Invites
   const generateInviteMutation = useGenerateInvite();
-  const shareInviteMutation = useShareInvite();
+  const generatePublicInviteMutation = useGeneratePublicInvite();
 
   // General tab state
   const [spaceName, setSpaceName] = useState('');
@@ -315,6 +575,28 @@ export default function SpaceSettingsModal({
 
   // Invite state
   const [generatedInviteLink, setGeneratedInviteLink] = useState<string | null>(null);
+  const [generatedInviteType, setGeneratedInviteType] = useState<'private' | 'public' | null>(null);
+  const [inviteType, setInviteType] = useState<'private' | 'public'>('private');
+  const [hasLoadedExistingInvite, setHasLoadedExistingInvite] = useState(false);
+
+  // Check for existing public invite URL when modal opens or tab changes to invites
+  // Only run once per modal open to avoid overriding user actions
+  useEffect(() => {
+    if (visible && spaceId && activeTab === 'invites' && !hasLoadedExistingInvite) {
+      const spaceData = getSpace(spaceId);
+      if (spaceData?.inviteUrl) {
+        // Space already has a public invite URL - show it
+        setGeneratedInviteLink(spaceData.inviteUrl);
+        setGeneratedInviteType('public');
+        setInviteType('public');
+      }
+      setHasLoadedExistingInvite(true);
+    }
+  }, [visible, spaceId, activeTab, hasLoadedExistingInvite]);
+
+  // Directory submission
+  const [directorySubmitting, setDirectorySubmitting] = useState(false);
+  const [directorySubmitted, setDirectorySubmitted] = useState(false);
 
   // Delete/Leave confirmation
   const [deleteConfirmStep, setDeleteConfirmStep] = useState(0);
@@ -334,6 +616,18 @@ export default function SpaceSettingsModal({
   const [editingStickerName, setEditingStickerName] = useState<string | null>(null);
   const [editingEmojiName, setEditingEmojiName] = useState('');
   const [editingStickerNameValue, setEditingStickerNameValue] = useState('');
+
+  // Channel/Group editing state
+  const [editingChannelId, setEditingChannelId] = useState<string | null>(null);
+  const [editingChannelName, setEditingChannelName] = useState('');
+  const [editingGroupIndex, setEditingGroupIndex] = useState<number | null>(null);
+  const [editingGroupName, setEditingGroupName] = useState('');
+  const [newChannelGroupIndex, setNewChannelGroupIndex] = useState<number | null>(null);
+  const [newChannelName, setNewChannelName] = useState('');
+
+  // Icon picker state
+  const [iconPickerVisible, setIconPickerVisible] = useState(false);
+  const [iconPickerChannelId, setIconPickerChannelId] = useState<string | null>(null);
 
   // Validation
   const nameError = useMemo(() => {
@@ -365,6 +659,9 @@ export default function SpaceSettingsModal({
   // Handlers
   const handleClose = useCallback(() => {
     setGeneratedInviteLink(null);
+    setGeneratedInviteType(null);
+    setInviteType('private');
+    setHasLoadedExistingInvite(false);
     setDeleteConfirmStep(0);
     setLeaveConfirmStep(0);
     setKickTarget(null);
@@ -387,7 +684,6 @@ export default function SpaceSettingsModal({
       const updated = getSpace(spaceId);
       setSpace(updated);
     } catch (error) {
-      console.error('[SpaceSettings] Save failed:', error);
       Alert.alert('Error', 'Failed to save changes');
     }
   }, [spaceId, spaceName, description, iconUrl, bannerUrl, isRepudiable, nameError, descriptionError, updateSpaceMutation]);
@@ -408,13 +704,19 @@ export default function SpaceSettingsModal({
 
   const handleGenerateInvite = useCallback(async () => {
     try {
-      const result = await generateInviteMutation.mutateAsync({ spaceId });
-      setGeneratedInviteLink(result.inviteLink);
+      if (inviteType === 'public') {
+        const result = await generatePublicInviteMutation.mutateAsync({ spaceId });
+        setGeneratedInviteLink(result.inviteLink);
+        setGeneratedInviteType('public');
+      } else {
+        const result = await generateInviteMutation.mutateAsync({ spaceId });
+        setGeneratedInviteLink(result.inviteLink);
+        setGeneratedInviteType('private');
+      }
     } catch (error) {
-      console.error('[SpaceSettings] Generate invite failed:', error);
       Alert.alert('Error', 'Failed to generate invite link');
     }
-  }, [spaceId, generateInviteMutation]);
+  }, [spaceId, inviteType, generateInviteMutation, generatePublicInviteMutation]);
 
   const handleCopyInvite = useCallback(async () => {
     if (generatedInviteLink) {
@@ -423,18 +725,14 @@ export default function SpaceSettingsModal({
     }
   }, [generatedInviteLink]);
 
-  const handleShareInvite = useCallback(async () => {
+  // Share now opens the in-app contact picker first (ShareInviteSheet);
+  // the OS share sheet is one tap deeper via the sheet's "More options".
+  const [shareSheetVisible, setShareSheetVisible] = useState(false);
+  const handleShareInvite = useCallback(() => {
     if (generatedInviteLink && space) {
-      try {
-        await shareInviteMutation.mutateAsync({
-          inviteLink: generatedInviteLink,
-          spaceName: space.spaceName,
-        });
-      } catch (error) {
-        console.error('[SpaceSettings] Share failed:', error);
-      }
+      setShareSheetVisible(true);
     }
-  }, [generatedInviteLink, space, shareInviteMutation]);
+  }, [generatedInviteLink, space]);
 
   // Emoji handlers
   const handleUploadEmoji = useCallback(async () => {
@@ -472,7 +770,6 @@ export default function SpaceSettingsModal({
       const updated = getSpace(spaceId);
       setSpace(updated);
     } catch (error) {
-      console.error('[SpaceSettings] Upload emoji failed:', error);
       Alert.alert('Error', 'Failed to upload emoji');
     } finally {
       setIsUploadingEmoji(false);
@@ -501,7 +798,6 @@ export default function SpaceSettingsModal({
               const updated = getSpace(spaceId);
               setSpace(updated);
             } catch (error) {
-              console.error('[SpaceSettings] Delete emoji failed:', error);
               Alert.alert('Error', 'Failed to delete emoji');
             }
           },
@@ -534,7 +830,6 @@ export default function SpaceSettingsModal({
       const updated = getSpace(spaceId);
       setSpace(updated);
     } catch (error) {
-      console.error('[SpaceSettings] Rename emoji failed:', error);
       Alert.alert('Error', 'Failed to rename emoji');
     } finally {
       setEditingEmojiId(null);
@@ -576,7 +871,6 @@ export default function SpaceSettingsModal({
       const updated = getSpace(spaceId);
       setSpace(updated);
     } catch (error) {
-      console.error('[SpaceSettings] Upload sticker failed:', error);
       Alert.alert('Error', 'Failed to upload sticker');
     } finally {
       setIsUploadingSticker(false);
@@ -605,7 +899,6 @@ export default function SpaceSettingsModal({
               const updated = getSpace(spaceId);
               setSpace(updated);
             } catch (error) {
-              console.error('[SpaceSettings] Delete sticker failed:', error);
               Alert.alert('Error', 'Failed to delete sticker');
             }
           },
@@ -638,7 +931,6 @@ export default function SpaceSettingsModal({
       const updated = getSpace(spaceId);
       setSpace(updated);
     } catch (error) {
-      console.error('[SpaceSettings] Rename sticker failed:', error);
       Alert.alert('Error', 'Failed to rename sticker');
     } finally {
       setEditingStickerName(null);
@@ -656,7 +948,6 @@ export default function SpaceSettingsModal({
         isPublic: true,
       });
     } catch (error) {
-      console.error('[SpaceSettings] Add role failed:', error);
       Alert.alert('Error', 'Failed to add role');
     }
   }, [spaceId, addRoleMutation]);
@@ -674,7 +965,6 @@ export default function SpaceSettingsModal({
             try {
               await deleteRoleMutation.mutateAsync({ spaceId, roleId });
             } catch (error) {
-              console.error('[SpaceSettings] Delete role failed:', error);
               Alert.alert('Error', 'Failed to delete role');
             }
           },
@@ -682,6 +972,179 @@ export default function SpaceSettingsModal({
       ]
     );
   }, [spaceId, deleteRoleMutation]);
+
+  // Channel/Group handlers
+  const handleAddGroup = useCallback(async () => {
+    try {
+      await addGroupMutation.mutateAsync({
+        spaceId,
+        groupName: 'New Group',
+      });
+      const updated = getSpace(spaceId);
+      setSpace(updated);
+    } catch (error) {
+      Alert.alert('Error', 'Failed to add group');
+    }
+  }, [spaceId, addGroupMutation]);
+
+  const handleSaveGroupName = useCallback(async (groupIndex: number) => {
+    if (!editingGroupName.trim()) {
+      setEditingGroupIndex(null);
+      return;
+    }
+    try {
+      await updateGroupMutation.mutateAsync({
+        spaceId,
+        groupIndex,
+        groupName: editingGroupName.trim(),
+      });
+      const updated = getSpace(spaceId);
+      setSpace(updated);
+    } catch (error) {
+      Alert.alert('Error', 'Failed to update group');
+    } finally {
+      setEditingGroupIndex(null);
+    }
+  }, [spaceId, editingGroupName, updateGroupMutation]);
+
+  const handleDeleteGroup = useCallback(async (groupIndex: number) => {
+    const group = space?.groups[groupIndex];
+    if (!group) return;
+
+    if (group.channels.length > 0) {
+      Alert.alert('Cannot Delete', 'Please delete or move all channels first');
+      return;
+    }
+
+    Alert.alert(
+      'Delete Group',
+      `Are you sure you want to delete "${group.groupName}"?`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              await deleteGroupMutation.mutateAsync({ spaceId, groupIndex });
+              const updated = getSpace(spaceId);
+              setSpace(updated);
+            } catch (error) {
+              Alert.alert('Error', 'Failed to delete group');
+            }
+          },
+        },
+      ]
+    );
+  }, [space, spaceId, deleteGroupMutation]);
+
+  const handleAddChannel = useCallback(async (groupIndex: number) => {
+    if (!newChannelName.trim()) {
+      setNewChannelGroupIndex(null);
+      return;
+    }
+    try {
+      await addChannelMutation.mutateAsync({
+        spaceId,
+        groupIndex,
+        channelName: newChannelName.trim(),
+      });
+      const updated = getSpace(spaceId);
+      setSpace(updated);
+      setNewChannelName('');
+      setNewChannelGroupIndex(null);
+    } catch (error) {
+      Alert.alert('Error', 'Failed to add channel');
+    }
+  }, [spaceId, newChannelName, addChannelMutation]);
+
+  const handleSaveChannelName = useCallback(async (channelId: string) => {
+    if (!editingChannelName.trim()) {
+      setEditingChannelId(null);
+      return;
+    }
+    try {
+      await updateChannelMutation.mutateAsync({
+        spaceId,
+        channelId,
+        channelName: editingChannelName.trim(),
+      });
+      const updated = getSpace(spaceId);
+      setSpace(updated);
+    } catch (error) {
+      Alert.alert('Error', 'Failed to update channel');
+    } finally {
+      setEditingChannelId(null);
+    }
+  }, [spaceId, editingChannelName, updateChannelMutation]);
+
+  const handleDeleteChannel = useCallback(async (channelId: string, channelName: string) => {
+    Alert.alert(
+      'Delete Channel',
+      `Are you sure you want to delete #${channelName}?`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              await deleteChannelMutation.mutateAsync({ spaceId, channelId });
+              const updated = getSpace(spaceId);
+              setSpace(updated);
+            } catch (error: unknown) {
+              if (error instanceof Error && error.message?.includes('default channel')) {
+                Alert.alert('Cannot Delete', 'You cannot delete the default channel');
+              } else {
+                Alert.alert('Error', 'Failed to delete channel');
+              }
+            }
+          },
+        },
+      ]
+    );
+  }, [spaceId, deleteChannelMutation]);
+
+  const handleMoveChannelUp = useCallback(async (groupIndex: number, channelIndex: number) => {
+    if (channelIndex === 0) return;
+    const group = space?.groups[groupIndex];
+    if (!group) return;
+
+    const channel = group.channels[channelIndex];
+    try {
+      await moveChannelMutation.mutateAsync({
+        spaceId,
+        channelId: channel.channelId,
+        fromGroupIndex: groupIndex,
+        toGroupIndex: groupIndex,
+        toPosition: channelIndex - 1,
+      });
+      const updated = getSpace(spaceId);
+      setSpace(updated);
+    } catch {
+      // Mutation handles its own error state
+    }
+  }, [space, spaceId, moveChannelMutation]);
+
+  const handleMoveChannelDown = useCallback(async (groupIndex: number, channelIndex: number) => {
+    const group = space?.groups[groupIndex];
+    if (!group || channelIndex >= group.channels.length - 1) return;
+
+    const channel = group.channels[channelIndex];
+    try {
+      await moveChannelMutation.mutateAsync({
+        spaceId,
+        channelId: channel.channelId,
+        fromGroupIndex: groupIndex,
+        toGroupIndex: groupIndex,
+        toPosition: channelIndex + 1,
+      });
+      const updated = getSpace(spaceId);
+      setSpace(updated);
+    } catch {
+      // Mutation handles its own error state
+    }
+  }, [space, spaceId, moveChannelMutation]);
 
   const handleDeleteSpace = useCallback(async () => {
     if (deleteConfirmStep === 0) {
@@ -695,7 +1158,6 @@ export default function SpaceSettingsModal({
       handleClose();
       onSpaceDeleted?.();
     } catch (error) {
-      console.error('[SpaceSettings] Delete failed:', error);
       Alert.alert('Error', 'Failed to delete space');
     }
   }, [spaceId, deleteConfirmStep, deleteSpaceMutation, handleClose, onSpaceDeleted]);
@@ -712,7 +1174,6 @@ export default function SpaceSettingsModal({
       handleClose();
       onSpaceLeft?.();
     } catch (error) {
-      console.error('[SpaceSettings] Leave failed:', error);
       Alert.alert('Error', 'Failed to leave space');
     }
   }, [spaceId, leaveConfirmStep, leaveSpaceMutation, handleClose, onSpaceLeft]);
@@ -722,10 +1183,12 @@ export default function SpaceSettingsModal({
     { key: 'general', label: 'General', icon: 'gearshape' },
     { key: 'account', label: 'Account', icon: 'person' },
     { key: 'members', label: 'Members', icon: 'person.2' },
+    { key: 'channels', label: 'Channels', icon: 'number' },
+    { key: 'linked', label: 'Linked', icon: 'link' },
     { key: 'roles', label: 'Roles', icon: 'shield' },
     { key: 'emojis', label: 'Emojis', icon: 'face.smiling' },
     { key: 'stickers', label: 'Stickers', icon: 'star' },
-    { key: 'invites', label: 'Invites', icon: 'link' },
+    { key: 'invites', label: 'Invites', icon: 'square.and.arrow.up' },
     { key: 'danger', label: 'Danger', icon: 'exclamationmark.triangle' },
   ];
 
@@ -871,15 +1334,158 @@ export default function SpaceSettingsModal({
     >
       <Text style={styles.sectionTitle}>Your Profile in This Space</Text>
       <Text style={styles.sectionDescription}>
-        Profile settings for this space will be available in a future update.
+        Override your display name, avatar, and bio for this space only.
+        Other spaces and your global profile are unaffected.
       </Text>
+
+      <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 12 }}>
+        <TouchableOpacity
+          onPress={handlePickSpaceProfileImage}
+          activeOpacity={0.8}
+          style={{
+            width: 72,
+            height: 72,
+            borderRadius: 36,
+            backgroundColor: theme.colors.surface3,
+            justifyContent: 'center',
+            alignItems: 'center',
+            overflow: 'hidden',
+          }}
+        >
+          {spaceProfileImage ? (
+            <Image source={{ uri: spaceProfileImage }} style={{ width: 72, height: 72 }} />
+          ) : (
+            <IconSymbol name="person.crop.circle" color={theme.colors.textMuted} size={36} />
+          )}
+        </TouchableOpacity>
+        <View style={{ flex: 1, marginLeft: 16 }}>
+          <Text style={[styles.sectionDescription, { marginBottom: 4 }]}>Avatar</Text>
+          <TouchableOpacity onPress={handlePickSpaceProfileImage}>
+            <Text style={{ color: theme.colors.primary, fontSize: 14 }}>
+              {spaceProfileImage ? 'Change image' : 'Choose image'}
+            </Text>
+          </TouchableOpacity>
+          {spaceProfileImage ? (
+            <TouchableOpacity onPress={() => setSpaceProfileImage('')} style={{ marginTop: 4 }}>
+              <Text style={{ color: theme.colors.danger, fontSize: 13 }}>Remove</Text>
+            </TouchableOpacity>
+          ) : null}
+        </View>
+      </View>
+
+      <Text style={[styles.sectionDescription, { marginTop: 16, marginBottom: 4 }]}>Display name</Text>
+      <TextInput
+        value={spaceProfileDisplayName}
+        onChangeText={setSpaceProfileDisplayName}
+        placeholder={user?.displayName || user?.username || 'Your name in this space'}
+        placeholderTextColor={theme.colors.textMuted}
+        maxLength={64}
+        style={{
+          backgroundColor: theme.colors.surface2,
+          color: theme.colors.textMain,
+          borderRadius: 10,
+          padding: 12,
+          fontSize: 15,
+        }}
+      />
+
+      <Text style={[styles.sectionDescription, { marginTop: 16, marginBottom: 4 }]}>Bio</Text>
+      <TextInput
+        value={spaceProfileBio}
+        onChangeText={setSpaceProfileBio}
+        placeholder="Tell this space about yourself"
+        placeholderTextColor={theme.colors.textMuted}
+        multiline
+        numberOfLines={3}
+        maxLength={280}
+        style={{
+          backgroundColor: theme.colors.surface2,
+          color: theme.colors.textMain,
+          borderRadius: 10,
+          padding: 12,
+          fontSize: 15,
+          minHeight: 72,
+          textAlignVertical: 'top',
+        }}
+      />
+
+      <TouchableOpacity
+        onPress={handleSaveSpaceProfile}
+        disabled={!spaceProfileDirty || spaceProfileSaving}
+        style={{
+          marginTop: 12,
+          alignSelf: 'flex-start',
+          paddingVertical: 10,
+          paddingHorizontal: 20,
+          borderRadius: 10,
+          backgroundColor: spaceProfileDirty && !spaceProfileSaving ? theme.colors.primary : theme.colors.surface3,
+          opacity: spaceProfileDirty && !spaceProfileSaving ? 1 : 0.6,
+        }}
+      >
+        {spaceProfileSaving ? (
+          <ActivityIndicator size="small" color="#fff" />
+        ) : (
+          <Text style={{ color: '#fff', fontWeight: '600', fontSize: 14 }}>Save profile</Text>
+        )}
+      </TouchableOpacity>
 
       <View style={styles.divider} />
 
       <Text style={styles.sectionTitle}>Notifications</Text>
-      <Text style={styles.sectionDescription}>
-        Notification settings will be available in a future update.
-      </Text>
+      <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 4 }}>
+        <View style={{ flex: 1, paddingRight: 12 }}>
+          <Text style={styles.sectionDescription}>
+            Notify me when messages are posted in this space.
+          </Text>
+        </View>
+        <Switch
+          value={spaceNotificationsOn}
+          onValueChange={handleToggleSpaceNotifications}
+          trackColor={{ false: theme.colors.surface4, true: theme.colors.accent }}
+          thumbColor={'#ffffff'}
+        />
+      </View>
+
+      {/* Per-channel mute. Listed under the space toggle so users can
+          turn the space on but silence specific noisy channels (or
+          turn the space off but keep one channel unmuted — gating
+          treats space-off as overriding, so the per-channel toggle
+          really only matters when the space is on, but we keep them
+          interactive either way to make the data model obvious). */}
+      {(space?.groups ?? []).some(g => (g.channels ?? []).length > 0) && (
+        <View style={{ marginTop: 8 }}>
+          <Text style={[styles.sectionDescription, { marginBottom: 8, opacity: spaceNotificationsOn ? 1 : 0.5 }]}>
+            Channels
+          </Text>
+          {(space?.groups ?? []).map(group => (
+            (group.channels ?? []).map(channel => {
+              const channelOn = channelNotifMap[channel.channelId] ?? true;
+              return (
+                <View
+                  key={channel.channelId}
+                  style={{
+                    flexDirection: 'row',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    paddingVertical: 6,
+                    opacity: spaceNotificationsOn ? 1 : 0.5,
+                  }}
+                >
+                  <Text style={{ flex: 1, color: theme.colors.textMain, fontSize: 14, paddingRight: 12 }}>
+                    # {channel.channelName}
+                  </Text>
+                  <Switch
+                    value={channelOn}
+                    onValueChange={(next) => handleToggleChannelNotifications(channel.channelId, next)}
+                    trackColor={{ false: theme.colors.surface4, true: theme.colors.accent }}
+                    thumbColor={'#ffffff'}
+                  />
+                </View>
+              );
+            })
+          ))}
+        </View>
+      )}
 
       {/* Leave space button (for non-owners) */}
       {!isSpaceOwner && (
@@ -914,24 +1520,14 @@ export default function SpaceSettingsModal({
     return roles.filter(role => role.members.includes(memberAddress));
   };
 
-  // Helper to truncate address
-  const truncateAddress = (address: string | undefined): string => {
-    if (!address) return 'Unknown';
-    if (address.length <= 16) return address;
-    return `${address.slice(0, 8)}...${address.slice(-6)}`;
-  };
 
   const renderMembersTab = () => (
-    <View
-      style={styles.tabContentWrapper}
-      onLayout={(e) => setContentHeight(e.nativeEvent.layout.height)}
+    <ScrollView
+      style={styles.membersScrollView}
+      showsVerticalScrollIndicator={true}
+      keyboardShouldPersistTaps="handled"
+      contentContainerStyle={styles.tabContentContainer}
     >
-      <ScrollView
-        style={contentHeight > 0 ? { height: contentHeight } : undefined}
-        showsVerticalScrollIndicator={false}
-        keyboardShouldPersistTaps="handled"
-        contentContainerStyle={styles.tabContentContainer}
-      >
         <Text style={styles.sectionDescription}>
           {members.length} member{members.length !== 1 ? 's' : ''} in this space
         </Text>
@@ -971,17 +1567,33 @@ export default function SpaceSettingsModal({
                 <View style={styles.kickedBadge}>
                   <Text style={styles.kickedBadgeText}>Kicked</Text>
                 </View>
-              ) : isSpaceOwner && member.address !== user?.address ? (
-                <TouchableOpacity
-                  style={styles.kickButton}
-                  onPress={() => setKickTarget({
-                    address: member.address,
-                    displayName: member.display_name || member.name || truncateAddress(member.address),
-                    userIcon: member.profile_image,
-                  })}
-                >
-                  <Text style={styles.kickButtonText}>Kick</Text>
-                </TouchableOpacity>
+              ) : member.address !== user?.address ? (
+                <View style={styles.memberActions}>
+                  {onToggleMuteUser && (
+                    <TouchableOpacity
+                      style={[styles.muteButton, isUserMuted?.(member.address) && styles.muteButtonActive]}
+                      onPress={() => onToggleMuteUser(member.address)}
+                    >
+                      <IconSymbol
+                        name={isUserMuted?.(member.address) ? 'bell.fill' : 'bell.slash.fill'}
+                        size={12}
+                        color={isUserMuted?.(member.address) ? theme.colors.primary : theme.colors.textMuted}
+                      />
+                    </TouchableOpacity>
+                  )}
+                  {isSpaceOwner && (
+                    <TouchableOpacity
+                      style={styles.kickButton}
+                      onPress={() => setKickTarget({
+                        address: member.address,
+                        displayName: member.display_name || member.name || truncateAddress(member.address),
+                        userIcon: member.profile_image,
+                      })}
+                    >
+                      <Text style={styles.kickButtonText}>Kick</Text>
+                    </TouchableOpacity>
+                  )}
+                </View>
               ) : null}
             </View>
           );
@@ -996,15 +1608,224 @@ export default function SpaceSettingsModal({
             </Text>
           </View>
         )}
-      </ScrollView>
-    </View>
+    </ScrollView>
+  );
+
+  const renderChannelsTab = () => (
+    <ScrollView
+      style={styles.membersScrollView}
+      contentContainerStyle={styles.tabContentContainer}
+      showsVerticalScrollIndicator={true}
+      keyboardShouldPersistTaps="handled"
+    >
+      <Text style={styles.sectionDescription}>
+        Manage channel groups and channels. Use the arrows to reorder channels.
+      </Text>
+
+      <TouchableOpacity
+        style={styles.addButton}
+        onPress={handleAddGroup}
+        disabled={addGroupMutation.isPending}
+      >
+        {addGroupMutation.isPending ? (
+          <ActivityIndicator size="small" color={theme.colors.primary} />
+        ) : (
+          <>
+            <IconSymbol name="plus" size={16} color={theme.colors.primary} />
+            <Text style={styles.addButtonText}>Add Group</Text>
+          </>
+        )}
+      </TouchableOpacity>
+
+      {(space?.groups ?? []).map((group, groupIndex) => (
+        <View key={`group-${groupIndex}`} style={styles.channelGroupContainer}>
+          {/* Group Header */}
+          <View style={styles.channelGroupHeader}>
+            {editingGroupIndex === groupIndex ? (
+              <View style={styles.editingInputRow}>
+                <TextInput
+                  style={styles.channelGroupNameInput}
+                  value={editingGroupName}
+                  onChangeText={setEditingGroupName}
+                  autoFocus
+                  onSubmitEditing={() => handleSaveGroupName(groupIndex)}
+                />
+                <TouchableOpacity
+                  style={styles.confirmButton}
+                  onPress={() => handleSaveGroupName(groupIndex)}
+                >
+                  <IconSymbol name="checkmark" size={16} color={theme.colors.primary} />
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.cancelButton}
+                  onPress={() => setEditingGroupIndex(null)}
+                >
+                  <IconSymbol name="xmark" size={16} color={theme.colors.textMuted} />
+                </TouchableOpacity>
+              </View>
+            ) : (
+              <TouchableOpacity
+                style={styles.channelGroupNameContainer}
+                onPress={() => {
+                  setEditingGroupIndex(groupIndex);
+                  setEditingGroupName(group.groupName);
+                }}
+              >
+                <Text style={styles.channelGroupName}>{group.groupName}</Text>
+                <IconSymbol name="pencil" size={12} color={theme.colors.textMuted} />
+              </TouchableOpacity>
+            )}
+            <View style={styles.channelGroupActions}>
+              <TouchableOpacity
+                style={styles.channelGroupActionButton}
+                onPress={() => {
+                  setNewChannelGroupIndex(groupIndex);
+                  setNewChannelName('');
+                }}
+              >
+                <IconSymbol name="plus" size={16} color={theme.colors.primary} />
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.channelGroupActionButton}
+                onPress={() => handleDeleteGroup(groupIndex)}
+              >
+                <IconSymbol name="trash" size={16} color={theme.colors.danger} />
+              </TouchableOpacity>
+            </View>
+          </View>
+
+          {/* New Channel Input */}
+          {newChannelGroupIndex === groupIndex && (
+            <View style={styles.newChannelRow}>
+              <Text style={styles.channelHashSymbol}>#</Text>
+              <TextInput
+                style={styles.newChannelInput}
+                value={newChannelName}
+                onChangeText={setNewChannelName}
+                placeholder="channel-name"
+                placeholderTextColor={theme.colors.textMuted}
+                autoFocus
+                autoCapitalize="none"
+                onSubmitEditing={() => handleAddChannel(groupIndex)}
+              />
+              <TouchableOpacity
+                style={styles.confirmButton}
+                onPress={() => handleAddChannel(groupIndex)}
+              >
+                <IconSymbol name="checkmark" size={16} color={theme.colors.primary} />
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.cancelButton}
+                onPress={() => setNewChannelGroupIndex(null)}
+              >
+                <IconSymbol name="xmark" size={16} color={theme.colors.textMuted} />
+              </TouchableOpacity>
+            </View>
+          )}
+
+          {/* Channels List */}
+          {group.channels.map((channel, channelIndex) => (
+            <View key={channel.channelId} style={styles.channelItem}>
+              <TouchableOpacity
+                style={[styles.channelIconButton, channel.icon && { backgroundColor: (channel.iconColor || theme.colors.textMuted) + '20' }]}
+                onPress={() => {
+                  setIconPickerChannelId(channel.channelId);
+                  setIconPickerVisible(true);
+                }}
+              >
+                <IconSymbol
+                  name={(channel.icon || 'number') as IconSymbolName}
+                  size={14}
+                  color={channel.iconColor || theme.colors.textMuted}
+                />
+              </TouchableOpacity>
+              {editingChannelId === channel.channelId ? (
+                <View style={styles.editingInputRow}>
+                  <TextInput
+                    style={styles.channelNameInput}
+                    value={editingChannelName}
+                    onChangeText={setEditingChannelName}
+                    autoFocus
+                    autoCapitalize="none"
+                    onSubmitEditing={() => handleSaveChannelName(channel.channelId)}
+                  />
+                  <TouchableOpacity
+                    style={styles.confirmButton}
+                    onPress={() => handleSaveChannelName(channel.channelId)}
+                  >
+                    <IconSymbol name="checkmark" size={16} color={theme.colors.primary} />
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.cancelButton}
+                    onPress={() => setEditingChannelId(null)}
+                  >
+                    <IconSymbol name="xmark" size={16} color={theme.colors.textMuted} />
+                  </TouchableOpacity>
+                </View>
+              ) : (
+                <TouchableOpacity
+                  style={styles.channelNameContainer}
+                  onPress={() => {
+                    setEditingChannelId(channel.channelId);
+                    setEditingChannelName(channel.channelName);
+                  }}
+                >
+                  <Text style={styles.channelName}>{channel.channelName}</Text>
+                </TouchableOpacity>
+              )}
+              {channel.channelId === space?.defaultChannelId && (
+                <View style={styles.defaultChannelBadge}>
+                  <Text style={styles.defaultChannelText}>default</Text>
+                </View>
+              )}
+              <View style={styles.channelActions}>
+                <TouchableOpacity
+                  style={[styles.channelArrowButton, channelIndex === 0 && styles.channelArrowDisabled]}
+                  onPress={() => handleMoveChannelUp(groupIndex, channelIndex)}
+                  disabled={channelIndex === 0}
+                >
+                  <IconSymbol name="chevron.up" size={14} color={channelIndex === 0 ? theme.colors.surface5 : theme.colors.textMuted} />
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.channelArrowButton, channelIndex === group.channels.length - 1 && styles.channelArrowDisabled]}
+                  onPress={() => handleMoveChannelDown(groupIndex, channelIndex)}
+                  disabled={channelIndex === group.channels.length - 1}
+                >
+                  <IconSymbol name="chevron.down" size={14} color={channelIndex === group.channels.length - 1 ? theme.colors.surface5 : theme.colors.textMuted} />
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.channelDeleteButton}
+                  onPress={() => handleDeleteChannel(channel.channelId, channel.channelName)}
+                >
+                  <IconSymbol name="trash" size={14} color={theme.colors.danger} />
+                </TouchableOpacity>
+              </View>
+            </View>
+          ))}
+
+          {group.channels.length === 0 && (
+            <Text style={styles.emptyGroupText}>No channels in this group</Text>
+          )}
+        </View>
+      ))}
+
+      {(space?.groups ?? []).length === 0 && (
+        <View style={styles.emptyState}>
+          <IconSymbol name="number" size={48} color={theme.colors.textMuted} />
+          <Text style={styles.emptyStateText}>No channel groups</Text>
+          <Text style={styles.emptyStateDescription}>
+            Add a group to organize your channels
+          </Text>
+        </View>
+      )}
+    </ScrollView>
   );
 
   const renderRolesTab = () => (
     <ScrollView
-      style={styles.tabContent}
+      style={styles.membersScrollView}
       contentContainerStyle={styles.tabContentContainer}
-      showsVerticalScrollIndicator={false}
+      showsVerticalScrollIndicator={true}
       keyboardShouldPersistTaps="handled"
     >
       <Text style={styles.sectionDescription}>
@@ -1187,32 +2008,91 @@ export default function SpaceSettingsModal({
     </ScrollView>
   );
 
+  const isGeneratingInvite = generateInviteMutation.isPending || generatePublicInviteMutation.isPending;
+
   const renderInvitesTab = () => (
     <ScrollView style={styles.tabContent} contentContainerStyle={styles.tabContentContainer} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
       <Text style={styles.sectionTitle}>Generate Invite Link</Text>
+
+      {/* Invite Type Toggle */}
+      <View style={styles.inviteTypeToggle}>
+        <TouchableOpacity
+          style={[
+            styles.inviteTypeButton,
+            inviteType === 'private' && styles.inviteTypeButtonActive,
+          ]}
+          onPress={() => {
+            setInviteType('private');
+            setGeneratedInviteLink(null);
+          }}
+        >
+          <IconSymbol
+            name="person.fill"
+            size={16}
+            color={inviteType === 'private' ? '#fff' : theme.colors.textMuted}
+          />
+          <Text
+            style={[
+              styles.inviteTypeButtonText,
+              inviteType === 'private' && styles.inviteTypeButtonTextActive,
+            ]}
+          >
+            One-Time
+          </Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[
+            styles.inviteTypeButton,
+            inviteType === 'public' && styles.inviteTypeButtonActive,
+          ]}
+          onPress={() => {
+            setInviteType('public');
+            setGeneratedInviteLink(null);
+          }}
+        >
+          <IconSymbol
+            name="globe"
+            size={16}
+            color={inviteType === 'public' ? '#fff' : theme.colors.textMuted}
+          />
+          <Text
+            style={[
+              styles.inviteTypeButtonText,
+              inviteType === 'public' && styles.inviteTypeButtonTextActive,
+            ]}
+          >
+            Public Link
+          </Text>
+        </TouchableOpacity>
+      </View>
+
       <Text style={styles.sectionDescription}>
-        Create a link to invite others to this Space. The link can be used once per person.
+        {inviteType === 'private'
+          ? 'Generate a one-time use invite link. Each link can only be used by one person.'
+          : 'Generate a reusable public invite link. Anyone with this link can join.'}
       </Text>
 
       {!generatedInviteLink ? (
         <TouchableOpacity
           style={styles.generateButton}
           onPress={handleGenerateInvite}
-          disabled={generateInviteMutation.isPending}
+          disabled={isGeneratingInvite}
         >
-          {generateInviteMutation.isPending ? (
+          {isGeneratingInvite ? (
             <ActivityIndicator size="small" color="#fff" />
           ) : (
             <>
               <IconSymbol name="link" size={18} color="#fff" />
-              <Text style={styles.generateButtonText}>Generate Invite Link</Text>
+              <Text style={styles.generateButtonText}>
+                Generate {inviteType === 'public' ? 'Public' : 'Invite'} Link
+              </Text>
             </>
           )}
         </TouchableOpacity>
       ) : (
         <View style={styles.inviteLinkContainer}>
           <View style={styles.inviteLinkBox}>
-            <Text style={styles.inviteLinkText} numberOfLines={1}>
+            <Text style={styles.inviteLinkText} numberOfLines={2}>
               {generatedInviteLink}
             </Text>
           </View>
@@ -1227,20 +2107,149 @@ export default function SpaceSettingsModal({
             </TouchableOpacity>
             <TouchableOpacity
               style={styles.inviteLinkButton}
-              onPress={() => setGeneratedInviteLink(null)}
+              onPress={() => {
+                setGeneratedInviteLink(null);
+                setGeneratedInviteType(null);
+              }}
             >
               <IconSymbol name="arrow.clockwise" size={18} color={theme.colors.primary} />
               <Text style={styles.inviteLinkButtonText}>New</Text>
             </TouchableOpacity>
           </View>
+          <Text style={styles.inviteHint}>
+            {generatedInviteType === 'public'
+              ? 'This public link can be shared freely. Regenerate to invalidate the old link.'
+              : 'This link can only be used once. Generate a new link for each person.'}
+          </Text>
         </View>
       )}
     </ScrollView>
   );
 
+  const handlePublishToDirectory = async () => {
+    if (!space || !spaceId || directorySubmitting) return;
+
+    setDirectorySubmitting(true);
+    try {
+      // Use the space owner key (not the user's identity key)
+      const ownerKey = getSpaceKey(spaceId, 'owner');
+      if (!ownerKey) throw new Error('Space owner key not found. You may not be the owner of this space.');
+      const publicKeyHex = ownerKey.publicKey;
+      const privateKeyHex = ownerKey.privateKey;
+
+      // Read invite URL from local storage (set by inviteService when generating a public link)
+      const localSpace = getSpace(spaceId);
+      const inviteUrl = localSpace?.inviteUrl || space.inviteUrl || generatedInviteLink || '';
+      if (!inviteUrl) throw new Error('Space must have a public invite link. Create one in the Invites tab first.');
+
+      const spaceName = space.spaceName;
+      const description = space.description || space.spaceName;
+      const timestamp = Date.now();
+
+      // Server verifies: sign(spaceAddress + name + description + inviteLink + BE_uint64(timestamp))
+      const encoder = new TextEncoder();
+      const tsBytes = new Uint8Array(8);
+      const view = new DataView(tsBytes.buffer);
+      view.setBigUint64(0, BigInt(timestamp));
+
+      const payloadParts = [
+        encoder.encode(spaceId),
+        encoder.encode(spaceName),
+        encoder.encode(description),
+        encoder.encode(inviteUrl),
+        tsBytes,
+      ];
+      const payloadLen = payloadParts.reduce((s, p) => s + p.length, 0);
+      const payload = new Uint8Array(payloadLen);
+      let offset = 0;
+      for (const part of payloadParts) {
+        payload.set(part, offset);
+        offset += part.length;
+      }
+
+      const { NativeCryptoProvider } = await import('@/services/crypto/native-provider');
+      const crypto = new NativeCryptoProvider();
+      const privateKeyBytes = hexToBytes(privateKeyHex);
+      const privateKeyBase64 = btoa(String.fromCharCode(...privateKeyBytes));
+      const payloadBase64 = btoa(String.fromCharCode(...payload));
+      const sigBase64 = await crypto.signEd448(privateKeyBase64, payloadBase64);
+      const sigBinary = atob(sigBase64);
+      let sigHex = '';
+      for (let i = 0; i < sigBinary.length; i++) {
+        sigHex += sigBinary.charCodeAt(i).toString(16).padStart(2, '0');
+      }
+
+      const { getApiConfig } = await import('@/services/api/config');
+      const config = getApiConfig();
+
+      logger.debug('[DirectorySubmit] payload check:', {
+        space_address_len: spaceId.length,
+        name_len: spaceName.length,
+        desc_len: description.length,
+        invite_len: inviteUrl.length,
+        icon_len: (space.iconUrl || '').length,
+        pubkey_len: publicKeyHex.length,
+        sig_len: sigHex.length,
+        timestamp,
+      });
+
+      const response = await fetch(`${config.baseUrl}/directory/submit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          space_address: spaceId,
+          name: spaceName,
+          description,
+          icon: space.iconUrl || '',
+          invite_link: inviteUrl,
+          owner_public_key: publicKeyHex,
+          owner_signature: sigHex,
+          timestamp,
+          category: 'community',
+        }),
+      });
+
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.error || `Failed: ${response.status}`);
+      }
+
+      setDirectorySubmitted(true);
+      Alert.alert('Submitted', 'Your space has been submitted for review. It will appear in Explore once approved.');
+    } catch (error) {
+      Alert.alert('Error', error instanceof Error ? error.message : 'Failed to submit');
+    } finally {
+      setDirectorySubmitting(false);
+    }
+  };
+
   const renderDangerTab = () => (
     <ScrollView style={styles.tabContent} contentContainerStyle={styles.tabContentContainer} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
-      <View style={styles.dangerSection}>
+      <View style={styles.inputSection}>
+        <Text style={styles.label}>Submit to Explorer</Text>
+        <Text style={styles.toggleDescription}>
+          Submit this space to the public directory so anyone can find it in the Explore tab. Requires admin approval.
+        </Text>
+        <TouchableOpacity
+          style={[
+            styles.saveButton,
+            { marginTop: 12 },
+            (directorySubmitting || directorySubmitted) && styles.saveButtonDisabled,
+          ]}
+          onPress={handlePublishToDirectory}
+          disabled={directorySubmitting || directorySubmitted}
+        >
+          {directorySubmitting ? (
+            <ActivityIndicator size="small" color="#fff" />
+          ) : (
+            <Text style={styles.saveButtonText}>
+              {directorySubmitted ? 'Submitted for Review' : 'Submit to Explorer'}
+            </Text>
+          )}
+        </TouchableOpacity>
+      </View>
+
+      <View style={[styles.dangerSection, { marginTop: 24 }]}>
         <Text style={[styles.dangerTitle, { color: theme.colors.danger }]}>
           Delete this Space
         </Text>
@@ -1265,6 +2274,22 @@ export default function SpaceSettingsModal({
     </ScrollView>
   );
 
+  const renderLinkedTab = () => (
+    <ScrollView
+      style={styles.tabContent}
+      contentContainerStyle={styles.generalTabContainer}
+      showsVerticalScrollIndicator={false}
+      keyboardShouldPersistTaps="handled"
+    >
+      <Text style={styles.sectionTitle}>Linked Farcaster channels</Text>
+      <Text style={[styles.sectionDescription, { marginBottom: 12 }]}>
+        Casts from linked channels appear inline at the top of this space's chat
+        screens. Bindings are local to your device.
+      </Text>
+      <SpaceChannelBindingPicker spaceId={spaceId} hideDescription />
+    </ScrollView>
+  );
+
   const renderTabContent = () => {
     switch (activeTab) {
       case 'general':
@@ -1273,6 +2298,10 @@ export default function SpaceSettingsModal({
         return renderAccountTab();
       case 'members':
         return renderMembersTab();
+      case 'channels':
+        return renderChannelsTab();
+      case 'linked':
+        return renderLinkedTab();
       case 'roles':
         return renderRolesTab();
       case 'emojis':
@@ -1293,7 +2322,7 @@ export default function SpaceSettingsModal({
   }
 
   return (
-    <BaseModal visible={visible} onClose={handleClose} height={0.80} avoidKeyboard>
+    <BaseModal visible={visible} onClose={handleClose} height={0.80} avoidKeyboard fillHeight>
       <View style={styles.container}>
         {/* Header */}
         <View style={styles.header}>
@@ -1315,7 +2344,7 @@ export default function SpaceSettingsModal({
               onPress={() => setActiveTab(tab.key)}
             >
               <IconSymbol
-                name={tab.icon as any}
+                name={tab.icon as IconSymbolName}
                 size={18}
                 color={
                   activeTab === tab.key
@@ -1353,11 +2382,51 @@ export default function SpaceSettingsModal({
           userAddress={kickTarget.address}
         />
       )}
+
+      {/* Icon Picker Modal */}
+      <IconPicker
+        visible={iconPickerVisible}
+        onClose={() => {
+          setIconPickerVisible(false);
+          setIconPickerChannelId(null);
+        }}
+        selectedIcon={iconPickerChannelId ? (space?.groups ?? []).flatMap(g => g.channels).find(c => c.channelId === iconPickerChannelId)?.icon : undefined}
+        selectedColor={iconPickerChannelId ? (space?.groups ?? []).flatMap(g => g.channels).find(c => c.channelId === iconPickerChannelId)?.iconColor : undefined}
+        onSelect={(icon, color) => {
+          if (iconPickerChannelId) {
+            updateChannelMutation.mutate({
+              spaceId,
+              channelId: iconPickerChannelId,
+              icon,
+              iconColor: color,
+            });
+          }
+        }}
+        onClear={() => {
+          if (iconPickerChannelId) {
+            updateChannelMutation.mutate({
+              spaceId,
+              channelId: iconPickerChannelId,
+              icon: '',
+              iconColor: '',
+            });
+          }
+        }}
+        theme={theme}
+      />
+      {generatedInviteLink && space && (
+        <ShareInviteSheet
+          visible={shareSheetVisible}
+          onClose={() => setShareSheetVisible(false)}
+          inviteLink={generatedInviteLink}
+          spaceName={space.spaceName}
+        />
+      )}
     </BaseModal>
   );
 }
 
-const createStyles = (theme: any, insets: any) =>
+const createStyles = (theme: AppTheme, insets: EdgeInsets) =>
   StyleSheet.create({
     container: {
       flex: 1,
@@ -1413,6 +2482,9 @@ const createStyles = (theme: any, insets: any) =>
     },
     tabContent: {
       flex: 1,
+    },
+    membersScrollView: {
+      maxHeight: SCREEN_HEIGHT * 0.6,
     },
     tabContentContainer: {
       paddingBottom: 16,
@@ -1852,6 +2924,43 @@ const createStyles = (theme: any, insets: any) =>
       fontWeight: theme.fonts.medium.fontWeight,
       color: theme.colors.primary,
     },
+    inviteTypeToggle: {
+      flexDirection: 'row',
+      backgroundColor: theme.colors.surface3,
+      borderRadius: 12,
+      padding: 4,
+      marginBottom: 16,
+      gap: 4,
+    },
+    inviteTypeButton: {
+      flex: 1,
+      flexDirection: 'row',
+      paddingVertical: 10,
+      paddingHorizontal: 12,
+      alignItems: 'center',
+      justifyContent: 'center',
+      borderRadius: 10,
+      gap: 6,
+    },
+    inviteTypeButtonActive: {
+      backgroundColor: theme.colors.primary,
+    },
+    inviteTypeButtonText: {
+      fontSize: 14,
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
+      color: theme.colors.textMuted,
+    },
+    inviteTypeButtonTextActive: {
+      color: '#fff',
+    },
+    inviteHint: {
+      fontSize: 13,
+      fontFamily: theme.fonts.regular.fontFamily,
+      color: theme.colors.textMuted,
+      marginTop: 12,
+      textAlign: 'center',
+    },
     dangerSection: {
       backgroundColor: theme.colors.danger + '15',
       borderRadius: 12,
@@ -1976,6 +3085,22 @@ const createStyles = (theme: any, insets: any) =>
       fontWeight: theme.fonts.medium.fontWeight,
       color: theme.colors.danger,
     },
+    memberActions: {
+      flexDirection: 'row' as const,
+      alignItems: 'center' as const,
+      gap: 8,
+    },
+    muteButton: {
+      width: 28,
+      height: 28,
+      borderRadius: 14,
+      backgroundColor: theme.colors.surface4,
+      alignItems: 'center' as const,
+      justifyContent: 'center' as const,
+    },
+    muteButtonActive: {
+      backgroundColor: theme.colors.primary + '20',
+    },
     kickButton: {
       backgroundColor: theme.colors.danger + '20',
       paddingHorizontal: 12,
@@ -1987,5 +3112,165 @@ const createStyles = (theme: any, insets: any) =>
       fontFamily: theme.fonts.medium.fontFamily,
       fontWeight: theme.fonts.medium.fontWeight,
       color: theme.colors.danger,
+    },
+    // Channel management styles
+    channelGroupContainer: {
+      backgroundColor: theme.colors.surface3,
+      borderRadius: 12,
+      marginBottom: 12,
+      overflow: 'hidden',
+    },
+    channelGroupHeader: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      paddingHorizontal: 12,
+      paddingVertical: 10,
+      borderBottomWidth: 1,
+      borderBottomColor: theme.colors.surface4,
+    },
+    channelGroupNameContainer: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 8,
+      flex: 1,
+    },
+    channelGroupName: {
+      fontSize: 14,
+      fontFamily: theme.fonts.bold.fontFamily,
+      fontWeight: theme.fonts.bold.fontWeight,
+      color: theme.colors.textMuted,
+      textTransform: 'uppercase',
+      letterSpacing: 0.5,
+    },
+    channelGroupNameInput: {
+      fontSize: 14,
+      fontFamily: theme.fonts.bold.fontFamily,
+      fontWeight: theme.fonts.bold.fontWeight,
+      color: theme.colors.textMain,
+      backgroundColor: theme.colors.surface4,
+      borderRadius: 6,
+      paddingHorizontal: 8,
+      paddingVertical: 4,
+      flex: 1,
+    },
+    channelGroupActions: {
+      flexDirection: 'row',
+      gap: 4,
+    },
+    channelGroupActionButton: {
+      padding: 6,
+    },
+    channelItem: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      paddingHorizontal: 12,
+      paddingVertical: 8,
+      borderBottomWidth: 1,
+      borderBottomColor: theme.colors.surface4,
+    },
+    channelHashSymbol: {
+      fontSize: 16,
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
+      color: theme.colors.textMuted,
+      marginRight: 4,
+    },
+    channelIconButton: {
+      width: 28,
+      height: 28,
+      borderRadius: 6,
+      backgroundColor: theme.colors.surface4,
+      alignItems: 'center' as const,
+      justifyContent: 'center' as const,
+      marginRight: 6,
+    },
+    channelNameContainer: {
+      flex: 1,
+    },
+    channelName: {
+      fontSize: 15,
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
+      color: theme.colors.textMain,
+    },
+    channelNameInput: {
+      fontSize: 15,
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
+      color: theme.colors.textMain,
+      backgroundColor: theme.colors.surface4,
+      borderRadius: 6,
+      paddingHorizontal: 8,
+      paddingVertical: 4,
+      flex: 1,
+    },
+    channelActions: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 2,
+    },
+    channelArrowButton: {
+      padding: 6,
+    },
+    channelArrowDisabled: {
+      opacity: 0.3,
+    },
+    channelDeleteButton: {
+      padding: 6,
+      marginLeft: 4,
+    },
+    defaultChannelBadge: {
+      backgroundColor: theme.colors.primary + '20',
+      paddingHorizontal: 6,
+      paddingVertical: 2,
+      borderRadius: 4,
+      marginRight: 8,
+    },
+    defaultChannelText: {
+      fontSize: 10,
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
+      color: theme.colors.primary,
+      textTransform: 'uppercase',
+    },
+    newChannelRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      paddingHorizontal: 12,
+      paddingVertical: 8,
+      backgroundColor: theme.colors.surface4,
+    },
+    newChannelInput: {
+      flex: 1,
+      fontSize: 15,
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
+      color: theme.colors.textMain,
+      paddingVertical: 4,
+    },
+    newChannelCancel: {
+      padding: 6,
+    },
+    emptyGroupText: {
+      fontSize: 13,
+      fontFamily: theme.fonts.regular.fontFamily,
+      color: theme.colors.textMuted,
+      textAlign: 'center',
+      paddingVertical: 16,
+    },
+    editingInputRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      flex: 1,
+      gap: 4,
+    },
+    confirmButton: {
+      padding: 6,
+      backgroundColor: theme.colors.primary + '20',
+      borderRadius: 6,
+    },
+    cancelButton: {
+      padding: 6,
     },
   });

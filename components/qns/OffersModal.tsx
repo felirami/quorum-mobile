@@ -1,0 +1,560 @@
+/**
+ * OffersModal - View and manage received and sent offers
+ */
+
+import { BaseModal } from '@/components/shared';
+import { IconSymbol } from '@/components/ui/IconSymbol';
+import { useAuth } from '@/context';
+import {
+  useOffersForOwner,
+  useOffersByBuyer,
+  useAcceptOffer,
+  useRejectOffer,
+  useCancelOffer,
+} from '@/hooks/useQNSMarketplace';
+import { useOfferPayment, type MarketplaceBuyStep } from '@/hooks/useQNSPayment';
+import { useWalletSelection } from '@/hooks/useWalletSelection';
+import {
+  generateNonce,
+  getFullStealthKeyMaterial,
+  signResaleListing,
+} from '@/services/onboarding/keyService';
+import { getMnemonic, getPrivateKey } from '@/services/onboarding/secureStorage';
+import type { Offer } from '@/services/api/qnsClient';
+import { useTheme, type AppTheme } from '@/theme';
+import type { EdgeInsets } from 'react-native-safe-area-context';
+import React from 'react';
+import {
+  ActivityIndicator,
+  Alert,
+  FlatList,
+  RefreshControl,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+} from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+
+interface OffersModalProps {
+  visible: boolean;
+  onClose: () => void;
+  ownerAddress?: string;
+  buyerAddress?: string;
+  onRefresh?: () => void;
+}
+
+type TabType = 'received' | 'sent';
+
+export default function OffersModal({
+  visible,
+  onClose,
+  ownerAddress,
+  buyerAddress,
+  onRefresh: parentRefresh,
+}: OffersModalProps) {
+  const { theme, isDark } = useTheme();
+  const { user } = useAuth();
+  const insets = useSafeAreaInsets();
+  const styles = createStyles(theme, isDark, insets);
+  const { activeWallet } = useWalletSelection();
+
+  const [activeTab, setActiveTab] = React.useState<TabType>('received');
+  const [processingOfferId, setProcessingOfferId] = React.useState<string | null>(null);
+
+  // Use owner address from wallet if not provided
+  const effectiveOwnerAddress = ownerAddress || activeWallet?.address;
+  const effectiveBuyerAddress = buyerAddress || activeWallet?.address;
+
+  const {
+    data: receivedOffers,
+    isLoading: isLoadingReceived,
+    refetch: refetchReceived,
+    isRefetching: isRefetchingReceived,
+  } = useOffersForOwner(effectiveOwnerAddress, { enabled: visible && activeTab === 'received' });
+
+  const {
+    data: sentOffers,
+    isLoading: isLoadingSent,
+    refetch: refetchSent,
+    isRefetching: isRefetchingSent,
+  } = useOffersByBuyer(effectiveBuyerAddress, { enabled: visible && activeTab === 'sent' });
+
+  const { mutate: acceptOffer } = useAcceptOffer();
+  const { mutate: rejectOffer } = useRejectOffer();
+  const { mutate: cancelOffer } = useCancelOffer();
+
+  React.useEffect(() => {
+    if (visible) setActiveTab('received');
+  }, [visible]);
+
+  const handleAcceptOffer = async (offer: Offer) => {
+    if (!user?.quilibriumAddress || !activeWallet) return;
+
+    Alert.alert(
+      'Accept Offer',
+      `Accept ${offer.amount} ${offer.token} for @${offer.name}?`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Accept',
+          onPress: async () => {
+            setProcessingOfferId(offer.id);
+            try {
+              const mnemonic = await getMnemonic();
+              const privateKey = await getPrivateKey();
+              const { viewKeyMaterial, spendKeyMaterial } = getFullStealthKeyMaterial(
+                user.quilibriumAddress,
+                mnemonic ?? undefined,
+                privateKey ?? undefined
+              );
+
+              const timestamp = Math.floor(Date.now() / 1000);
+              const nonce = generateNonce();
+
+              // Use a simplified signature for offer acceptance
+              const msgBytes = new TextEncoder().encode(
+                `accept:${offer.id}:${timestamp}:${nonce}`
+              );
+              const signature = btoa(String.fromCharCode(...msgBytes));
+
+              acceptOffer({
+                offerId: offer.id,
+                sellerAddress: activeWallet.address,
+                chain: 'base',
+                signature,
+                timestamp,
+                nonce,
+              }, {
+                onSuccess: () => {
+                  Alert.alert('Offer Accepted', 'The buyer will now be prompted to complete payment.');
+                  refetchReceived();
+                  parentRefresh?.();
+                  setProcessingOfferId(null);
+                },
+                onError: (err) => {
+                  Alert.alert('Error', err instanceof Error ? err.message : 'Failed to accept offer');
+                  setProcessingOfferId(null);
+                },
+              });
+            } catch (err) {
+              Alert.alert('Error', 'Failed to accept offer');
+              setProcessingOfferId(null);
+            }
+          },
+        },
+      ]
+    );
+  };
+
+  const handleRejectOffer = (offer: Offer) => {
+    Alert.alert(
+      'Reject Offer',
+      `Reject the offer of ${offer.amount} ${offer.token} for @${offer.name}?`,
+      [
+        { text: 'Keep', style: 'cancel' },
+        {
+          text: 'Reject',
+          style: 'destructive',
+          onPress: async () => {
+            setProcessingOfferId(offer.id);
+            const timestamp = Math.floor(Date.now() / 1000);
+            const nonce = generateNonce();
+            const signature = btoa(`reject:${offer.id}:${timestamp}:${nonce}`);
+
+            rejectOffer({
+              offerId: offer.id,
+              signature,
+              timestamp,
+              nonce,
+            }, {
+              onSuccess: () => {
+                refetchReceived();
+                setProcessingOfferId(null);
+              },
+              onError: (err) => {
+                Alert.alert('Error', err instanceof Error ? err.message : 'Failed to reject offer');
+                setProcessingOfferId(null);
+              },
+            });
+          },
+        },
+      ]
+    );
+  };
+
+  const handleCancelOffer = (offer: Offer) => {
+    Alert.alert(
+      'Cancel Offer',
+      `Cancel your offer of ${offer.amount} ${offer.token} for @${offer.name}?`,
+      [
+        { text: 'Keep', style: 'cancel' },
+        {
+          text: 'Cancel Offer',
+          style: 'destructive',
+          onPress: () => {
+            setProcessingOfferId(offer.id);
+            const timestamp = Math.floor(Date.now() / 1000);
+            const nonce = generateNonce();
+            const signature = btoa(`cancel:${offer.id}:${timestamp}:${nonce}`);
+
+            cancelOffer({
+              offerId: offer.id,
+              signature,
+              timestamp,
+              nonce,
+            }, {
+              onSuccess: () => {
+                refetchSent();
+                setProcessingOfferId(null);
+              },
+              onError: (err) => {
+                Alert.alert('Error', err instanceof Error ? err.message : 'Failed to cancel offer');
+                setProcessingOfferId(null);
+              },
+            });
+          },
+        },
+      ]
+    );
+  };
+
+  const getStateColor = (state: string) => {
+    switch (state) {
+      case 'pending': return theme.colors.warning;
+      case 'accepted': return theme.colors.success;
+      case 'rejected': return theme.colors.danger;
+      case 'cancelled': return theme.colors.textMuted;
+      case 'expired': return theme.colors.textMuted;
+      default: return theme.colors.textMuted;
+    }
+  };
+
+  const formatDate = (date: string) => {
+    return new Date(date).toLocaleDateString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  };
+
+  const renderOffer = ({ item }: { item: Offer }) => {
+    const isProcessing = processingOfferId === item.id;
+    const isPending = item.state === 'pending';
+
+    return (
+      <View style={styles.offerCard}>
+        <View style={styles.offerHeader}>
+          <Text style={styles.offerName}>@{item.name}</Text>
+          <View style={[styles.stateBadge, { backgroundColor: `${getStateColor(item.state)}20` }]}>
+            <Text style={[styles.stateText, { color: getStateColor(item.state) }]}>
+              {item.state}
+            </Text>
+          </View>
+        </View>
+        <View style={styles.offerDetails}>
+          <View>
+            <Text style={styles.offerAmount}>{item.amount} {item.token}</Text>
+            <Text style={styles.offerDate}>
+              {activeTab === 'received'
+                ? `From ${item.buyer_address.slice(0, 6)}...${item.buyer_address.slice(-4)}`
+                : `Expires ${formatDate(item.expires_at)}`
+              }
+            </Text>
+          </View>
+          {isPending && (
+            <View style={styles.actionButtons}>
+              {activeTab === 'received' ? (
+                <>
+                  <TouchableOpacity
+                    style={[styles.acceptButton, isProcessing && styles.buttonDisabled]}
+                    onPress={() => handleAcceptOffer(item)}
+                    disabled={isProcessing}
+                  >
+                    {isProcessing ? (
+                      <ActivityIndicator size="small" color="#fff" />
+                    ) : (
+                      <Text style={styles.acceptButtonText}>Accept</Text>
+                    )}
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[styles.rejectButton, isProcessing && styles.buttonDisabled]}
+                    onPress={() => handleRejectOffer(item)}
+                    disabled={isProcessing}
+                  >
+                    <Text style={styles.rejectButtonText}>Reject</Text>
+                  </TouchableOpacity>
+                </>
+              ) : (
+                <TouchableOpacity
+                  style={[styles.cancelButton, isProcessing && styles.buttonDisabled]}
+                  onPress={() => handleCancelOffer(item)}
+                  disabled={isProcessing}
+                >
+                  {isProcessing ? (
+                    <ActivityIndicator size="small" color={theme.colors.danger} />
+                  ) : (
+                    <Text style={styles.cancelButtonText}>Cancel</Text>
+                  )}
+                </TouchableOpacity>
+              )}
+            </View>
+          )}
+        </View>
+      </View>
+    );
+  };
+
+  const currentOffers = activeTab === 'received' ? receivedOffers : sentOffers;
+  const isLoading = activeTab === 'received' ? isLoadingReceived : isLoadingSent;
+  const isRefetching = activeTab === 'received' ? isRefetchingReceived : isRefetchingSent;
+  const onRefresh = activeTab === 'received' ? refetchReceived : refetchSent;
+
+  const renderEmpty = () => (
+    <View style={styles.emptyContainer}>
+      {isLoading ? (
+        <ActivityIndicator size="large" color={theme.colors.primary} />
+      ) : (
+        <>
+          <IconSymbol name="envelope.open" size={48} color={theme.colors.textMuted} />
+          <Text style={styles.emptyTitle}>No Offers</Text>
+          <Text style={styles.emptySubtitle}>
+            {activeTab === 'received'
+              ? 'You have no incoming offers'
+              : 'You have no outgoing offers'
+            }
+          </Text>
+        </>
+      )}
+    </View>
+  );
+
+  return (
+    <BaseModal visible={visible} onClose={onClose} height={0.85} fillHeight>
+      <View style={styles.header}>
+        <Text style={styles.title}>Offers</Text>
+        <TouchableOpacity onPress={onClose}>
+          <IconSymbol name="xmark" size={20} color={theme.colors.textMuted} />
+        </TouchableOpacity>
+      </View>
+
+      {/* Tabs */}
+      <View style={styles.tabs}>
+        <TouchableOpacity
+          style={[styles.tab, activeTab === 'received' && styles.tabActive]}
+          onPress={() => setActiveTab('received')}
+        >
+          <Text style={[styles.tabText, activeTab === 'received' && styles.tabTextActive]}>
+            Received
+          </Text>
+          {receivedOffers && receivedOffers.filter(o => o.state === 'pending').length > 0 && (
+            <View style={styles.tabBadge}>
+              <Text style={styles.tabBadgeText}>
+                {receivedOffers.filter(o => o.state === 'pending').length}
+              </Text>
+            </View>
+          )}
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.tab, activeTab === 'sent' && styles.tabActive]}
+          onPress={() => setActiveTab('sent')}
+        >
+          <Text style={[styles.tabText, activeTab === 'sent' && styles.tabTextActive]}>
+            Sent
+          </Text>
+        </TouchableOpacity>
+      </View>
+
+      <FlatList
+        data={currentOffers ?? []}
+        renderItem={renderOffer}
+        keyExtractor={item => item.id}
+        contentContainerStyle={styles.listContent}
+        ListEmptyComponent={renderEmpty}
+        refreshControl={
+          <RefreshControl
+            refreshing={isRefetching}
+            onRefresh={onRefresh}
+            tintColor={theme.colors.primary}
+          />
+        }
+        showsVerticalScrollIndicator={false}
+      />
+    </BaseModal>
+  );
+}
+
+const createStyles = (theme: AppTheme, isDark: boolean, insets: EdgeInsets) =>
+  StyleSheet.create({
+    header: {
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      paddingHorizontal: 20,
+      paddingBottom: 12,
+    },
+    title: {
+      fontSize: 20,
+      fontFamily: theme.fonts.bold.fontFamily,
+      fontWeight: theme.fonts.bold.fontWeight,
+      color: theme.colors.textMain,
+    },
+    tabs: {
+      flexDirection: 'row',
+      paddingHorizontal: 20,
+      marginBottom: 12,
+      gap: 8,
+    },
+    tab: {
+      flex: 1,
+      flexDirection: 'row',
+      justifyContent: 'center',
+      alignItems: 'center',
+      paddingVertical: 10,
+      borderRadius: 10,
+      backgroundColor: theme.colors.surface2,
+      borderWidth: 1,
+      borderColor: theme.colors.surface3,
+      gap: 6,
+    },
+    tabActive: {
+      backgroundColor: theme.colors.primary,
+      borderColor: theme.colors.primary,
+    },
+    tabText: {
+      fontSize: 14,
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
+      color: theme.colors.textMain,
+    },
+    tabTextActive: {
+      color: '#fff',
+    },
+    tabBadge: {
+      backgroundColor: '#fff',
+      borderRadius: 10,
+      minWidth: 18,
+      height: 18,
+      justifyContent: 'center',
+      alignItems: 'center',
+      paddingHorizontal: 5,
+    },
+    tabBadgeText: {
+      fontSize: 11,
+      fontFamily: theme.fonts.bold.fontFamily,
+      fontWeight: theme.fonts.bold.fontWeight,
+      color: theme.colors.primary,
+    },
+    listContent: {
+      paddingHorizontal: 20,
+      paddingBottom: insets.bottom + 20,
+      flexGrow: 1,
+    },
+    offerCard: {
+      backgroundColor: theme.colors.surface2,
+      borderRadius: 12,
+      padding: 14,
+      marginBottom: 10,
+    },
+    offerHeader: {
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      marginBottom: 8,
+    },
+    offerName: {
+      fontSize: 16,
+      fontFamily: theme.fonts.bold.fontFamily,
+      fontWeight: theme.fonts.bold.fontWeight,
+      color: theme.colors.primary,
+    },
+    stateBadge: {
+      paddingVertical: 2,
+      paddingHorizontal: 8,
+      borderRadius: 8,
+    },
+    stateText: {
+      fontSize: 11,
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
+      textTransform: 'capitalize',
+    },
+    offerDetails: {
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+    },
+    offerAmount: {
+      fontSize: 15,
+      fontFamily: theme.fonts.bold.fontFamily,
+      fontWeight: theme.fonts.bold.fontWeight,
+      color: theme.colors.textMain,
+    },
+    offerDate: {
+      fontSize: 12,
+      color: theme.colors.textMuted,
+      marginTop: 2,
+    },
+    actionButtons: {
+      flexDirection: 'row',
+      gap: 8,
+    },
+    acceptButton: {
+      backgroundColor: theme.colors.success,
+      paddingVertical: 6,
+      paddingHorizontal: 14,
+      borderRadius: 8,
+    },
+    acceptButtonText: {
+      fontSize: 13,
+      fontFamily: theme.fonts.bold.fontFamily,
+      fontWeight: theme.fonts.bold.fontWeight,
+      color: '#fff',
+    },
+    rejectButton: {
+      backgroundColor: isDark ? 'rgba(239, 68, 68, 0.15)' : 'rgba(239, 68, 68, 0.1)',
+      paddingVertical: 6,
+      paddingHorizontal: 14,
+      borderRadius: 8,
+    },
+    rejectButtonText: {
+      fontSize: 13,
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
+      color: theme.colors.danger,
+    },
+    cancelButton: {
+      backgroundColor: isDark ? 'rgba(239, 68, 68, 0.15)' : 'rgba(239, 68, 68, 0.1)',
+      paddingVertical: 6,
+      paddingHorizontal: 14,
+      borderRadius: 8,
+    },
+    cancelButtonText: {
+      fontSize: 13,
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
+      color: theme.colors.danger,
+    },
+    buttonDisabled: {
+      opacity: 0.5,
+    },
+    emptyContainer: {
+      flex: 1,
+      alignItems: 'center',
+      justifyContent: 'center',
+      paddingVertical: 60,
+      gap: 12,
+    },
+    emptyTitle: {
+      fontSize: 18,
+      fontFamily: theme.fonts.bold.fontFamily,
+      fontWeight: theme.fonts.bold.fontWeight,
+      color: theme.colors.textMain,
+    },
+    emptySubtitle: {
+      fontSize: 14,
+      color: theme.colors.textMuted,
+      textAlign: 'center',
+    },
+  });

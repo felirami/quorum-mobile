@@ -7,16 +7,18 @@
  * - Share via system share sheet
  */
 
-import { logger } from '@quilibrium/quorum-shared';
 import { BaseModal } from '@/components/shared';
+import ShareInviteSheet from '@/components/ShareInviteSheet';
 import { IconSymbol } from '@/components/ui/IconSymbol';
 import {
   useCopyInviteLink,
   useGenerateInvite,
-  useShareInvite,
+  useGeneratePublicInvite,
 } from '@/hooks/chat/useInviteManagement';
-import { useTheme } from '@/theme';
-import React, { useCallback, useState } from 'react';
+import { getSpace } from '@/services/config/spaceStorage';
+import { useTheme, type AppTheme } from '@/theme';
+import type { EdgeInsets } from 'react-native-safe-area-context';
+import React, { useCallback, useState, useEffect } from 'react';
 import {
   ActivityIndicator,
   ScrollView,
@@ -46,20 +48,45 @@ export default function InviteModal({
   const styles = createStyles(theme, insets);
 
   const [inviteLink, setInviteLink] = useState<string | null>(null);
+  const [generatedType, setGeneratedType] = useState<'private' | 'public' | null>(null);
   const [copied, setCopied] = useState(false);
+  const [inviteType, setInviteType] = useState<'private' | 'public'>('private');
+  const [hasLoadedExistingInvite, setHasLoadedExistingInvite] = useState(false);
 
   const generateInviteMutation = useGenerateInvite();
+  const generatePublicInviteMutation = useGeneratePublicInvite();
   const copyLinkMutation = useCopyInviteLink();
-  const shareInviteMutation = useShareInvite();
+
+  // Check for existing public invite URL when modal opens
+  // Only run once per modal open to avoid overriding user actions
+  useEffect(() => {
+    if (visible && spaceId && !hasLoadedExistingInvite) {
+      const space = getSpace(spaceId);
+      if (space?.inviteUrl) {
+        // Space already has a public invite URL - show it
+        setInviteLink(space.inviteUrl);
+        setGeneratedType('public');
+        setInviteType('public');
+      }
+      setHasLoadedExistingInvite(true);
+    }
+  }, [visible, spaceId, hasLoadedExistingInvite]);
 
   const handleGenerateInvite = useCallback(async () => {
     try {
-      const result = await generateInviteMutation.mutateAsync({ spaceId });
-      setInviteLink(result.inviteLink);
+      if (inviteType === 'public') {
+        const result = await generatePublicInviteMutation.mutateAsync({ spaceId });
+        setInviteLink(result.inviteLink);
+        setGeneratedType('public');
+      } else {
+        const result = await generateInviteMutation.mutateAsync({ spaceId });
+        setInviteLink(result.inviteLink);
+        setGeneratedType('private');
+      }
     } catch (error) {
-      logger.log('[InviteModal] Failed to generate invite:', error);
+      // Failed to generate invite
     }
-  }, [spaceId, generateInviteMutation]);
+  }, [spaceId, inviteType, generateInviteMutation, generatePublicInviteMutation]);
 
   const handleCopyLink = useCallback(async () => {
     if (!inviteLink) return;
@@ -69,34 +96,32 @@ export default function InviteModal({
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch (error) {
-      logger.log('[InviteModal] Failed to copy link:', error);
+      // Failed to copy link
     }
   }, [inviteLink, copyLinkMutation]);
 
-  const handleShare = useCallback(async () => {
+  // Share opens the in-app contact picker first; the system share sheet
+  // is one tap deeper via the sheet's "More options" button.
+  const [shareSheetVisible, setShareSheetVisible] = useState(false);
+  const handleShare = useCallback(() => {
     if (!inviteLink) return;
-
-    try {
-      await shareInviteMutation.mutateAsync({
-        inviteLink,
-        spaceName,
-      });
-    } catch (error) {
-      logger.log('[InviteModal] Failed to share:', error);
-    }
-  }, [inviteLink, spaceName, shareInviteMutation]);
+    setShareSheetVisible(true);
+  }, [inviteLink]);
 
   const handleClose = useCallback(() => {
     setInviteLink(null);
+    setGeneratedType(null);
     setCopied(false);
+    setInviteType('private');
+    setHasLoadedExistingInvite(false);
     onClose();
   }, [onClose]);
 
-  const isGenerating = generateInviteMutation.isPending;
-  const hasError = generateInviteMutation.error;
+  const isGenerating = generateInviteMutation.isPending || generatePublicInviteMutation.isPending;
+  const hasError = generateInviteMutation.error || generatePublicInviteMutation.error;
 
   return (
-    <BaseModal visible={visible} onClose={handleClose} height={0.5} avoidKeyboard>
+    <BaseModal visible={visible} onClose={handleClose} height={0.65} fillHeight avoidKeyboard>
       <View style={styles.container}>
         {/* Header */}
         <View style={styles.header}>
@@ -106,8 +131,15 @@ export default function InviteModal({
           </Text>
         </View>
 
-        {/* Content */}
-        <View style={styles.content}>
+        {/* Content — scrollable so the generate UI, warnings, and link
+            actions fit on small-screen phones where the modal's 50%
+            height isn't enough to show everything at once. */}
+        <ScrollView
+          style={styles.content}
+          contentContainerStyle={styles.contentInner}
+          showsVerticalScrollIndicator={false}
+          keyboardShouldPersistTaps="handled"
+        >
           {!inviteLink ? (
             // Generate button
             <View style={styles.generateSection}>
@@ -115,9 +147,56 @@ export default function InviteModal({
                 <IconSymbol name="link" size={48} color={theme.colors.primary} />
               </View>
 
+              {/* Invite Type Toggle */}
+              <View style={styles.inviteTypeToggle}>
+                <TouchableOpacity
+                  style={[
+                    styles.inviteTypeButton,
+                    inviteType === 'private' && styles.inviteTypeButtonActive,
+                  ]}
+                  onPress={() => setInviteType('private')}
+                >
+                  <IconSymbol
+                    name="person.fill"
+                    size={16}
+                    color={inviteType === 'private' ? '#fff' : theme.colors.textMuted}
+                  />
+                  <Text
+                    style={[
+                      styles.inviteTypeButtonText,
+                      inviteType === 'private' && styles.inviteTypeButtonTextActive,
+                    ]}
+                  >
+                    One-Time
+                  </Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[
+                    styles.inviteTypeButton,
+                    inviteType === 'public' && styles.inviteTypeButtonActive,
+                  ]}
+                  onPress={() => setInviteType('public')}
+                >
+                  <IconSymbol
+                    name="globe"
+                    size={16}
+                    color={inviteType === 'public' ? '#fff' : theme.colors.textMuted}
+                  />
+                  <Text
+                    style={[
+                      styles.inviteTypeButtonText,
+                      inviteType === 'public' && styles.inviteTypeButtonTextActive,
+                    ]}
+                  >
+                    Public Link
+                  </Text>
+                </TouchableOpacity>
+              </View>
+
               <Text style={styles.infoText}>
-                This will generate a one-time use invite link that you can share
-                with someone to join this space.
+                {inviteType === 'private'
+                  ? 'Generate a one-time use invite link. Each link can only be used by one person.'
+                  : 'Generate a reusable public invite link. Anyone with this link can join.'}
               </Text>
 
               {hasError && (
@@ -139,7 +218,9 @@ export default function InviteModal({
                 ) : (
                   <>
                     <IconSymbol name="link.badge.plus" size={20} color="#fff" />
-                    <Text style={styles.primaryButtonText}>Generate Invite Link</Text>
+                    <Text style={styles.primaryButtonText}>
+                      Generate {inviteType === 'public' ? 'Public' : 'Invite'} Link
+                    </Text>
                   </>
                 )}
               </TouchableOpacity>
@@ -184,23 +265,22 @@ export default function InviteModal({
                 <TouchableOpacity
                   style={styles.actionButton}
                   onPress={handleShare}
-                  disabled={shareInviteMutation.isPending}
                 >
-                  {shareInviteMutation.isPending ? (
-                    <ActivityIndicator size="small" color={theme.colors.textMain} />
-                  ) : (
-                    <>
-                      <IconSymbol name="square.and.arrow.up" size={18} color={theme.colors.textMain} />
-                      <Text style={styles.actionButtonText}>Share</Text>
-                    </>
-                  )}
+                  <IconSymbol name="square.and.arrow.up" size={18} color={theme.colors.textMain} />
+                  <Text style={styles.actionButtonText}>Share</Text>
                 </TouchableOpacity>
               </View>
 
-              <View style={styles.warningBanner}>
-                <IconSymbol name="exclamationmark.circle" size={16} color={theme.colors.warning ?? '#f59e0b'} />
-                <Text style={styles.warningText}>
-                  This link can only be used once. Generate a new link for each person you want to invite.
+              <View style={[styles.warningBanner, generatedType === 'public' && styles.infoBanner]}>
+                <IconSymbol
+                  name={generatedType === 'public' ? 'info.circle' : 'exclamationmark.circle'}
+                  size={16}
+                  color={generatedType === 'public' ? theme.colors.primary : (theme.colors.warning ?? '#f59e0b')}
+                />
+                <Text style={[styles.warningText, generatedType === 'public' && styles.infoText]}>
+                  {generatedType === 'public'
+                    ? 'Anyone with this link can join. You can regenerate it at any time to invalidate the old link.'
+                    : 'This link can only be used once. Generate a new link for each person you want to invite.'}
                 </Text>
               </View>
 
@@ -220,14 +300,22 @@ export default function InviteModal({
               </TouchableOpacity>
             </View>
           )}
-        </View>
+        </ScrollView>
 
       </View>
+      {inviteLink && (
+        <ShareInviteSheet
+          visible={shareSheetVisible}
+          onClose={() => setShareSheetVisible(false)}
+          inviteLink={inviteLink}
+          spaceName={spaceName}
+        />
+      )}
     </BaseModal>
   );
 }
 
-const createStyles = (theme: any, insets: any) =>
+const createStyles = (theme: AppTheme, insets: EdgeInsets) =>
   StyleSheet.create({
     container: {
       flex: 1,
@@ -254,6 +342,11 @@ const createStyles = (theme: any, insets: any) =>
     content: {
       flex: 1,
     },
+    contentInner: {
+      // Bottom padding above the safe area so the last action button has
+      // breathing room when the user scrolls to the end.
+      paddingBottom: Math.max(insets.bottom, 16),
+    },
     generateSection: {
       alignItems: 'center',
       paddingVertical: 24,
@@ -275,6 +368,39 @@ const createStyles = (theme: any, insets: any) =>
       lineHeight: 20,
       marginBottom: 24,
       paddingHorizontal: 16,
+    },
+    inviteTypeToggle: {
+      flexDirection: 'row',
+      backgroundColor: theme.colors.surface3,
+      borderRadius: 12,
+      padding: 4,
+      marginBottom: 20,
+      gap: 4,
+    },
+    inviteTypeButton: {
+      flex: 1,
+      flexDirection: 'row',
+      paddingVertical: 10,
+      paddingHorizontal: 12,
+      alignItems: 'center',
+      justifyContent: 'center',
+      borderRadius: 10,
+      gap: 6,
+    },
+    inviteTypeButtonActive: {
+      backgroundColor: theme.colors.primary,
+    },
+    inviteTypeButtonText: {
+      fontSize: 14,
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
+      color: theme.colors.textMuted,
+    },
+    inviteTypeButtonTextActive: {
+      color: '#fff',
+    },
+    infoBanner: {
+      backgroundColor: theme.colors.primary + '15',
     },
     primaryButton: {
       flexDirection: 'row',

@@ -1,4 +1,5 @@
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query';
+import { isScamCast } from '@/services/farcaster/scamFilter';
 
 const CHANNEL_INFO_URL = 'https://farcaster.xyz/~api/v2/channel';
 const CHANNEL_FEED_URL = 'https://client.farcaster.xyz/v2/feed-items';
@@ -249,7 +250,12 @@ async function fetchChannelFeed(
   }
 
   const json = await response.json();
-  const items: ChannelFeedItem[] = json?.result?.items ?? [];
+  const rawItems: ChannelFeedItem[] = json?.result?.items ?? [];
+  // See useFarcasterFeed: drop wallet-drainer typo-squat casts at
+  // the fetch boundary so cursors/exclude lists stay coherent.
+  const items = rawItems.filter(
+    (item) => !isScamCast(item.cast as unknown as Parameters<typeof isScamCast>[0]),
+  );
 
   // Extract casts from feed items
   const casts: ChannelCast[] = items.map((item) => item.cast);

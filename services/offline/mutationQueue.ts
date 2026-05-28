@@ -3,12 +3,14 @@ import { mutationQueueStorage } from './storage';
 export interface QueuedMutation {
   id: string;
   type: 'like' | 'unlike' | 'post';
-  payload: any;
+  payload: Record<string, unknown>;
   timestamp: number;
   retryCount: number;
 }
 
 const QUEUE_KEY = 'MUTATION_QUEUE';
+const MAX_RETRIES = 5;
+const EXPIRATION_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 /**
  * Manages offline mutation queue for operations that should sync when online.
@@ -60,17 +62,25 @@ class MutationQueue {
   }
 
   /**
-   * Get all queued mutations
+   * Get all queued mutations, filtering out expired or exhausted entries
    */
   getAll(): QueuedMutation[] {
-    return this.getQueue();
+    const queue = this.getQueue();
+    const now = Date.now();
+    const valid = queue.filter(m =>
+      m.retryCount < MAX_RETRIES && (now - m.timestamp) < EXPIRATION_MS
+    );
+    if (valid.length !== queue.length) {
+      this.saveQueue(valid);
+    }
+    return valid;
   }
 
   /**
    * Get count of pending mutations
    */
   getCount(): number {
-    return this.getQueue().length;
+    return this.getAll().length;
   }
 
   /**

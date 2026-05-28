@@ -1,6 +1,6 @@
 import type { EmbeddedCast } from '@/hooks/useFarcasterFeed';
 
-export type FeedFilter = 'all' | 'media' | 'node-ops' | 'events';
+export type FeedFilter = 'all' | 'media' | 'governance' | 'node-ops' | 'events';
 
 export interface VideoEmbed {
   url?: string;
@@ -20,6 +20,13 @@ export interface UrlEmbed {
   isFarcasterLink?: boolean;
   farcasterUsername?: string;
   farcasterCastHash?: string;
+  isQuorumInvite?: boolean;
+  snapUrl?: string;
+  /** Farcaster Frame v2 / miniapp metadata. Renderers should prefer the snap UI
+   *  when the URL is detected as a snap, otherwise show this as a frame card. */
+  frameImageUrl?: string;
+  frameButtonTitle?: string;
+  frameActionUrl?: string;
 }
 
 export interface QuoteCastEmbed {
@@ -60,6 +67,7 @@ export interface FeedPost {
   filter: FeedFilter;
   viewerHasLiked?: boolean;
   viewerHasRecast?: boolean;
+  viewerIsFollowing?: boolean;
 }
 
 export interface ThreadInfo {

@@ -1,7 +1,8 @@
 import { BaseModal } from '@/components/shared';
 import { IconSymbol } from '@/components/ui/IconSymbol';
 import { useAuth } from '@/context';
-import { useTheme } from '@/theme';
+import { useTheme, type AppTheme } from '@/theme';
+import type { EdgeInsets } from 'react-native-safe-area-context';
 import { LinearGradient } from 'expo-linear-gradient';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
@@ -21,6 +22,11 @@ interface MiniAppsModalProps {
   visible: boolean;
   onClose: () => void;
   onOpenMiniApp?: (url: string, isQNative: boolean) => void;
+  isRouteMode?: boolean;
+  /** Skip the route-mode top safe-area inset when nested under a host
+   *  that already accounts for the status bar (e.g. the Wallet/Mini
+   *  Apps segmented switcher). Without this the inset would double up. */
+  noTopInset?: boolean;
 }
 
 // Farcaster API response types
@@ -84,7 +90,15 @@ const requiresBase = (frame: ApiFrame): boolean => {
   return frame.requiredChains?.some(chain => chain === BASE_CHAIN_ID) ?? false;
 };
 
-export default function MiniAppsModal({ visible, onClose, onOpenMiniApp }: MiniAppsModalProps) {
+// Creators excluded from the discover list
+const EXCLUDED_AUTHORS = new Set<string>(['hypercat']);
+
+const isExcludedAuthor = (frame: ApiFrame): boolean => {
+  const username = frame.author?.username?.toLowerCase();
+  return Boolean(username && EXCLUDED_AUTHORS.has(username));
+};
+
+export default function MiniAppsModal({ visible, onClose, onOpenMiniApp, isRouteMode = false, noTopInset = false }: MiniAppsModalProps) {
   const { theme, isDark } = useTheme();
   const insets = useSafeAreaInsets();
   const { farcasterAuthToken } = useAuth();
@@ -159,8 +173,10 @@ export default function MiniAppsModal({ visible, onClose, onOpenMiniApp }: MiniA
 
         const data: TopFramesResponse = await response.json();
 
-        // Filter out apps that require Base chain
-        const filteredFrames = data.result.frames.filter(frame => !requiresBase(frame));
+        // Filter out apps that require Base chain, or are authored by excluded creators
+        const filteredFrames = data.result.frames.filter(
+          frame => !requiresBase(frame) && !isExcludedAuthor(frame),
+        );
 
         const apps = filteredFrames.map((frame, index) => frameToMiniApp(frame, index, true));
         setMiniApps(apps);
@@ -206,7 +222,9 @@ export default function MiniAppsModal({ visible, onClose, onOpenMiniApp }: MiniA
         const data: SearchMiniAppsResponse = await response.json();
 
         // Filter out apps that require Base chain
-        const filteredApps = (data.result.apps || []).filter(frame => !requiresBase(frame));
+        const filteredApps = (data.result.apps || []).filter(
+          frame => !requiresBase(frame) && !isExcludedAuthor(frame),
+        );
 
         const apps = filteredApps.map((frame, index) => frameToMiniApp(frame, index, false));
         setSearchResults(apps);
@@ -229,23 +247,24 @@ export default function MiniAppsModal({ visible, onClose, onOpenMiniApp }: MiniA
   const featuredApps = miniApps.filter(app => app.featured).slice(0, 5);
 
   const handleAppPress = (url: string, isQNative: boolean) => {
-    onClose();
+    // In route mode, don't close - just open the mini app
+    // In modal mode, close the modal first
+    if (!isRouteMode) {
+      onClose();
+    }
     onOpenMiniApp?.(url, isQNative);
   };
 
-  return (
-    <BaseModal
-      visible={visible}
-      onClose={onClose}
-      height={0.9}
-    >
-      {/* Header */}
-      <View style={styles.header}>
-        <Text style={styles.title}>Mini Apps</Text>
-        <TouchableOpacity style={styles.storeButton}>
-          <IconSymbol name="plus.circle.fill" size={24} color={theme.colors.primary} />
-        </TouchableOpacity>
-      </View>
+  const miniAppsContent = (
+    <>
+      {/* Title is owned by the parent tab header now (wallet/index.tsx).
+          Modal-mode callers still need a visible title since they don't
+          carry their own header — show it only when not in route mode. */}
+      {!isRouteMode && (
+        <View style={styles.header}>
+          <Text style={styles.title}>Mini Apps</Text>
+        </View>
+      )}
 
       {/* Search Bar */}
       <View style={styles.searchContainer}>
@@ -419,12 +438,38 @@ export default function MiniAppsModal({ visible, onClose, onOpenMiniApp }: MiniA
           )}
         </ScrollView>
       )}
+    </>
+  );
+
+  // In route mode, render directly without modal wrapper. Suppress the
+  // top safe-area inset when the host has its own header above (e.g.
+  // the Wallet/Mini Apps segmented switcher) so the inset isn't doubled.
+  if (isRouteMode) {
+    return (
+      <View style={[styles.routeContainer, { paddingTop: noTopInset ? 0 : insets.top, backgroundColor: theme.colors.surface1 }]}>
+        {miniAppsContent}
+      </View>
+    );
+  }
+
+  // In modal mode, wrap with BaseModal
+  return (
+    <BaseModal
+      visible={visible}
+      onClose={onClose}
+      height={0.9}
+    >
+      {miniAppsContent}
     </BaseModal>
   );
 }
 
-const createStyles = (theme: any, isDark: boolean, insets: any) =>
+const createStyles = (theme: AppTheme, isDark: boolean, insets: EdgeInsets) =>
   StyleSheet.create({
+    routeContainer: {
+      flex: 1,
+      paddingBottom: 90, // Clear the blur tab bar
+    },
     header: {
       flexDirection: 'row',
       justifyContent: 'space-between',
@@ -437,9 +482,6 @@ const createStyles = (theme: any, isDark: boolean, insets: any) =>
       fontFamily: theme.fonts.bold.fontFamily,
       fontWeight: theme.fonts.bold.fontWeight,
       color: theme.colors.textMain,
-    },
-    storeButton: {
-      padding: 4,
     },
     searchContainer: {
       flexDirection: 'row',

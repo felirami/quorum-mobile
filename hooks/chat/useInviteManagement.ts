@@ -7,14 +7,15 @@
  * - useShareInvite: Share invite via system share sheet
  */
 
-import { logger } from '@quilibrium/quorum-shared';
 import { useMutation } from '@tanstack/react-query';
 import * as Clipboard from 'expo-clipboard';
 import { Share, Platform } from 'react-native';
 import {
   generatePrivateInviteLink,
+  generatePublicInviteLink,
   parseInviteLink,
   isValidInviteLink,
+  isPublicInvite,
   getShortenedInviteLink,
   type InviteParams,
 } from '@/services/space/inviteService';
@@ -46,6 +47,35 @@ export function useGenerateInvite() {
       return {
         inviteLink: result.inviteLink,
         isOneTimeUse: result.isOneTimeUse,
+        spaceName: space.spaceName,
+      };
+    },
+  });
+}
+
+interface GeneratePublicInviteResult {
+  inviteLink: string;
+  isPublic: true;
+  spaceName: string;
+}
+
+/**
+ * Generate a public invite link for a space (reusable, ~200 uses)
+ * Only space owners can generate public invites
+ */
+export function useGeneratePublicInvite() {
+  return useMutation({
+    mutationFn: async (params: GenerateInviteParams): Promise<GeneratePublicInviteResult> => {
+      const space = getSpace(params.spaceId);
+      if (!space) {
+        throw new Error('Space not found');
+      }
+
+      const result = await generatePublicInviteLink(params.spaceId);
+
+      return {
+        inviteLink: result.inviteLink,
+        isPublic: true,
         spaceName: space.spaceName,
       };
     },
@@ -84,12 +114,9 @@ export function useShareInvite() {
         );
 
         if (result.action === Share.dismissedAction) {
-          logger.log('[useShareInvite] Share dismissed');
         } else if (result.action === Share.sharedAction) {
-          logger.log('[useShareInvite] Shared successfully');
         }
       } catch (error) {
-        console.error('[useShareInvite] Share failed:', error);
         throw error;
       }
     },
@@ -112,4 +139,4 @@ export function useParseInviteLink() {
 }
 
 // Re-export utility functions for direct use
-export { isValidInviteLink, getShortenedInviteLink, parseInviteLink };
+export { isValidInviteLink, isPublicInvite, getShortenedInviteLink, parseInviteLink };

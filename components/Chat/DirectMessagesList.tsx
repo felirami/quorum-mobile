@@ -3,23 +3,27 @@
  * Displays both E2EE (Quorum) and Farcaster direct cast conversations
  */
 
-import React, { useCallback } from 'react';
-import {
-  View,
-  Text,
-  Image,
-  StyleSheet,
-  TouchableOpacity,
-  ActivityIndicator,
-  RefreshControl,
-} from 'react-native';
-import { FlatList } from 'react-native-gesture-handler';
-import { IconSymbol } from '@/components/ui/IconSymbol';
+import type { AppTheme } from '@/theme';
 import { DefaultAvatar } from '@/components/ui/DefaultAvatar';
-import type { Conversation } from '@/hooks/chat/useConversations';
+import { IconSymbol } from '@/components/ui/IconSymbol';
+import type { Conversation } from '@/hooks/chat';
+import React, { useCallback, useMemo } from 'react';
+import {
+  ActivityIndicator,
+  Alert,
+  Image,
+  RefreshControl,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View
+} from 'react-native';
+import { FlashList } from '@shopify/flash-list';
 
 // Farcaster logo for non-E2EE indicator
 const FarcasterLogo = require('@/assets/images/farcaster.png');
+
+type DMFilter = 'all' | 'favorites' | 'unknown' | 'muted';
 
 interface DirectMessagesListProps {
   conversations: Conversation[];
@@ -28,10 +32,18 @@ interface DirectMessagesListProps {
   onNewConversation?: () => void;
   isLoading?: boolean;
   isRefreshing?: boolean;
+  isFetchingNextPage?: boolean;
+  hasNextPage?: boolean;
   error?: Error | null;
   onRefresh?: () => void;
-  theme: any;
+  onEndReached?: () => void;
+  onMarkAllRead?: () => void;
+  theme: AppTheme;
   currentUserAddress?: string;
+  isFavorite?: (conversationId: string) => boolean;
+  isMuted?: (conversationId: string) => boolean;
+  onToggleFavorite?: (conversationId: string) => void;
+  onToggleMute?: (conversationId: string) => void;
 }
 
 // Check if icon is a valid data URI (not a local path or remote URL)
@@ -40,20 +52,174 @@ function isValidAvatarUri(icon: string | undefined): boolean {
   return icon.startsWith('data:');
 }
 
-// Format timestamp to relative time
+// Format timestamp for conversation list (Discord-style)
 function formatRelativeTime(timestamp: number): string {
-  const now = Date.now();
-  const diff = now - timestamp;
-  const minutes = Math.floor(diff / 60000);
-  const hours = Math.floor(diff / 3600000);
-  const days = Math.floor(diff / 86400000);
+  const date = new Date(timestamp);
+  const now = new Date();
+  const timeStr = date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 
-  if (minutes < 1) return 'now';
-  if (minutes < 60) return `${minutes}m`;
-  if (hours < 24) return `${hours}h`;
-  if (days < 7) return `${days}d`;
-  return new Date(timestamp).toLocaleDateString();
+  // Check if same day - show time only
+  if (date.toDateString() === now.toDateString()) {
+    return timeStr;
+  }
+
+  // Check if yesterday
+  const yesterday = new Date(now);
+  yesterday.setDate(yesterday.getDate() - 1);
+  if (date.toDateString() === yesterday.toDateString()) {
+    return `Yesterday at ${timeStr}`;
+  }
+
+  // Older - show date and time
+  return `${date.toLocaleDateString()} ${timeStr}`;
 }
+
+// Truncate sender name for preview
+function truncateName(name: string, maxLength: number = 8): string {
+  if (name.length <= maxLength) return name;
+  return `${name.slice(0, maxLength)}…`;
+}
+
+// Extracted conversation item for React.memo optimization
+interface DMConversationItemProps {
+  item: Conversation;
+  isSelected: boolean;
+  styles: ReturnType<typeof createStyles>;
+  theme: AppTheme;
+  isFavorite: boolean;
+  isMuted: boolean;
+  onSelect: (id: string) => void;
+  onToggleFavorite?: (id: string) => void;
+  onToggleMute?: (id: string) => void;
+}
+
+const DMConversationItem = React.memo(function DMConversationItem({
+  item,
+  isSelected,
+  styles,
+  theme,
+  isFavorite: favorite,
+  isMuted: muted,
+  onSelect,
+  onToggleFavorite,
+  onToggleMute,
+}: DMConversationItemProps) {
+  const hasUnread = item.lastReadTimestamp ? item.timestamp > item.lastReadTimestamp : false;
+
+  let displayName = item.displayName;
+  if (!displayName && item.address) {
+    if (item.address.startsWith('@')) {
+      displayName = item.address;
+    } else if (item.address.length > 12) {
+      displayName = `${item.address.slice(0, 8)}...${item.address.slice(-4)}`;
+    } else {
+      displayName = item.address;
+    }
+  }
+  displayName = displayName || 'Unknown';
+
+  const isFarcaster = item.source === 'farcaster';
+
+  const hasValidIcon = isFarcaster
+    ? !!item.icon && item.icon.startsWith('http')
+    : isValidAvatarUri(item.icon);
+
+  const handleLongPress = useCallback(() => {
+    if (isFarcaster) return;
+    const actions: { text: string; onPress: () => void; style?: 'cancel' | 'destructive' }[] = [];
+    if (onToggleFavorite) {
+      actions.push({
+        text: favorite ? 'Remove from Favorites' : 'Add to Favorites',
+        onPress: () => onToggleFavorite(item.conversationId),
+      });
+    }
+    if (onToggleMute) {
+      actions.push({
+        text: muted ? 'Unmute' : 'Mute',
+        onPress: () => onToggleMute(item.conversationId),
+      });
+    }
+    actions.push({ text: 'Cancel', onPress: () => {}, style: 'cancel' });
+    Alert.alert(displayName, undefined, actions);
+  }, [isFarcaster, favorite, muted, onToggleFavorite, onToggleMute, item.conversationId, displayName]);
+
+  const handlePress = useCallback(() => {
+    onSelect(item.conversationId);
+  }, [onSelect, item.conversationId]);
+
+  return (
+    <TouchableOpacity
+      style={[
+        styles.conversationItem,
+        isSelected && styles.conversationItemSelected,
+      ]}
+      onPress={handlePress}
+      onLongPress={handleLongPress}
+      activeOpacity={0.7}
+    >
+      <View style={styles.avatarContainer}>
+        {hasValidIcon ? (
+          <Image source={{ uri: item.icon }} style={styles.avatar} />
+        ) : (
+          <DefaultAvatar address={item.address || ''} size={48} />
+        )}
+        {hasUnread && <View style={styles.unreadBadge} />}
+        {isFarcaster && (
+          <View style={styles.farcasterBadge}>
+            <Image source={FarcasterLogo} style={styles.farcasterIcon} />
+          </View>
+        )}
+      </View>
+
+      <View style={styles.conversationContent}>
+        <View style={styles.conversationHeader}>
+          {favorite && (
+            <IconSymbol name="star.fill" size={12} color="#f59e0b" style={{ marginRight: 4 }} />
+          )}
+          <Text
+            style={[styles.userName, hasUnread && !muted && styles.userNameUnread]}
+            numberOfLines={1}
+          >
+            {displayName}
+          </Text>
+          {muted && (
+            <IconSymbol name="bell.slash.fill" size={12} color={theme.colors.textMuted} style={{ marginLeft: 4 }} />
+          )}
+          <Text style={styles.timestamp}>
+            {formatRelativeTime(item.timestamp)}
+          </Text>
+        </View>
+        {item.lastMessagePreview && (
+          <Text
+            style={[styles.messagePreview, hasUnread && styles.messagePreviewUnread]}
+            numberOfLines={1}
+          >
+            {item.lastMessageSenderName ? (
+              <Text style={styles.previewSender}>
+                {truncateName(item.lastMessageSenderName)}:{' '}
+              </Text>
+            ) : null}
+            {(() => {
+              const preview = item.lastMessagePreview;
+              if (typeof preview === 'string') {
+                return preview;
+              }
+              if (typeof preview === 'object' && preview !== null) {
+                const obj = preview as any;
+                if (obj.type === 'embed') return '📷 Image';
+                if (obj.type === 'sticker') return '🎨 Sticker';
+                const text = obj.text;
+                if (Array.isArray(text)) return text.join('');
+                return text || '';
+              }
+              return '';
+            })()}
+          </Text>
+        )}
+      </View>
+    </TouchableOpacity>
+  );
+});
 
 export function DirectMessagesList({
   conversations,
@@ -62,91 +228,66 @@ export function DirectMessagesList({
   onNewConversation,
   isLoading = false,
   isRefreshing = false,
+  isFetchingNextPage = false,
+  hasNextPage = false,
   error = null,
   onRefresh,
+  onEndReached,
+  onMarkAllRead,
   theme,
+  isFavorite,
+  isMuted,
+  onToggleFavorite,
+  onToggleMute,
 }: DirectMessagesListProps) {
-  const styles = createStyles(theme);
+  const styles = useMemo(() => createStyles(theme), [theme]);
+  const [activeFilter, setActiveFilter] = React.useState<DMFilter>('all');
+
+  // Sort and filter conversations
+  const filteredConversations = useMemo(() => {
+    let filtered = conversations;
+
+    // Apply filter
+    switch (activeFilter) {
+      case 'favorites':
+        filtered = conversations.filter(c => isFavorite?.(c.conversationId));
+        break;
+      case 'muted':
+        filtered = conversations.filter(c => isMuted?.(c.conversationId));
+        break;
+      case 'unknown':
+        // Unknown = no display name and not favorited
+        filtered = conversations.filter(c => !c.displayName && !isFavorite?.(c.conversationId));
+        break;
+    }
+
+    // Sort: favorites first, then by timestamp
+    return [...filtered].sort((a, b) => {
+      const aFav = isFavorite?.(a.conversationId) ? 1 : 0;
+      const bFav = isFavorite?.(b.conversationId) ? 1 : 0;
+      if (aFav !== bFav) return bFav - aFav;
+      return b.timestamp - a.timestamp;
+    });
+  }, [conversations, activeFilter, isFavorite, isMuted]);
 
   const renderItem = useCallback(
     ({ item }: { item: Conversation }) => {
-      const isSelected = selectedConversation === item.conversationId;
-      // Check if there are unread messages by comparing timestamps
-      const hasUnread = item.lastReadTimestamp ? item.timestamp > item.lastReadTimestamp : false;
-
-      // Format display name - use displayName, or format address appropriately
-      let displayName = item.displayName;
-      if (!displayName && item.address) {
-        if (item.address.startsWith('@')) {
-          displayName = item.address;
-        } else if (item.address.length > 12) {
-          displayName = `${item.address.slice(0, 8)}...${item.address.slice(-4)}`;
-        } else {
-          displayName = item.address;
-        }
-      }
-      displayName = displayName || 'Unknown';
-
-      // Check if this is a Farcaster conversation (not E2EE)
-      const isFarcaster = item.source === 'farcaster';
-
-      // For Farcaster, use HTTP URL directly; for others check data URI
-      const hasValidIcon = isFarcaster
-        ? !!item.icon && item.icon.startsWith('http')
-        : isValidAvatarUri(item.icon);
-
       return (
-        <TouchableOpacity
-          style={[
-            styles.conversationItem,
-            isSelected && styles.conversationItemSelected,
-          ]}
-          onPress={() => onSelectConversation(item.conversationId)}
-          activeOpacity={0.7}
-        >
-          <View style={styles.avatarContainer}>
-            {hasValidIcon ? (
-              <Image source={{ uri: item.icon }} style={styles.avatar} />
-            ) : (
-              <DefaultAvatar address={item.address || ''} size={48} />
-            )}
-            {hasUnread && <View style={styles.unreadBadge} />}
-            {/* Farcaster indicator badge - shows this is NOT E2EE */}
-            {isFarcaster && (
-              <View style={styles.farcasterBadge}>
-                <Image source={FarcasterLogo} style={styles.farcasterIcon} />
-              </View>
-            )}
-          </View>
-
-          <View style={styles.conversationContent}>
-            <View style={styles.conversationHeader}>
-              <Text
-                style={[styles.userName, hasUnread && styles.userNameUnread]}
-                numberOfLines={1}
-              >
-                {displayName}
-              </Text>
-              <Text style={styles.timestamp}>
-                {formatRelativeTime(item.timestamp)}
-              </Text>
-            </View>
-          </View>
-        </TouchableOpacity>
+        <DMConversationItem
+          item={item}
+          isSelected={selectedConversation === item.conversationId}
+          styles={styles}
+          theme={theme}
+          isFavorite={isFavorite?.(item.conversationId) ?? false}
+          isMuted={isMuted?.(item.conversationId) ?? false}
+          onSelect={onSelectConversation}
+          onToggleFavorite={onToggleFavorite}
+          onToggleMute={onToggleMute}
+        />
       );
     },
-    [styles, selectedConversation, onSelectConversation]
+    [styles, selectedConversation, onSelectConversation, theme, isFavorite, isMuted, onToggleFavorite, onToggleMute]
   );
-
-  // Loading state
-  if (isLoading && conversations.length === 0) {
-    return (
-      <View style={[styles.container, styles.centerContent]}>
-        <ActivityIndicator size="large" color={theme.colors.primary} />
-        <Text style={styles.loadingText}>Loading conversations...</Text>
-      </View>
-    );
-  }
 
   // Error state
   if (error && conversations.length === 0) {
@@ -182,18 +323,45 @@ export function DirectMessagesList({
     <View style={styles.container}>
       <View style={styles.header}>
         <Text style={styles.headerTitle}>Messages</Text>
-        {onNewConversation && (
-          <TouchableOpacity style={styles.newButton} onPress={onNewConversation}>
-            <IconSymbol name="square.and.pencil" size={20} color={theme.colors.primary} />
-          </TouchableOpacity>
-        )}
+        <View style={styles.headerActions}>
+          {onNewConversation && (
+            <TouchableOpacity style={styles.newButton} onPress={onNewConversation}>
+              <IconSymbol name="square.and.pencil" size={20} color={theme.colors.primary} />
+            </TouchableOpacity>
+          )}
+        </View>
       </View>
 
-      <FlatList
-        data={conversations}
+      {/* Filter chips */}
+      {(isFavorite || isMuted) && (
+        <View style={styles.filterContainer}>
+          {(['all', 'favorites', 'unknown', 'muted'] as DMFilter[]).map((filter) => (
+            <TouchableOpacity
+              key={filter}
+              style={[
+                styles.filterChip,
+                activeFilter === filter && styles.filterChipActive,
+              ]}
+              onPress={() => setActiveFilter(filter)}
+            >
+              <Text
+                style={[
+                  styles.filterChipText,
+                  activeFilter === filter && styles.filterChipTextActive,
+                ]}
+              >
+                {filter === 'all' ? 'All' : filter === 'favorites' ? 'Favorites' : filter === 'unknown' ? 'Unknown' : 'Muted'}
+              </Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+      )}
+
+      <FlashList
+        data={filteredConversations}
         keyExtractor={(item) => item.conversationId}
         renderItem={renderItem}
-        style={styles.list}
+        estimatedItemSize={73}
         refreshControl={
           onRefresh ? (
             <RefreshControl
@@ -204,12 +372,21 @@ export function DirectMessagesList({
             />
           ) : undefined
         }
+        onEndReached={hasNextPage && !isFetchingNextPage ? onEndReached : undefined}
+        onEndReachedThreshold={0.5}
+        ListFooterComponent={
+          isFetchingNextPage ? (
+            <View style={styles.loadingFooter}>
+              <ActivityIndicator size="small" color={theme.colors.primary} />
+            </View>
+          ) : null
+        }
       />
     </View>
   );
 }
 
-const createStyles = (theme: any) =>
+const createStyles = (theme: AppTheme) =>
   StyleSheet.create({
     container: {
       flex: 1,
@@ -235,11 +412,42 @@ const createStyles = (theme: any) =>
       fontWeight: theme.fonts.bold.fontWeight,
       color: theme.colors.textStrong,
     },
+    headerActions: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 4,
+    },
+    headerActionButton: {
+      padding: 8,
+    },
     newButton: {
       padding: 8,
     },
-    list: {
-      flex: 1,
+    filterContainer: {
+      flexDirection: 'row',
+      paddingHorizontal: 12,
+      paddingVertical: 8,
+      gap: 8,
+      borderBottomWidth: 1,
+      borderBottomColor: theme.colors.surface3,
+    },
+    filterChip: {
+      paddingHorizontal: 12,
+      paddingVertical: 6,
+      borderRadius: 16,
+      backgroundColor: theme.colors.surface3 ?? theme.colors.surface2,
+    },
+    filterChipActive: {
+      backgroundColor: theme.colors.primary,
+    },
+    filterChipText: {
+      fontSize: 13,
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
+      color: theme.colors.textMuted,
+    },
+    filterChipTextActive: {
+      color: '#fff',
     },
     conversationItem: {
       flexDirection: 'row',
@@ -325,6 +533,10 @@ const createStyles = (theme: any) =>
     messagePreviewUnread: {
       color: theme.colors.textMain,
     },
+    previewSender: {
+      fontFamily: theme.fonts.medium.fontFamily,
+      fontWeight: theme.fonts.medium.fontWeight,
+    },
     loadingText: {
       marginTop: 12,
       fontSize: 14,
@@ -376,6 +588,10 @@ const createStyles = (theme: any) =>
       fontFamily: theme.fonts.medium.fontFamily,
       fontWeight: theme.fonts.medium.fontWeight,
       color: '#fff',
+    },
+    loadingFooter: {
+      paddingVertical: 16,
+      alignItems: 'center',
     },
   });
 

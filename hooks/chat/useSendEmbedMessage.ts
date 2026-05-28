@@ -2,7 +2,6 @@
  * useSendEmbedMessage - Hook for sending image/embed messages to space channels
  */
 
-import { logger } from '@quilibrium/quorum-shared';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { useAuth, useWebSocket } from '@/context';
 import { sendEmbedMessage } from '@/services/space/spaceMessageService';
@@ -17,6 +16,8 @@ export interface UseSendEmbedMessageParams {
   width?: number;
   height?: number;
   isLargeGif?: boolean;
+  /** Optional text to accompany the image */
+  text?: string;
 }
 
 export function useSendEmbedMessage() {
@@ -26,8 +27,6 @@ export function useSendEmbedMessage() {
 
   return useMutation({
     mutationFn: async (params: UseSendEmbedMessageParams) => {
-      logger.log('[useSendEmbedMessage] Sending embed message');
-
       if (!user?.address) {
         throw new Error('User must be logged in to send messages');
       }
@@ -44,6 +43,7 @@ export function useSendEmbedMessage() {
         thumbnailUrl: params.thumbnailUrl,
         width: params.width?.toString(),
         height: params.height?.toString(),
+        text: params.text,
       });
 
       // Send via WebSocket
@@ -51,7 +51,6 @@ export function useSendEmbedMessage() {
         return [result.wsEnvelope];
       });
 
-      logger.log('[useSendEmbedMessage] Embed message queued:', result.message.messageId);
       return result.message;
     },
 
@@ -86,13 +85,14 @@ export function useSendEmbedMessage() {
           thumbnailUrl: params.thumbnailUrl,
           width: params.width?.toString(),
           height: params.height?.toString(),
-        } as EmbedMessage,
+          text: params.text,
+        } as EmbedMessage & { text?: string },
         reactions: [],
         mentions: { memberIds: [], roleIds: [], channelIds: [] },
         sendStatus: 'sending',
       };
 
-      // Optimistically add to cache
+      // Optimistically add to cache (append to end like text messages)
       queryClient.setQueryData(
         key,
         (old: { pages: GetMessagesResult[]; pageParams: unknown[] } | undefined) => {
@@ -104,7 +104,7 @@ export function useSendEmbedMessage() {
               if (index === 0) {
                 return {
                   ...page,
-                  messages: [optimisticMessage, ...page.messages],
+                  messages: [...page.messages, optimisticMessage],
                 };
               }
               return page;
@@ -117,8 +117,6 @@ export function useSendEmbedMessage() {
     },
 
     onError: (err, params, context) => {
-      console.error('[useSendEmbedMessage] Error:', err);
-
       // Rollback on error
       if (context?.previousData) {
         const key = ['messages', 'infinite', params.spaceId, params.channelId];

@@ -8,6 +8,11 @@ import { clearConfigStorage } from '../config';
 const storage: MMKV = createMMKV({ id: 'quorum-cache' });
 
 /**
+ * Wallet balance cache storage
+ */
+const walletCacheStorage: MMKV = createMMKV({ id: 'quorum-wallet-cache' });
+
+/**
  * Storage adapter that matches React Query's persist interface.
  */
 export const mmkvStorage = {
@@ -43,14 +48,28 @@ export const mutationQueueStorage = {
 };
 
 /**
- * Clear all MMKV storage data (cache, mutations, encryption states, and config)
- * Used during app reset / sign out
+ * Clear all MMKV storage data (cache, mutations, encryption states, wallet cache, and config)
+ * Used during app reset / sign out.
+ *
+ * Also clears the SQLite messages database so the previous identity's
+ * chat history doesn't leak into a re-onboarded identity on the same
+ * device. The messages module is lazy-required to avoid a circular
+ * dependency at module load (messagesDb imports `storage` from here).
  */
 export function clearAllMMKVStorage(): void {
   storage.clearAll();
   mutationStorage.clearAll();
+  walletCacheStorage.clearAll();
   encryptionStateStorage.clearAll();
   clearConfigStorage();
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const messagesDb = require('../storage/messagesDb') as typeof import('../storage/messagesDb');
+    messagesDb.clearAllMessages();
+  } catch {
+    // If the messages module hasn't been initialized yet (sign-out before
+    // first message read), there's nothing to clear.
+  }
 }
 
 /**

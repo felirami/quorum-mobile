@@ -1,0 +1,392 @@
+/**
+ * DM chat screen — wraps DMChatArea with data hooks.
+ */
+
+import { DMChatArea, type MessageUserInfo } from '@/components/Chat';
+import { FarcasterDirectMessageView } from '@/components/Chat/FarcasterDirectMessageView';
+import { DefaultAvatar } from '@/components/ui/DefaultAvatar';
+import { IconSymbol } from '@/components/ui/IconSymbol';
+import { useConversation } from '@/hooks/chat/useConversations';
+import { useUnifiedConversations } from '@/hooks/chat/useUnifiedConversations';
+import { useUserPublicProfile } from '@/hooks/useUserPublicProfile';
+import { useBookmarks } from '@/hooks/useUserConfig';
+import { useCall } from '@/context';
+import { truncateAddress } from '@/utils/formatAddress';
+import { useTheme } from '@/theme';
+import { useBottomTabBarHeight } from '@react-navigation/bottom-tabs';
+import { router, Stack, useLocalSearchParams } from 'expo-router';
+import React, { Suspense, useCallback, useMemo, useRef, useState } from 'react';
+import { ActivityIndicator, Image, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+
+const BrowserModal = React.lazy(() => import('@/components/BrowserModal'));
+const UserProfileModal = React.lazy(() => import('@/components/UserProfileModal'));
+const DMSettingsSheet = React.lazy(() =>
+  import('@/components/Chat/DMSettingsSheet').then((m) => ({ default: m.DMSettingsSheet }))
+);
+
+export default function DMChatScreen() {
+  const params = useLocalSearchParams<{ id: string }>();
+  const conversationId = typeof params.id === 'string' ? decodeURIComponent(params.id) : undefined;
+
+  const { theme } = useTheme();
+  const insets = useSafeAreaInsets();
+  const tabBarHeight = useBottomTabBarHeight();
+  const containerStyle = useMemo(
+    () => [
+      styles.container,
+      {
+        paddingBottom: tabBarHeight,
+        backgroundColor: theme.colors.surface1,
+      },
+    ],
+    [tabBarHeight, theme.colors.surface1]
+  );
+
+  // Grab the conversation from unified conversations first (has richest data)
+  const { conversations } = useUnifiedConversations();
+  const conversationFromList = useMemo(
+    () => conversations.find((c) => c.conversationId === conversationId),
+    [conversations, conversationId]
+  );
+
+  const isFarcasterConversation = conversationId?.startsWith('farcaster:') ?? false;
+
+  // Fall back to local storage if not yet in unified list
+  const { data: conversationFromStorage } = useConversation(conversationId, {
+    enabled: !!conversationId && !isFarcasterConversation && !conversationFromList,
+  });
+
+  const conversationBase = conversationFromList ?? conversationFromStorage;
+
+  const recipientAddress = useMemo(() => {
+    if (!conversationId || isFarcasterConversation) return undefined;
+    return conversationId.split('/')[0];
+  }, [conversationId, isFarcasterConversation]);
+
+  // Fetch the recipient's public profile for back-fill. DMChatArea's
+  // member map already does this, but the screen-level header needs it
+  // independently — the recipient might not be in any space member
+  // list yet, and the local Conversation row often has an empty
+  // displayName/icon if no message has been received yet.
+  const recipientPublicProfile = useUserPublicProfile(recipientAddress, {
+    enabled: !!recipientAddress && !isFarcasterConversation,
+  }).data;
+
+  // Merge: public profile fills gaps left by the local conversation row.
+  // Preference order favors the LOCAL row (manually entered display
+  // name, chat-broadcasted profile updates) over the public profile;
+  // public profile is used only when the local fields are empty.
+  const conversation = useMemo(() => {
+    if (!conversationBase) return conversationBase;
+    if (!recipientPublicProfile) return conversationBase;
+    return {
+      ...conversationBase,
+      displayName: conversationBase.displayName || recipientPublicProfile.display_name,
+      icon: conversationBase.icon || recipientPublicProfile.profile_image,
+    };
+  }, [conversationBase, recipientPublicProfile]);
+
+  const { bookmarks, addBookmark, removeBookmark, isBookmarked } = useBookmarks();
+
+  const draftsRef = useRef<Map<string, string>>(new Map());
+
+  const [selectedMiniApp, setSelectedMiniApp] = useState<{
+    url: string;
+    isQNative: boolean;
+    timestamp: number;
+    fromChatLink?: boolean;
+  } | null>(null);
+  const [selectedUserProfile, setSelectedUserProfile] = useState<MessageUserInfo | null>(null);
+  const [settingsVisible, setSettingsVisible] = useState(false);
+
+  const handleShowSidebars = useCallback(() => {
+    router.back();
+  }, []);
+
+  const handleUserPress = useCallback((info: MessageUserInfo) => {
+    // For an avatar tap in a DM, MessagesList has no `members` prop to
+    // draw Farcaster linkage from (it's space-only), so anything other
+    // than the basics arrives undefined. When the tapped user is the
+    // counterparty of THIS conversation, enrich from the conversation
+    // record itself (Farcaster DMs always carry these; Quorum DMs may
+    // have them populated via the peer's public profile / registration).
+    if (
+      conversation &&
+      conversation.address &&
+      info.userId === conversation.address &&
+      (info.farcasterFid === undefined || !info.farcasterUsername)
+    ) {
+      setSelectedUserProfile({
+        ...info,
+        farcasterFid: info.farcasterFid ?? conversation.farcasterFid,
+        farcasterUsername: info.farcasterUsername ?? conversation.farcasterUsername,
+      });
+      return;
+    }
+    setSelectedUserProfile(info);
+  }, [conversation]);
+
+  const handleLinkPress = useCallback((url: string) => {
+    setSelectedMiniApp({ url, isQNative: false, timestamp: Date.now(), fromChatLink: true });
+  }, []);
+
+  const handleOpenFarcasterCast = useCallback((username: string, castHashPrefix: string) => {
+    router.push({ pathname: '/feed', params: { username, castHashPrefix } });
+  }, []);
+
+  const handleJoinSpaceFromLink = useCallback((spaceId: string, channelId: string) => {
+    router.push(`/spaces/${spaceId}/${channelId}`);
+  }, []);
+
+  const handleOpenDmSettings = useCallback(() => {
+    setSettingsVisible(true);
+  }, []);
+
+  const { initiateCall } = useCall();
+  const handleCallPress = useCallback(() => {
+    if (!conversationId || !recipientAddress || !conversation) return;
+    initiateCall({
+      conversationId,
+      recipientAddress,
+      recipientDisplayName: conversation.displayName || recipientAddress.slice(0, 12),
+      recipientAvatar: conversation.icon || '',
+      mediaType: 'audio',
+    });
+  }, [conversationId, recipientAddress, conversation, initiateCall]);
+
+  const handleVideoCallPress = useCallback(() => {
+    if (!conversationId || !recipientAddress || !conversation) return;
+    initiateCall({
+      conversationId,
+      recipientAddress,
+      recipientDisplayName: conversation.displayName || recipientAddress.slice(0, 12),
+      recipientAvatar: conversation.icon || '',
+      mediaType: 'video',
+    });
+  }, [conversationId, recipientAddress, conversation, initiateCall]);
+
+  // Title + header components are declared BEFORE the early returns so
+  // their hooks run in the same order on every render. Previously these
+  // sat below the `if (!conversation) return ...` guards, which made
+  // the hook count jump between the first render (no conversation, 59
+  // hooks) and the second (conversation arrived, 61 hooks). React's
+  // hook-order check fires that exact path.
+  const title =
+    conversation?.displayName ||
+    (conversation?.address ? truncateAddress(conversation.address, 'long') : 'Conversation');
+
+  const headerRight = useCallback(() => (
+    <View style={styles.headerRight}>
+      {!isFarcasterConversation && (
+        <>
+          <TouchableOpacity onPress={handleVideoCallPress} hitSlop={8}>
+            <IconSymbol name="video" color={theme.colors.primary} size={20} />
+          </TouchableOpacity>
+          <TouchableOpacity onPress={handleCallPress} hitSlop={8}>
+            <IconSymbol name="phone" color={theme.colors.primary} size={20} />
+          </TouchableOpacity>
+          <TouchableOpacity onPress={() => setSettingsVisible(true)} hitSlop={8}>
+            <IconSymbol name="info.circle" color={theme.colors.primary} size={20} />
+          </TouchableOpacity>
+        </>
+      )}
+    </View>
+  ), [theme, isFarcasterConversation, handleVideoCallPress, handleCallPress]);
+
+  // Tapping the avatar or name in the header opens the same profile
+  // modal that tapping a pfp inside the chat opens. Builds a minimal
+  // MessageUserInfo from the conversation row + public-profile merge.
+  const handleHeaderPress = useCallback(() => {
+    if (!conversation || !conversation.address) return;
+    setSelectedUserProfile({
+      userId: conversation.address,
+      userName: conversation.displayName || conversation.address.slice(0, 12),
+      userAvatar: conversation.icon,
+      // Forward Farcaster linkage from the conversation row so the
+      // profile modal can render the linked-FC row. Without this the
+      // header-tap path looked identical to a Farcaster-less profile
+      // even on conversations where we have the FID and username.
+      farcasterFid: conversation.farcasterFid,
+      farcasterUsername: conversation.farcasterUsername,
+    });
+  }, [conversation]);
+
+  const headerTitle = useCallback(() => {
+    if (!conversation) return null;
+    return (
+      <TouchableOpacity
+        onPress={handleHeaderPress}
+        activeOpacity={0.7}
+        hitSlop={8}
+        style={styles.headerTitle}
+        accessibilityLabel={`Open ${title}'s profile`}
+      >
+        {conversation.icon ? (
+          <Image source={{ uri: conversation.icon }} style={styles.headerAvatar} />
+        ) : (
+          <DefaultAvatar address={conversation.address || ''} size={28} />
+        )}
+        <Text style={[styles.headerName, { color: theme.colors.textMain }]} numberOfLines={1}>
+          {title}
+        </Text>
+      </TouchableOpacity>
+    );
+  }, [conversation, title, theme, handleHeaderPress]);
+
+  if (!conversationId) {
+    return (
+      <View style={containerStyle}>
+        <Stack.Screen options={{ title: 'Chat' }} />
+      </View>
+    );
+  }
+
+  if (!conversation) {
+    return (
+      <View style={containerStyle}>
+        <Stack.Screen options={{ title: 'Loading...' }} />
+        <View style={styles.center}>
+          <ActivityIndicator size="large" color={theme.colors.primary} />
+        </View>
+      </View>
+    );
+  }
+
+  // Farcaster DM gets its own specialized view
+  if (isFarcasterConversation) {
+    return (
+      <View style={containerStyle}>
+        <Stack.Screen options={{ title, headerTitle, headerRight }} />
+        <FarcasterDirectMessageView
+          conversation={conversation}
+          onBack={handleShowSidebars}
+          theme={theme}
+          onOpenFarcasterCast={handleOpenFarcasterCast}
+          onLinkPress={handleLinkPress}
+          bottomInset={0}
+          tabBarHeight={tabBarHeight}
+        />
+
+        {selectedMiniApp !== null && (
+          <Suspense fallback={null}>
+            <BrowserModal
+              visible
+              url={selectedMiniApp.url}
+              isQNative={selectedMiniApp.isQNative}
+              timestamp={selectedMiniApp.timestamp}
+              onClose={() => setSelectedMiniApp(null)}
+              allowInsecureLAN={selectedMiniApp.fromChatLink ?? false}
+            />
+          </Suspense>
+        )}
+      </View>
+    );
+  }
+
+  return (
+    <View style={containerStyle}>
+      <Stack.Screen options={{ title, headerTitle, headerRight }} />
+
+      <DMChatArea
+        conversationId={conversationId}
+        conversationData={conversation}
+        isFarcasterConversation={false}
+        recipientAddress={recipientAddress}
+        onShowSidebars={handleShowSidebars}
+        onUserPress={handleUserPress}
+        onLinkPress={handleLinkPress}
+        onOpenFarcasterCast={handleOpenFarcasterCast}
+        onJoinSpaceFromLink={handleJoinSpaceFromLink}
+        onOpenDmSettings={handleOpenDmSettings}
+        onCallPress={handleCallPress}
+        onVideoCallPress={handleVideoCallPress}
+        bookmarks={bookmarks}
+        isBookmarked={isBookmarked}
+        addBookmark={addBookmark}
+        removeBookmark={removeBookmark}
+        tabBarHeight={tabBarHeight}
+        theme={theme}
+        draftsRef={draftsRef}
+      />
+
+      {selectedMiniApp !== null && (
+        <Suspense fallback={null}>
+          <BrowserModal
+            visible
+            url={selectedMiniApp.url}
+            isQNative={selectedMiniApp.isQNative}
+            timestamp={selectedMiniApp.timestamp}
+            onClose={() => setSelectedMiniApp(null)}
+            allowInsecureLAN={selectedMiniApp.fromChatLink ?? false}
+          />
+        </Suspense>
+      )}
+
+      {selectedUserProfile && (
+        <Suspense fallback={null}>
+          <UserProfileModal
+            visible
+            onClose={() => setSelectedUserProfile(null)}
+            user={selectedUserProfile}
+            onOpenFarcasterProfile={({ fid, username }) => {
+              setSelectedUserProfile(null);
+              router.push({
+                pathname: '/(tabs)/feed',
+                params: {
+                  profileFid: String(fid),
+                  ...(username ? { profileUsername: username } : {}),
+                },
+              });
+            }}
+          />
+        </Suspense>
+      )}
+
+      {settingsVisible && (
+        <Suspense fallback={null}>
+          <DMSettingsSheet
+            visible
+            onClose={() => setSettingsVisible(false)}
+            conversationId={conversationId}
+            displayName={title}
+            theme={theme}
+            isRepudiable={conversation.isRepudiable}
+            saveEditHistory={conversation.saveEditHistory}
+          />
+        </Suspense>
+      )}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+  },
+  center: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  headerTitle: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  headerAvatar: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+  },
+  headerName: {
+    fontSize: 17,
+    fontWeight: '600',
+    maxWidth: 180,
+  },
+  headerRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 16,
+  },
+});

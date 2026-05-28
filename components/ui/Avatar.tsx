@@ -1,6 +1,5 @@
 import React, { useState } from 'react';
 import {
-  Image,
   ImageSourcePropType,
   StyleSheet,
   Text,
@@ -8,7 +7,11 @@ import {
   View,
   ViewStyle,
 } from 'react-native';
-import { useTheme } from '@/theme';
+import { Image } from 'expo-image';
+import { useTheme, type AppTheme } from '@/theme';
+
+// expo-image caching policy for avatars
+const AVATAR_CACHE_POLICY = 'disk' as const;
 
 type AvatarSize = 'xs' | 'sm' | 'md' | 'lg' | 'xl';
 
@@ -89,6 +92,8 @@ export function Avatar({
         <Image
           source={imageSource}
           style={styles.image}
+          cachePolicy={AVATAR_CACHE_POLICY}
+          transition={0}
           onError={() => setImageError(true)}
         />
       ) : shouldShowFallback ? (
@@ -121,7 +126,7 @@ export function Avatar({
 }
 
 const createStyles = (
-  theme: any,
+  theme: AppTheme,
   dimension: number,
   fontSize: number,
   badgeColor?: string

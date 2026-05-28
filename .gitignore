@@ -3,6 +3,10 @@
 # dependencies
 node_modules/
 
+# Local-only snapshot of iOS customizations taken before expo prebuild.
+# See PREBUILD.md.
+.ios-snapshot/
+
 # Expo
 .expo/
 dist/
@@ -37,3 +41,6 @@ yarn-error.*
 *.tsbuildinfo
 
 app-example
+
+# build
+modules/quorum-crypto/android/build/

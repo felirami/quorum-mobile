@@ -9,7 +9,6 @@
  * Mirrors the desktop's MessageService encryption flow.
  */
 
-import { logger } from '@quilibrium/quorum-shared';
 import { NativeCryptoProvider } from './native-provider';
 import {
   encryptionStateStorage,
@@ -25,12 +24,6 @@ import type {
   SealedMessage,
   UnsealedEnvelope,
 } from '@quilibrium/quorum-shared';
-
-// Global log prefix for identifying device in logs
-let logPrefix = '[E2E]';
-export function setE2ELogPrefix(userAddress: string): void {
-  logPrefix = `[E2E:${userAddress.substring(0, 8)}]`;
-}
 
 // Session key length for X3DH (96 bytes = 32 session + 32 send header + 32 recv header)
 const SESSION_KEY_LENGTH = 96;
@@ -126,12 +119,6 @@ class EncryptionService {
         conversationId,
         latestState.inboxId
       );
-      logger.log(`${logPrefix} Found existing session via latestState:`, {
-        latestInboxId: latestState.inboxId.substring(0, 12),
-        foundState: !!encryptionState,
-      });
-    } else {
-      logger.log(`${logPrefix} No latestState for conversation, will establish new session`);
     }
 
     // Track if this is a new session (first message)
@@ -161,20 +148,6 @@ class EncryptionService {
     // Encrypt message using Double Ratchet
     const messageBytes = Array.from(textEncoder.encode(plaintext));
 
-    // Log state before encryption for debugging
-    logger.log(`${logPrefix} encryptMessage - state before encrypt:`, {
-      inboxId: inboxAddress.substring(0, 12),
-      stateLength: state.state?.length,
-    });
-    try {
-      const parsedState = JSON.parse(state.state);
-      logger.log(`${logPrefix} encryptMessage - parsed state keys:`, Object.keys(parsedState));
-      if (parsedState.sending_chain) {
-        logger.log(`${logPrefix} encryptMessage - sending_chain.n before:`, parsedState.sending_chain.n);
-      }
-    } catch (e) {
-      logger.log(`${logPrefix} encryptMessage - could not parse state:`, e);
-    }
 
     const stateAndMessage: DoubleRatchetStateAndMessage = {
       ratchet_state: state.state,
@@ -182,9 +155,6 @@ class EncryptionService {
     };
 
     const result = await this.cryptoProvider.doubleRatchetEncrypt(stateAndMessage);
-
-    logger.log(`${logPrefix} encryptMessage - encrypted, envelope length:`, result.envelope?.length);
-    logger.log(`${logPrefix} encryptMessage - envelope preview (100):`, result.envelope?.substring(0, 100));
 
     // Save updated state - preserve sendingInbox, tag, and X3DH ephemeral keys
     const newState: EncryptionState = {
@@ -210,18 +180,92 @@ class EncryptionService {
   }
 
   /**
+   * Encrypt a message for a specific device, always establishing a new session.
+   *
+   * This is used for multi-device support where we need to send to devices
+   * that don't have an existing session, even if the conversation already
+   * has sessions with other devices.
+   *
+   * @param conversationId - The conversation ID
+   * @param recipientInfo - The target device's encryption info
+   * @param plaintext - The message to encrypt
+   * @param senderDeviceInboxAddress - The sender's inbox for this device session
+   * @param deviceTag - A unique tag for this device (usually the device's inbox address)
+   */
+  async encryptMessageForNewDevice(
+    conversationId: string,
+    recipientInfo: RecipientInfo,
+    plaintext: string,
+    senderDeviceInboxAddress: string,
+    deviceTag: string
+  ): Promise<EncryptedEnvelope> {
+    if (!this.deviceKeys) {
+      throw new Error('Device keys not initialized');
+    }
+
+    const { inboxAddress } = recipientInfo;
+
+    // Always establish a new session for this device
+    const sessionResult = await this.establishSession(
+      conversationId,
+      recipientInfo,
+      senderDeviceInboxAddress
+    );
+
+    const encryptionState = sessionResult.state;
+    const ephemeralPublicKey = sessionResult.ephemeralPublicKey;
+    const ephemeralPrivateKey = sessionResult.ephemeralPrivateKey;
+
+    // Encrypt message using Double Ratchet
+    const messageBytes = Array.from(textEncoder.encode(plaintext));
+
+    const stateAndMessage: DoubleRatchetStateAndMessage = {
+      ratchet_state: encryptionState.state,
+      message: messageBytes,
+    };
+
+    const result = await this.cryptoProvider.doubleRatchetEncrypt(stateAndMessage);
+
+    // Save state with the device tag so we can track sessions per-device
+    // Note: We save under the senderDeviceInboxAddress (our inbox for this device)
+    // but use the deviceTag to identify which device this session is for
+    const newState: EncryptionState = {
+      state: result.ratchet_state,
+      timestamp: Date.now(),
+      conversationId,
+      inboxId: senderDeviceInboxAddress, // Our receiving inbox for this device
+      sentAccept: false,
+      sendingInbox: {
+        inbox_address: recipientInfo.inboxAddress,
+        inbox_encryption_key: recipientInfo.inboxEncryptionKey
+          ? this.bytesToHex(recipientInfo.inboxEncryptionKey)
+          : '',
+        inbox_public_key: '', // Will be set when we receive their reply
+        inbox_private_key: '', // Never have their private key
+      },
+      tag: deviceTag, // Tag with device inbox to identify this session
+      x3dhEphemeralPublicKey: this.bytesToHex(ephemeralPublicKey),
+      x3dhEphemeralPrivateKey: this.bytesToHex(ephemeralPrivateKey),
+    };
+    encryptionStateStorage.saveEncryptionState(newState, false); // Don't update latest - multi-device
+
+    return {
+      envelope: result.envelope,
+      inboxAddress,
+      ephemeralPublicKey,
+      ephemeralPrivateKey,
+    };
+  }
+
+  /**
    * Decrypt a message from a conversation
+   * Returns null if decryption fails (expected in multi-device scenarios)
    */
   async decryptMessage(
     conversationId: string,
     senderInboxAddress: string,
     envelope: string
-  ): Promise<string> {
-    logger.log(`${logPrefix} decryptMessage called:`, {
-      conversationId: conversationId.substring(0, 30),
-      senderInboxAddress: senderInboxAddress.substring(0, 12),
-    });
-
+  ): Promise<string | null> {
     // Get the encryption state for this specific inbox
     // IMPORTANT: Do NOT fall back to other states - each inbox has its own session
     // If we don't have a state for this inbox, the message cannot be decrypted
@@ -230,91 +274,41 @@ class EncryptionService {
       senderInboxAddress
     );
 
-    if (encryptionState) {
-      logger.log(`${logPrefix} Found state for inbox ${senderInboxAddress.substring(0, 12)}`);
-    } else {
-      logger.log(`${logPrefix} No state for inbox ${senderInboxAddress.substring(0, 12)}`);
-      // Log what states we DO have for debugging
-      const allStates = encryptionStateStorage.getEncryptionStates(conversationId);
-      logger.log(`${logPrefix} Available states for conversation (${allStates.length}):`);
-      for (const s of allStates) {
-        logger.log(`${logPrefix}   - inboxId: ${s.inboxId.substring(0, 12)}, timestamp: ${s.timestamp}`);
-      }
-    }
-
     if (!encryptionState) {
-      throw new Error(`No encryption state found for conversation ${conversationId}`);
-    }
-
-    // Log state details for debugging
-    logger.log(`${logPrefix} State details:`, {
-      inboxId: encryptionState.inboxId.substring(0, 12),
-      timestamp: encryptionState.timestamp,
-      stateLength: encryptionState.state?.length,
-    });
-
-    // Parse state to log key details
-    try {
-      const parsedState = JSON.parse(encryptionState.state);
-      logger.log(`${logPrefix} Parsed state keys:`, Object.keys(parsedState));
-      logger.log(`${logPrefix} Parsed state has sending_chain:`, 'sending_chain' in parsedState);
-      logger.log(`${logPrefix} Parsed state has receiving_chain:`, 'receiving_chain' in parsedState);
-      // Log chain counters if available
-      if (parsedState.sending_chain) {
-        logger.log(`${logPrefix} sending_chain.n:`, parsedState.sending_chain.n);
-      }
-      if (parsedState.receiving_chain) {
-        logger.log(`${logPrefix} receiving_chain.n:`, parsedState.receiving_chain.n);
-      }
-    } catch (e) {
-      logger.log(`${logPrefix} Could not parse state for diagnostics:`, e);
+      // No session for this inbox - expected in multi-device scenarios
+      return null;
     }
 
     // Handle escaped envelope (backslash-quote sequences from JSON encoding)
     // This happens when the envelope was JSON-stringified during transport
     let cleanEnvelope = envelope;
     if (cleanEnvelope.includes('\\"') || cleanEnvelope.includes('\\\\')) {
-      logger.log(`${logPrefix} decryptMessage - envelope contains escapes, unescaping`);
       cleanEnvelope = cleanEnvelope
         .replace(/\\"/g, '"')
         .replace(/\\\\/g, '\\');
     }
-
-    logger.log(`${logPrefix} decryptMessage - envelope length:`, cleanEnvelope?.length);
-    logger.log(`${logPrefix} decryptMessage - envelope type:`, typeof cleanEnvelope);
-    logger.log(`${logPrefix} decryptMessage - envelope preview:`, typeof cleanEnvelope === 'string' ? cleanEnvelope.substring(0, 100) : 'not string');
-
-    // Decrypt using Double Ratchet
-    logger.log(`${logPrefix} About to decrypt, envelope length:`, cleanEnvelope.length);
-    logger.log(`${logPrefix} Envelope preview (100):`, cleanEnvelope.substring(0, 100));
-    logger.log(`${logPrefix} State to use preview (100):`, encryptionState.state.substring(0, 100));
 
     const stateAndEnvelope: DoubleRatchetStateAndEnvelope = {
       ratchet_state: encryptionState.state,
       envelope: cleanEnvelope,
     };
 
-    let result;
-    try {
-      result = await this.cryptoProvider.doubleRatchetDecrypt(stateAndEnvelope);
-    } catch (decryptError) {
-      console.error(`${logPrefix} doubleRatchetDecrypt threw error:`, decryptError);
-      throw decryptError;
-    }
+    const result = await this.cryptoProvider.doubleRatchetDecrypt(stateAndEnvelope);
 
-    logger.log(`${logPrefix} decryptMessage - result.message length:`, result.message?.length);
-    logger.log(`${logPrefix} decryptMessage - result.message type:`, typeof result.message);
-    logger.log(`${logPrefix} decryptMessage - result.message bytes (first 20):`, result.message?.slice(0, 20));
+    // Check for decryption failure (returned as result with empty message and error)
+    const resultWithError = result as typeof result & { decryptionError?: string };
+    if (resultWithError.decryptionError || result.message.length === 0) {
+      // Expected in multi-device scenarios - return null instead of throwing
+      return null;
+    }
 
     // Convert bytes back to string FIRST, before saving state
     const decryptedText = textDecoder.decode(new Uint8Array(result.message));
-    logger.log(`${logPrefix} decryptMessage - decrypted text length:`, decryptedText?.length);
 
     // CRITICAL: Check if decryption actually succeeded before saving state
     // The native module sometimes returns error strings instead of throwing
     // If we save corrupted state, future decryption attempts will also fail
     if (decryptedText.startsWith('Decryption failed')) {
-      console.error(`${logPrefix} decryptMessage - native module returned error:`, decryptedText);
       throw new Error(decryptedText);
     }
 
@@ -336,7 +330,6 @@ class EncryptionService {
     // Save updated state but DON'T update latestState - this is a RECEIVE operation
     // The latestState tracks where to SEND messages (recipient's inbox), not where we received from
     encryptionStateStorage.saveEncryptionState(newState, false);
-    logger.log(`${logPrefix} decryptMessage - saved updated state under inboxId:`, encryptionState.inboxId.substring(0, 12));
 
     return decryptedText;
   }
@@ -368,9 +361,6 @@ class EncryptionService {
       session_key_length: SESSION_KEY_LENGTH,
     });
 
-    logger.log(`${logPrefix} senderX3DH result (first 100 chars):`, sessionKeyResult.substring(0, 100));
-    logger.log(`${logPrefix} senderX3DH result length:`, sessionKeyResult.length);
-
     // The result might be JSON-quoted, hex, or base64 - handle all cases
     let sessionKeyBytes: Uint8Array;
     let sessionKeyData = sessionKeyResult;
@@ -383,24 +373,15 @@ class EncryptionService {
     // Check if it's hex (all hex chars and even length, typically 192 chars for 96 bytes)
     const isHex = /^[0-9a-fA-F]+$/.test(sessionKeyData) && sessionKeyData.length % 2 === 0;
     if (isHex) {
-      logger.log(`${logPrefix} Session key appears to be hex encoded`);
       sessionKeyBytes = new Uint8Array(this.hexToBytes(sessionKeyData));
     } else {
-      logger.log(`${logPrefix} Session key appears to be base64 encoded`);
       sessionKeyBytes = this.base64ToBytes(sessionKeyData);
     }
 
     // Decode session key (96 bytes: 32 session + 32 send header + 32 recv header)
-    logger.log(`${logPrefix} Session key bytes length:`, sessionKeyBytes.length);
     const sessionKey = Array.from(sessionKeyBytes.slice(0, 32));
     const sendingHeaderKey = Array.from(sessionKeyBytes.slice(32, 64));
     const receivingHeaderKey = Array.from(sessionKeyBytes.slice(64, 96));
-
-    // Log first bytes of each key for debugging
-    logger.log(`${logPrefix} [SENDER] Session key first 8 bytes:`, sessionKey.slice(0, 8));
-    logger.log(`${logPrefix} [SENDER] Sending header key first 8 bytes:`, sendingHeaderKey.slice(0, 8));
-    logger.log(`${logPrefix} [SENDER] Receiving header key first 8 bytes:`, receivingHeaderKey.slice(0, 8));
-    logger.log(`${logPrefix} [SENDER] Ephemeral public key first 8 bytes:`, ephemeralKey.public_key.slice(0, 8));
 
     // Initialize Double Ratchet as sender
     const ratchetState = await this.cryptoProvider.newDoubleRatchet({
@@ -448,13 +429,6 @@ class EncryptionService {
     };
     encryptionStateStorage.saveEncryptionState(encryptionState, true);
     encryptionStateStorage.saveInboxMapping(senderDeviceInboxAddress, conversationId);
-
-    logger.log(`${logPrefix} Stored X3DH ephemeral key for reuse:`, this.bytesToHex(ephemeralKey.public_key).substring(0, 20) + '...');
-
-    logger.log(`${logPrefix} Saved session state:`, {
-      ourInbox: senderDeviceInboxAddress.substring(0, 12),
-      sendingTo: recipientInfo.inboxAddress.substring(0, 12),
-    });
 
     return {
       state: encryptionState,
@@ -546,8 +520,6 @@ class EncryptionService {
    * After reset, the next message will establish a fresh X3DH session.
    */
   resetSession(conversationId: string): void {
-    logger.log(`${logPrefix} Resetting session for conversation:`, conversationId.substring(0, 30));
-
     // Get all states to find ephemeral keys to clean up
     const states = encryptionStateStorage.getEncryptionStates(conversationId);
     for (const state of states) {
@@ -563,8 +535,6 @@ class EncryptionService {
     // NOTE: We intentionally do NOT delete:
     // - Conversation inbox keypairs (the addresses are still valid for receiving)
     // - Inbox mappings (routing still needs to work)
-
-    logger.log(`${logPrefix} Session reset complete for:`, conversationId.substring(0, 30));
   }
 
   /**
@@ -580,7 +550,7 @@ class EncryptionService {
     return null;
   }
 
-  // ============ Initialization Envelope Handling ============
+  // Initialization Envelope Handling
 
   /**
    * Unseal an initialization envelope (first message from a new sender)
@@ -598,10 +568,6 @@ class EncryptionService {
     // Parse the ephemeral public key from hex string to bytes
     const ephemeralPublicKey = this.hexToBytes(sealedMessage.ephemeral_public_key);
 
-    // Parse the envelope (it's a MessageCiphertext JSON)
-    logger.log(`${logPrefix} sealedMessage.envelope type:`, typeof sealedMessage.envelope);
-    logger.log(`${logPrefix} sealedMessage.envelope (first 500):`, sealedMessage.envelope.substring(0, 500));
-
     // The encryptInboxMessage returns a JSON string that might be quoted
     // Try to parse it, handling potential double-encoding
     let ciphertext: { ciphertext: string; initialization_vector: string; associated_data?: string };
@@ -609,21 +575,14 @@ class EncryptionService {
 
     // If the envelope starts with a quote, it might be a quoted JSON string
     if (envelopeStr.startsWith('"') && envelopeStr.endsWith('"')) {
-      logger.log(`${logPrefix} Envelope appears to be quoted, unquoting`);
       envelopeStr = JSON.parse(envelopeStr) as string;
     }
 
     try {
       ciphertext = JSON.parse(envelopeStr);
     } catch (parseError) {
-      console.error(`${logPrefix} Failed to parse envelope as JSON:`, parseError);
-      console.error(`${logPrefix} Envelope content:`, envelopeStr.substring(0, 1000));
       throw new Error(`Failed to parse sealed envelope: ${parseError}`);
     }
-
-    logger.log(`${logPrefix} Parsed ciphertext keys:`, Object.keys(ciphertext));
-    logger.log(`${logPrefix} Has ciphertext field:`, 'ciphertext' in ciphertext);
-    logger.log(`${logPrefix} Has initialization_vector field:`, 'initialization_vector' in ciphertext);
 
     // Decrypt the envelope using our inbox encryption private key and sender's ephemeral key
     const decryptedBytes = await this.cryptoProvider.decryptInboxMessage({
@@ -643,7 +602,6 @@ class EncryptionService {
     // The ephemeral_public_key is at the TOP LEVEL of SealedMessage, NOT inside the envelope.
     // We ALWAYS use sealedMessage.ephemeral_public_key for X3DH, regardless of what's in the envelope.
     envelope.ephemeral_public_key = sealedMessage.ephemeral_public_key;
-    logger.log(`${logPrefix} Using sealed message ephemeral key for X3DH:`, sealedMessage.ephemeral_public_key.substring(0, 20) + '...');
 
     return envelope;
   }
@@ -655,6 +613,7 @@ class EncryptionService {
    * It performs receiver-side X3DH and initializes the Double Ratchet.
    *
    * Returns the decrypted message, session info, and sender's user profile.
+   * Returns null if decryption fails (expected in multi-device scenarios).
    */
   async initializeRecipientSession(
     unsealed: UnsealedEnvelope,
@@ -676,18 +635,13 @@ class EncryptionService {
       displayName?: string;
       userIcon?: string;
     };
-  }> {
+  } | null> {
     if (!this.deviceKeys) {
       throw new Error('Device keys not initialized');
     }
 
     // Derive conversation ID from sender address
     const conversationId = `${unsealed.user_address}/${unsealed.user_address}`;
-
-    logger.log(`${logPrefix} initializeRecipientSession called:`);
-    logger.log(`${logPrefix}   receivedOnInboxAddress: ${receivedOnInboxAddress?.substring(0, 12)}`);
-    logger.log(`${logPrefix}   conversationId: ${conversationId.substring(0, 30)}`);
-    logger.log(`${logPrefix}   ephemeral_public_key: ${unsealed.ephemeral_public_key?.substring(0, 20)}...`);
 
     // FIRST: Check if we have a cached state for this specific ephemeral key
     // This handles multiple messages sent with the same X3DH session before our reply.
@@ -699,9 +653,6 @@ class EncryptionService {
     );
 
     if (ephemeralCachedState) {
-      logger.log(`${logPrefix} Found EPHEMERAL KEY cached state - using advanced ratchet`);
-      logger.log(`${logPrefix}   cached state inboxId: ${ephemeralCachedState.inboxId?.substring(0, 12)}`);
-
       // Decrypt using the cached (advanced) ratchet state
       let envelopeStr = unsealed.message;
       if (envelopeStr.includes('\\')) {
@@ -714,94 +665,81 @@ class EncryptionService {
       };
 
       const decryptResult = await this.cryptoProvider.doubleRatchetDecrypt(stateAndEnvelope);
-      const decryptedMessage = textDecoder.decode(new Uint8Array(decryptResult.message));
 
-      logger.log(`${logPrefix} Decrypted message with ephemeral-cached session:`, decryptedMessage.substring(0, 100));
+      // Check for decryption failure (returned as result with empty message and error)
+      const resultWithError = decryptResult as typeof decryptResult & { decryptionError?: string };
+      if (resultWithError.decryptionError || decryptResult.message.length === 0) {
+        // Decryption failed - fall through to try other methods
+        // Continue to next decryption attempt below
+      } else {
+        const decryptedMessage = textDecoder.decode(new Uint8Array(decryptResult.message));
 
-      // Check if decryption succeeded
-      if (decryptedMessage.startsWith('Decryption failed')) {
-        console.error(`${logPrefix} Ephemeral-cached session decrypt failed:`, decryptedMessage);
-        throw new Error(`Failed to parse double ratchet decrypt result: Double ratchet decryption error: ${decryptedMessage}`);
+        // Save the ADVANCED ratchet state back to ephemeral cache for next message
+        const updatedState: EncryptionState = {
+          ...ephemeralCachedState,
+          state: decryptResult.ratchet_state,
+          timestamp: Date.now(),
+        };
+        encryptionStateStorage.saveEphemeralKeyState(unsealed.ephemeral_public_key, conversationId, updatedState);
+        // Also save to regular state storage
+        encryptionStateStorage.saveEncryptionState(updatedState, false);
+
+        // Get our conversation inbox for the return value
+        const cachedConversationInbox = encryptionStateStorage.getConversationInboxKeypair(conversationId);
+
+        return {
+          conversationId,
+          message: decryptedMessage,
+          senderAddress: unsealed.user_address,
+          returnInbox: {
+            address: unsealed.return_inbox_address,
+            encryptionKey: unsealed.return_inbox_encryption_key,
+            publicKey: unsealed.return_inbox_public_key,
+            privateKey: unsealed.return_inbox_private_key,
+          },
+          ourConversationInbox: cachedConversationInbox?.inboxAddress || ephemeralCachedState.inboxId,
+          userProfile: {
+            displayName: unsealed.display_name,
+            userIcon: unsealed.user_icon,
+          },
+        };
       }
-
-      // Save the ADVANCED ratchet state back to ephemeral cache for next message
-      const updatedState: EncryptionState = {
-        ...ephemeralCachedState,
-        state: decryptResult.ratchet_state,
-        timestamp: Date.now(),
-      };
-      encryptionStateStorage.saveEphemeralKeyState(unsealed.ephemeral_public_key, conversationId, updatedState);
-      // Also save to regular state storage
-      encryptionStateStorage.saveEncryptionState(updatedState, false);
-
-      const conversationInbox = encryptionStateStorage.getConversationInboxKeypair(conversationId);
-      const userProfile = (unsealed.display_name || unsealed.user_icon)
-        ? { displayName: unsealed.display_name, userIcon: unsealed.user_icon }
-        : undefined;
-
-      return {
-        conversationId,
-        message: decryptedMessage,
-        senderAddress: unsealed.user_address,
-        returnInbox: {
-          address: unsealed.return_inbox_address,
-          encryptionKey: unsealed.return_inbox_encryption_key,
-          publicKey: unsealed.return_inbox_public_key,
-          privateKey: unsealed.return_inbox_private_key,
-        },
-        ourConversationInbox: conversationInbox?.inboxAddress || ephemeralCachedState.inboxId,
-        userProfile,
-      };
+      // If decryption failed, fall through to try other methods
     }
 
     // Check if we already have a session with this sender
     // If so, we should decrypt with the existing Double Ratchet instead of doing fresh X3DH
 
-    // Log ALL encryption states for this conversation to debug state mismatch
     const allStates = encryptionStateStorage.getEncryptionStates(conversationId);
-    logger.log(`${logPrefix} ALL states for conversation (${allStates.length}):`, allStates.map(s => ({
-      inboxId: s.inboxId?.substring(0, 12),
-      sendingInbox: s.sendingInbox?.inbox_address?.substring(0, 12),
-      tag: s.tag?.substring(0, 12),
-    })));
 
     // IMPORTANT: Try to find a state that matches the inbox we received this on
     // This handles the case where desktop is sending to mobile's device inbox
     // and we need to use the session state for that specific inbox
     const stateForReceivedInbox = allStates.find(s => s.inboxId === receivedOnInboxAddress || s.tag === receivedOnInboxAddress);
-    logger.log(`${logPrefix} stateForReceivedInbox (${receivedOnInboxAddress?.substring(0, 12)}):`, stateForReceivedInbox ? {
-      inboxId: stateForReceivedInbox.inboxId?.substring(0, 12),
-      sendingInbox: stateForReceivedInbox.sendingInbox?.inbox_address?.substring(0, 12),
-      tag: stateForReceivedInbox.tag?.substring(0, 12),
-    } : null);
 
     const latestState = encryptionStateStorage.getLatestState(conversationId);
-    logger.log(`${logPrefix} latestState:`, latestState ? {
-      inboxId: latestState.inboxId?.substring(0, 12),
-      timestamp: latestState.timestamp,
-    } : null);
 
-    // IMPORTANT: Only use an existing state if it matches the inbox we received on.
-    // If we have a state but it's for a DIFFERENT inbox, that means desktop and mobile
-    // each initiated separate sessions. The old state won't decrypt messages from the new session.
-    // In this case, we should perform fresh X3DH to establish a new session for this inbox.
-    const stateToUse = stateForReceivedInbox;
+    // Determine which state to use for decryption:
+    // 1. First, try to find a state matching the received inbox (exact match)
+    // 2. If no exact match but we have states, use the latest state
+    //    This handles the case where:
+    //    - Sender is sending to our DEVICE inbox (from registration)
+    //    - But our session state is keyed by CONVERSATION inbox (per-conversation)
+    //    - The sender doesn't know about our conversation inbox yet
+    // 3. If no states at all, we'll do fresh X3DH below
+    let stateToUse = stateForReceivedInbox;
 
-    if (!stateToUse && allStates.length > 0) {
-      logger.log(`${logPrefix} WARNING: Have ${allStates.length} state(s) but none match receivedOnInboxAddress ${receivedOnInboxAddress?.substring(0, 12)}`);
-      logger.log(`${logPrefix} Will perform fresh X3DH for this inbox instead of using mismatched state`);
+    if (!stateToUse && latestState && allStates.length > 0) {
+      // No exact match, but we have a session for this conversation
+      // Try the latest state - the sender may be using our device inbox
+      const latestFullState = encryptionStateStorage.getEncryptionState(conversationId, latestState.inboxId);
+      if (latestFullState) {
+        stateToUse = latestFullState;
+      }
     }
 
     if (stateToUse) {
       const existingState = stateToUse;
-      logger.log(`${logPrefix} Using existingState:`, {
-        inboxId: existingState.inboxId?.substring(0, 12),
-        sendingInbox: existingState.sendingInbox?.inbox_address?.substring(0, 12),
-        tag: existingState.tag?.substring(0, 12),
-        statePreview: existingState.state?.substring(0, 100),
-        matchedReceivedInbox: stateForReceivedInbox ? true : false,
-      });
-      logger.log(`${logPrefix} Found existing session for sender, using existing Double Ratchet`);
 
       // Decrypt using existing session (no X3DH needed)
       let envelopeStr = unsealed.message;
@@ -815,54 +753,52 @@ class EncryptionService {
       };
 
       const decryptResult = await this.cryptoProvider.doubleRatchetDecrypt(stateAndEnvelope);
-      const decryptedMessage = textDecoder.decode(new Uint8Array(decryptResult.message));
 
-      logger.log(`${logPrefix} Decrypted message with existing session:`, decryptedMessage.substring(0, 100));
+      // Check for decryption failure (returned as result with empty message and error)
+      const resultWithError = decryptResult as typeof decryptResult & { decryptionError?: string };
+      if (resultWithError.decryptionError || decryptResult.message.length === 0) {
+        // Existing session decrypt failed - fall through to X3DH
+      } else {
+        const decryptedMessage = textDecoder.decode(new Uint8Array(decryptResult.message));
 
-      // CRITICAL: Check if decryption actually succeeded before saving state
-      if (decryptedMessage.startsWith('Decryption failed')) {
-        console.error(`${logPrefix} processInitializationEnvelope - existing session decrypt failed:`, decryptedMessage);
-        throw new Error(`Failed to parse double ratchet decrypt result: Double ratchet decryption error: ${decryptedMessage}`);
+        // Save updated state (preserve existing inboxId, sendingInbox, and X3DH ephemeral keys)
+        const updatedState: EncryptionState = {
+          state: decryptResult.ratchet_state,
+          timestamp: Date.now(),
+          conversationId,
+          inboxId: existingState.inboxId,
+          sentAccept: existingState.sentAccept,
+          sendingInbox: existingState.sendingInbox,
+          tag: existingState.tag,
+          x3dhEphemeralPublicKey: existingState.x3dhEphemeralPublicKey,
+          x3dhEphemeralPrivateKey: existingState.x3dhEphemeralPrivateKey,
+        };
+        encryptionStateStorage.saveEncryptionState(updatedState, false); // Don't update latestState for receive
+
+        // Get our conversation inbox for the return value
+        const conversationInbox = encryptionStateStorage.getConversationInboxKeypair(conversationId);
+
+        const userProfile = (unsealed.display_name || unsealed.user_icon)
+          ? { displayName: unsealed.display_name, userIcon: unsealed.user_icon }
+          : undefined;
+
+        return {
+          conversationId,
+          message: decryptedMessage,
+          senderAddress: unsealed.user_address,
+          returnInbox: {
+            address: unsealed.return_inbox_address,
+            encryptionKey: unsealed.return_inbox_encryption_key,
+            publicKey: unsealed.return_inbox_public_key,
+            privateKey: unsealed.return_inbox_private_key,
+          },
+          ourConversationInbox: conversationInbox?.inboxAddress || existingState.inboxId,
+          userProfile,
+        };
       }
-
-      // Save updated state (preserve existing inboxId, sendingInbox, and X3DH ephemeral keys)
-      const updatedState: EncryptionState = {
-        state: decryptResult.ratchet_state,
-        timestamp: Date.now(),
-        conversationId,
-        inboxId: existingState.inboxId,
-        sentAccept: existingState.sentAccept,
-        sendingInbox: existingState.sendingInbox,
-        tag: existingState.tag,
-        x3dhEphemeralPublicKey: existingState.x3dhEphemeralPublicKey,
-        x3dhEphemeralPrivateKey: existingState.x3dhEphemeralPrivateKey,
-      };
-      encryptionStateStorage.saveEncryptionState(updatedState, false); // Don't update latestState for receive
-
-      // Get our conversation inbox for the return value
-      const conversationInbox = encryptionStateStorage.getConversationInboxKeypair(conversationId);
-
-      const userProfile = (unsealed.display_name || unsealed.user_icon)
-        ? { displayName: unsealed.display_name, userIcon: unsealed.user_icon }
-        : undefined;
-
-      return {
-        conversationId,
-        message: decryptedMessage,
-        senderAddress: unsealed.user_address,
-        returnInbox: {
-          address: unsealed.return_inbox_address,
-          encryptionKey: unsealed.return_inbox_encryption_key,
-          publicKey: unsealed.return_inbox_public_key,
-          privateKey: unsealed.return_inbox_private_key,
-        },
-        ourConversationInbox: conversationInbox?.inboxAddress || existingState.inboxId,
-        userProfile,
-      };
     }
 
     // No existing session - perform full X3DH initialization
-    logger.log(`${logPrefix} No existing session, performing X3DH initialization`);
 
     // Parse keys from hex strings to byte arrays
     const senderIdentityKey = this.hexToBytes(unsealed.identity_public_key);
@@ -877,26 +813,15 @@ class EncryptionService {
       session_key_length: SESSION_KEY_LENGTH,
     });
 
-    logger.log(`${logPrefix} receiverX3DH result (first 100 chars):`, sessionKeyBase64.substring(0, 100));
-    logger.log(`${logPrefix} receiverX3DH result length:`, sessionKeyBase64.length);
-
     // Decode session key (96 bytes: 32 session + 32 send header + 32 recv header)
     const sessionKeyBytes = this.base64ToBytes(sessionKeyBase64);
     const sessionKey = Array.from(sessionKeyBytes.slice(0, 32));
     const sendingHeaderKey = Array.from(sessionKeyBytes.slice(32, 64));
     const receivingHeaderKey = Array.from(sessionKeyBytes.slice(64, 96));
 
-    // Log first bytes of each key for debugging (raw from X3DH, before swap)
-    logger.log(`${logPrefix} [RECEIVER] Session key first 8 bytes:`, sessionKey.slice(0, 8));
-    logger.log(`${logPrefix} [RECEIVER] Raw X3DH key A (32-64) first 8:`, sendingHeaderKey.slice(0, 8));
-    logger.log(`${logPrefix} [RECEIVER] Raw X3DH key B (64-96) first 8:`, receivingHeaderKey.slice(0, 8));
-    logger.log(`${logPrefix} [RECEIVER] Sender ephemeral key first 8 bytes:`, senderEphemeralKey.slice(0, 8));
-
     // IMPORTANT: Do NOT swap header keys for receiver
     // The X3DH derivation order is consistent between sender and receiver
     // Both sides use the same key positions (32-64 for sending, 64-96 for receiving)
-    logger.log(`${logPrefix} [RECEIVER] sending_header_key (32-64) first 8:`, sendingHeaderKey.slice(0, 8));
-    logger.log(`${logPrefix} [RECEIVER] next_receiving_header_key (64-96) first 8:`, receivingHeaderKey.slice(0, 8));
 
     // Initialize Double Ratchet as receiver (DO NOT swap header keys - desktop doesn't)
     const ratchetState = await this.cryptoProvider.newDoubleRatchet({
@@ -910,13 +835,10 @@ class EncryptionService {
 
     // The unsealed.message is actually a Double Ratchet envelope that needs to be decrypted
     // Decrypt the first message using the newly initialized ratchet
-    logger.log(`${logPrefix} Decrypting first message from init envelope`);
-    logger.log(`${logPrefix} Envelope message preview:`, unsealed.message.substring(0, 100));
 
     // Handle escaped JSON in the message (backslash-quote sequences)
     let envelopeStr = unsealed.message;
     if (envelopeStr.includes('\\')) {
-      logger.log(`${logPrefix} Envelope contains escapes, unescaping`);
       envelopeStr = envelopeStr
         .replace(/\\"/g, '"')
         .replace(/\\\\/g, '\\');
@@ -928,9 +850,15 @@ class EncryptionService {
     };
 
     const decryptResult = await this.cryptoProvider.doubleRatchetDecrypt(stateAndEnvelope);
-    const decryptedMessage = textDecoder.decode(new Uint8Array(decryptResult.message));
 
-    logger.log(`${logPrefix} Decrypted first message:`, decryptedMessage.substring(0, 100));
+    // Check for decryption failure (returned as result with empty message and error)
+    const resultWithError = decryptResult as typeof decryptResult & { decryptionError?: string };
+    if (resultWithError.decryptionError || decryptResult.message.length === 0) {
+      // Expected in multi-device scenarios - return null instead of throwing
+      return null;
+    }
+
+    const decryptedMessage = textDecoder.decode(new Uint8Array(decryptResult.message));
 
     // Create sendingInbox structure for sealing future replies
     // This is the sender's inbox info we'll use to seal messages to them
@@ -962,8 +890,6 @@ class EncryptionService {
     };
     encryptionStateStorage.saveConversationInboxKeypair(storedKeypair);
 
-    logger.log(`${logPrefix} Generated receiver conversation inbox:`, conversationInboxAddress.substring(0, 12));
-
     // Save encryption state with the updated ratchet state from decryption
     // IMPORTANT: State is keyed by our CONVERSATION inbox (not device inbox)
     // because that's where subsequent messages will be routed when we have
@@ -985,18 +911,11 @@ class EncryptionService {
     // IMPORTANT: Also save to ephemeral key cache so subsequent messages with same
     // ephemeral key can use this advanced ratchet state instead of re-doing X3DH
     encryptionStateStorage.saveEphemeralKeyState(unsealed.ephemeral_public_key, conversationId, encryptionState);
-    logger.log(`${logPrefix} Saved ephemeral key cache for: ${unsealed.ephemeral_public_key.substring(0, 20)}...`);
 
     // Map the conversation inbox to this conversation for lookup
     encryptionStateStorage.saveInboxMapping(conversationInboxAddress, conversationId);
     // Also map the sender's return inbox so we can route received messages
     encryptionStateStorage.saveInboxMapping(unsealed.return_inbox_address, conversationId);
-
-    logger.log(`${logPrefix} Saved recipient session state:`, {
-      ourConversationInbox: conversationInboxAddress.substring(0, 12),
-      sendingInbox: unsealed.return_inbox_address.substring(0, 12),
-      hasEncryptionKey: !!unsealed.return_inbox_encryption_key,
-    });
 
     // Extract user profile from the envelope (if present)
     // Desktop stores these as display_name and user_icon in the InitializationEnvelope
@@ -1029,7 +948,7 @@ class EncryptionService {
     return this.deviceKeys;
   }
 
-  // ============ Utility Methods ============
+  // Utility Methods
 
   private hexToBytes(hex: string): number[] {
     const bytes: number[] = [];
@@ -1055,7 +974,6 @@ class EncryptionService {
 
     // Validate base64 characters
     if (!/^[A-Za-z0-9+/]*={0,2}$/.test(cleanBase64)) {
-      console.error(`${logPrefix} Invalid base64 string:`, cleanBase64.substring(0, 50));
       throw new Error(`Invalid base64 string: ${cleanBase64.substring(0, 20)}...`);
     }
 

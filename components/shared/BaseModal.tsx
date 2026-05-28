@@ -21,26 +21,20 @@ import { createTheme } from '@/theme/themes';
 type ThemeType = ReturnType<typeof createTheme>;
 
 export interface BaseModalProps {
-  /** Whether the modal is visible */
   visible: boolean;
-  /** Callback when modal should close */
   onClose: () => void;
-  /** Modal content */
   children: React.ReactNode;
-  /** Height as percentage of screen (0-1), default 0.9 */
+  /** Fraction of screen height (0-1), default 0.9 */
   height?: number;
   /** Backdrop opacity (0-1), default 0.5 */
   backdropDarkness?: number;
-  /** Show the drag handle at top, default true */
   showHandle?: boolean;
-  /** Custom handle container style */
   handleContainerStyle?: ViewStyle;
-  /** Test ID for the modal */
   testID?: string;
-  /** Enable keyboard avoiding behavior, default false */
   avoidKeyboard?: boolean;
-  /** Force modal to fill specified height instead of sizing to content, default false */
   fillHeight?: boolean;
+  /** Fraction of screen height (0-1) */
+  minHeight?: number;
 }
 
 /**
@@ -66,6 +60,7 @@ export function BaseModal({
   testID,
   avoidKeyboard = false,
   fillHeight = false,
+  minHeight,
 }: BaseModalProps) {
   const { theme } = useTheme();
   const insets = useSafeAreaInsets();
@@ -101,7 +96,7 @@ export function BaseModal({
     };
   }, [avoidKeyboard]);
 
-  const styles = createStyles(theme, insets, height, backdropDarkness, fillHeight);
+  const styles = createStyles(theme, insets, height, backdropDarkness, fillHeight, minHeight);
 
   // Calculate bottom offset and max height when keyboard is visible
   const keyboardVisible = avoidKeyboard && keyboardHeight > 0;
@@ -178,7 +173,8 @@ const createStyles = (
   insets: EdgeInsets,
   height: number,
   backdropDarkness: number,
-  fillHeight: boolean
+  fillHeight: boolean,
+  minHeight?: number
 ) =>
   StyleSheet.create({
     container: {
@@ -197,6 +193,7 @@ const createStyles = (
       borderTopLeftRadius: 20,
       borderTopRightRadius: 20,
       ...(fillHeight ? { height: SCREEN_HEIGHT * height } : {}),
+      ...(minHeight ? { minHeight: SCREEN_HEIGHT * minHeight } : {}),
       maxHeight: SCREEN_HEIGHT * height,
       paddingBottom: insets.bottom,
     },

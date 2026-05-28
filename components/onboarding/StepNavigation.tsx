@@ -4,7 +4,7 @@
 
 import React from 'react';
 import { View, StyleSheet } from 'react-native';
-import { useTheme } from '@/theme';
+import { useTheme, type AppTheme } from '@/theme';
 import { Button } from '@/components/ui/Button';
 
 interface StepNavigationProps {
@@ -74,7 +74,7 @@ export function StepNavigation({
   );
 }
 
-const createStyles = (theme: any) =>
+const createStyles = (theme: AppTheme) =>
   StyleSheet.create({
     container: {
       marginTop: 'auto',

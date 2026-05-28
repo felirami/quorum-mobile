@@ -12,7 +12,6 @@
  * 7. Marking user as kicked locally
  */
 
-import { logger } from '@quilibrium/quorum-shared';
 import { useState, useCallback, useEffect } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { useAuth } from '@/context';
@@ -74,8 +73,6 @@ export function useUserKicking(options: UseUserKickingOptions) {
           enqueueOutbound(async () => result.wsEnvelopes);
         }
 
-        logger.log('[useUserKicking] User kicked:', userAddress);
-
         // Invalidate queries to refresh UI
         await queryClient.invalidateQueries({
           queryKey: ['spaceMembers', spaceId],
@@ -91,7 +88,6 @@ export function useUserKicking(options: UseUserKickingOptions) {
           onSuccess();
         }
       } catch (error) {
-        console.error('[useUserKicking] Failed to kick user:', error);
         throw error;
       } finally {
         setKicking(false);

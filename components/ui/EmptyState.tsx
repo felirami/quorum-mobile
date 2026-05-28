@@ -6,7 +6,7 @@ import {
   View,
   ViewStyle,
 } from 'react-native';
-import { useTheme } from '@/theme';
+import { useTheme, type AppTheme } from '@/theme';
 import { IconSymbol, type IconSymbolName } from './IconSymbol';
 
 interface EmptyStateProps {
@@ -78,7 +78,7 @@ export function EmptyState({
   );
 }
 
-const createStyles = (theme: any) =>
+const createStyles = (theme: AppTheme) =>
   StyleSheet.create({
     container: {
       alignItems: 'center',

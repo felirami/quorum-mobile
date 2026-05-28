@@ -8,7 +8,13 @@
  * - Inbox subscription management
  */
 
-import { logger } from '@quilibrium/quorum-shared';
+import {
+  bytesToHex,
+  createRNWebSocketClient,
+  int64ToBytes,
+  logger,
+  queryKeys,
+} from '@quilibrium/quorum-shared';
 import { useQueryClient } from '@tanstack/react-query';
 import React, {
   createContext,
@@ -19,71 +25,45 @@ import React, {
   useRef,
   useState,
 } from 'react';
-import { Alert, AppState, AppStateStatus } from 'react-native';
+import { Alert, AppState, AppStateStatus, InteractionManager } from 'react-native';
 
+import type { Conversation } from '@/hooks/chat/useConversations';
+import { incrementReplyCount } from '@/hooks/chat/useReplyTracking';
+import { recordSpaceActivity } from '@/hooks/chat/useSpaceActivity';
+import { messagePreview as getSpaceMessagePreview, messageSenderName } from '@/utils/messagePreview';
+import { sha256 } from '@noble/hashes/sha2.js';
 import type {
-  Conversation,
   EncryptedWebSocketMessage,
   KickMessage,
   Message,
   SealedMessage,
   Space,
+  SpaceMember,
   UnsealedEnvelope,
   WebSocketClient,
   WebSocketConnectionState,
-  // Sync protocol types
-  SyncRequestPayload,
-  SyncInfoPayload,
-  SyncInitiatePayload,
-  SyncManifestPayload,
-  SyncDeltaPayload,
-  SyncSummary,
 } from '@quilibrium/quorum-shared';
-import {
-  bytesToHex,
-  createRNWebSocketClient,
-  int64ToBytes,
-  queryKeys,
-  // Sync utilities
-  SyncService,
-  isSyncRequest,
-  isSyncInfo,
-  isSyncInitiate,
-  isSyncManifest,
-  isSyncDelta,
-} from '@quilibrium/quorum-shared';
-import { sha256 } from '@noble/hashes/sha2';
 import { getQuorumClient } from '../services/api/quorumClient';
-import { getAllSpaceInboxAddresses, getSpace, getSpaceIds, getSpaceKey, saveSpace, saveSpaceKey } from '../services/config/spaceStorage';
-import { encryptionService, setE2ELogPrefix } from '../services/crypto/encryption-service';
+import { getAllSpaceInboxAddresses, getInboxToSpaceMap, getSpace, getSpaceByHubAddress, getSpaceIds, getSpaceKey, saveSpace, saveSpaceKey } from '../services/config/spaceStorage';
+import { encryptionService } from '../services/crypto/encryption-service';
 import { encryptionStateStorage, type ConversationInboxKeypair } from '../services/crypto/encryption-state-storage';
-import { NativeCryptoProvider, SyncSealedMessage } from '../services/crypto/native-provider';
+import { NativeCryptoProvider, SyncSealedMessage, type BatchSpaceGroup, type BatchSpaceMessage, type BatchProcessInput, type BatchProcessOutput, type BatchSpaceGroupResult, type BatchDMGroup, type BatchDMMessage, type BatchDRState } from '../services/crypto/native-provider';
 import { NativeSigningProvider } from '../services/crypto/native-signing-provider';
+import { mmkvStorage } from '../services/offline/storage';
 import { getDeviceKeyset, type DeviceKeyset } from '../services/onboarding/secureStorage';
 import {
   clearSentEnvelope,
   isSentEnvelope,
-  // Old sync functions (to be removed)
-  sendSyncInfoMessage,
-  sendSyncMembersMessage,
-  sendSyncMessagesMessage,
-  sendSyncPeerMapMessage,
-  // New sync protocol functions
-  sendSyncRequestMessage,
-  sendSyncInfoMessageV2,
-  sendSyncInitiateMessage,
-  sendSyncManifestMessage,
-  sendSyncDeltaMessages,
 } from '../services/space/spaceMessageService';
-import { mmkvStorage } from '../services/offline/storage';
+import { buildListenHubFrame, buildLogSinceFrame } from '../services/space/hubLogSync';
+import { getHubLastSeq, setHubLastSeq } from '../services/space/hubLogCursor';
 import { getMMKVAdapter } from '../services/storage/mmkvAdapter';
 import { useAuth } from './AuthContext';
 import { useStorageAdapter } from './StorageContext';
 
-// API Configuration (matches quorumClient.ts)
-const API_CONFIG = {
-  wsUrl: 'wss://api.quorummessenger.com/ws',
-};
+import { getApiConfig } from '../services/api/config';
+
+import type { MessagesPage, InfiniteMessagesData } from '../hooks/chat/queryTypes';
 
 interface WebSocketContextValue {
   // Connection state
@@ -101,13 +81,33 @@ interface WebSocketContextValue {
   subscribe: (inboxAddresses: string[]) => Promise<void>;
   unsubscribe: (inboxAddresses: string[]) => Promise<void>;
 
-  // Sync
-  triggerSyncRequest: (spaceId: string, channelId: string) => Promise<void>;
-
   // Kick events - space ID that user was kicked from, null when acknowledged
   kickedFromSpaceId: string | null;
   clearKickedFromSpace: () => void;
+
+  // Call signaling — CallContext registers a handler to receive decrypted call messages
+  registerCallSignalingHandler: (handler: (message: any) => void) => () => void;
+
+  // Per-space log transport — register to receive log-update / log-since-result / log-append-ack frames
+  registerLogFrameHandler: (handler: (frame: LogFrame) => void) => () => void;
 }
+
+export type LogEntryFrame = {
+  seq: number;
+  ts: number;
+  payload: { ts: number; data: any };
+};
+
+export type LogFrame =
+  | { type: 'log-update'; hub_address: string; seq: number; ts: number }
+  | { type: 'log-append-ack'; hub_address: string; seq: number; ts: number; request_id?: string }
+  | {
+      type: 'log-since-result';
+      hub_address: string;
+      entries: LogEntryFrame[];
+      has_more: boolean;
+      request_id?: string;
+    };
 
 const WebSocketContext = createContext<WebSocketContextValue | null>(null);
 
@@ -162,19 +162,9 @@ async function deleteInboxMessages(
       inbox_public_key: publicKeyHex,
       inbox_signature: signatureHex,
     };
-    logger.log('[WS] Delete request:', {
-      inbox_address: inboxAddress.substring(0, 12) + '...',
-      timestamps,
-      messageToSign: messageToSign.substring(0, 50) + '...',
-      publicKeyLength: publicKeyHex.length,
-      signatureLength: signatureHex.length,
-    });
     await client.deleteInboxMessages(deletePayload);
-
-    logger.log(`[WS] Deleted ${timestamps.length} message(s) from inbox`);
   } catch (error) {
     // Log but don't fail - message deletion is best-effort
-    logger.warn('[WS] Failed to delete inbox messages:', error);
   }
 }
 
@@ -216,11 +206,8 @@ async function deleteSpaceInboxMessages(
       inbox_public_key: inboxKey.publicKey,
       inbox_signature: signatureHex,
     });
-
-    logger.log(`[WS] Deleted ${timestamps.length} space message(s) from inbox:`, inboxAddress.substring(0, 12));
   } catch (error) {
     // Log but don't fail - message deletion is best-effort
-    logger.warn('[WS] Failed to delete space inbox messages:', error);
   }
 }
 
@@ -262,11 +249,8 @@ async function deleteConversationInboxMessages(
       inbox_public_key: signingKey.publicKey,
       inbox_signature: signatureHex,
     });
-
-    logger.log(`[WS] Deleted ${timestamps.length} conversation message(s) from inbox:`, inboxAddress.substring(0, 12));
   } catch (error) {
     // Log but don't fail - message deletion is best-effort
-    logger.warn('[WS] Failed to delete conversation inbox messages:', error);
   }
 }
 
@@ -369,6 +353,20 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
   const [kickedFromSpaceId, setKickedFromSpaceId] = useState<string | null>(null);
   const clearKickedFromSpace = useCallback(() => setKickedFromSpaceId(null), []);
 
+  // Call signaling handler — CallContext registers to intercept call-* messages
+  const callSignalingHandlerRef = useRef<((message: any) => void) | null>(null);
+  const registerCallSignalingHandler = useCallback((handler: (message: any) => void) => {
+    callSignalingHandlerRef.current = handler;
+    return () => { callSignalingHandlerRef.current = null; };
+  }, []);
+
+  // Per-space log frame handlers — multiple subscribers (one per useSpaceLog hook).
+  const logFrameHandlersRef = useRef<Set<(frame: LogFrame) => void>>(new Set());
+  const registerLogFrameHandler = useCallback((handler: (frame: LogFrame) => void) => {
+    logFrameHandlersRef.current.add(handler);
+    return () => { logFrameHandlersRef.current.delete(handler); };
+  }, []);
+
   // WebSocket client instance (singleton for the app)
   const wsClientRef = useRef<WebSocketClient | null>(null);
 
@@ -381,119 +379,53 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
   // Store our own inbox address for checking initialization messages
   const ownInboxAddressRef = useRef<string | null>(null);
 
-  // Track sent space message envelopes to skip decrypting our own echoed messages
-  // We store a hash of the envelope content since we can't decrypt our own TR messages
-  const sentSpaceEnvelopesRef = useRef<Set<string>>(new Set());
+  // Message queue for throttled processing - prevents CPU overload from burst messages
+  const messageQueueRef = useRef<EncryptedWebSocketMessage[]>([]);
+  const isProcessingQueueRef = useRef(false);
+  const MESSAGE_PROCESS_DELAY_MS = 10; // 10ms delay between non-batch messages (brief yield to UI thread)
+  const MAX_MESSAGE_QUEUE_SIZE = 2000;
 
-  // Track processed sync requests to prevent duplicate handling within a short window
-  // Key is `${spaceId}:${expiry}:${inboxAddress}` for sync-request
-  // Value is timestamp when processed, entries expire after 30 seconds
-  const processedSyncRequestsRef = useRef<Map<string, number>>(new Map());
-  const SYNC_REQUEST_DEDUP_EXPIRY_MS = 30000; // 30 seconds for sync-request (based on message expiry)
-  // Track sync-initiate operations that are currently in-flight to prevent parallel processing
-  const syncInitiateInFlightRef = useRef<Set<string>>(new Set());
+  // Pre-unsealed payload cache - populated by batch native decryption in processMessageQueue
+  // Key: `${inboxAddress}:${timestamp}`, Value: decrypted plaintext payload
+  // This eliminates N JS-native bridge crossings for N space messages
+  const preUnsealedCacheRef = useRef<Map<string, string>>(new Map());
+  const MAX_PRE_UNSEALED_CACHE_SIZE = 500;
 
-  // SyncService instance for new hash-based delta sync protocol
-  const syncServiceRef = useRef<SyncService | null>(null);
+  // Ratchet state deserialization cache - avoids re-parsing JSON on every message
+  // Key: raw state string, Value: parsed object
+  const ratchetStateCacheRef = useRef<Map<string, object>>(new Map());
+  const MAX_RATCHET_CACHE_SIZE = 200;
 
   /**
-   * Handle sync initiation callback from SyncService
-   * This is called when candidates are collected and we should start sync
+   * Parse ratchet state from a raw state string, using the cache to avoid
+   * redundant JSON.parse calls. Handles the double-nested state structure.
    */
-  const handleInitiateSync = useCallback(async (spaceId: string, targetInbox: string) => {
-    logger.log(`[WS] handleInitiateSync called for space ${spaceId.substring(0, 12)}, target ${targetInbox.substring(0, 12)}`);
+  const parseRatchetState = useCallback((rawState: string): object => {
+    const cached = ratchetStateCacheRef.current.get(rawState);
+    if (cached) return cached;
 
-    try {
-      const syncService = syncServiceRef.current;
-      if (!syncService) {
-        logger.warn('[WS] handleInitiateSync: No SyncService');
-        return;
-      }
+    const parsed = JSON.parse(rawState);
+    const result = (parsed.state && typeof parsed.state === 'string')
+      ? JSON.parse(parsed.state)
+      : parsed;
 
-      const inboxKey = getSpaceKey(spaceId, 'inbox');
-      if (!inboxKey?.address) {
-        logger.warn('[WS] handleInitiateSync: No inbox key');
-        return;
-      }
-
-      const space = getSpace(spaceId);
-      const channelId = space?.defaultChannelId || spaceId;
-
-      // Get peer IDs from encryption state
-      const encryptionStateData = encryptionStateStorage.getEncryptionState(
-        `space:${spaceId}:${channelId}`,
-        inboxKey.address
-      );
-      let peerIds: number[] = [];
-      if (encryptionStateData?.state) {
-        try {
-          const parsed = JSON.parse(encryptionStateData.state);
-          const ratchetState = parsed.state ? JSON.parse(parsed.state) : parsed;
-          if (ratchetState.peer_id_map) {
-            peerIds = Object.values(ratchetState.peer_id_map as Record<string, number>);
-          }
-        } catch (e) {
-          logger.log('[WS] handleInitiateSync: Failed to parse peer IDs');
-        }
-      }
-
-      // Build sync-initiate payload
-      const initiateResult = await syncService.buildSyncInitiate(
-        spaceId,
-        channelId,
-        inboxKey.address,
-        peerIds
-      );
-
-      if (!initiateResult) {
-        logger.log('[WS] handleInitiateSync: buildSyncInitiate returned null');
-        return;
-      }
-
-      logger.log(`[WS] handleInitiateSync: Sending sync-initiate to ${initiateResult.target.substring(0, 12)}`);
-
-      const syncInitiateEnvelope = await sendSyncInitiateMessage(
-        spaceId,
-        initiateResult.target,
-        initiateResult.payload
-      );
-
-      const client = wsClientRef.current;
-      if (client?.isConnected) {
-        client.enqueueOutbound(async () => [syncInitiateEnvelope]);
-        logger.log('[WS] handleInitiateSync: sync-initiate sent!');
-      }
-    } catch (error) {
-      console.error('[WS] handleInitiateSync failed:', error);
+    if (ratchetStateCacheRef.current.size >= MAX_RATCHET_CACHE_SIZE) {
+      const firstKey = ratchetStateCacheRef.current.keys().next().value;
+      if (firstKey) ratchetStateCacheRef.current.delete(firstKey);
     }
+    ratchetStateCacheRef.current.set(rawState, result as object);
+    return result;
   }, []);
-
-  // Initialize SyncService lazily when storage is available
-  const getSyncService = useCallback(() => {
-    if (!syncServiceRef.current && storage) {
-      syncServiceRef.current = new SyncService({
-        storage,
-        maxMessages: 1000,
-        requestExpiry: 30000,
-        onInitiateSync: handleInitiateSync,
-      });
-    }
-    return syncServiceRef.current;
-  }, [storage, handleInitiateSync]);
 
   /**
    * Initialize device keys and set them in the encryption service
    */
   const initializeDeviceKeys = useCallback(async () => {
-    logger.log('[WS] initializeDeviceKeys called, already initialized:', deviceKeysInitialized.current);
-
     if (deviceKeysInitialized.current) {
       // Verify keys are actually set
       const hasKeys = encryptionService.hasDeviceKeys();
-      logger.log('[WS] Keys already initialized, hasDeviceKeys:', hasKeys);
       if (!hasKeys) {
         // Reset flag to force re-initialization
-        logger.warn('[WS] Keys flag set but no keys - resetting');
         deviceKeysInitialized.current = false;
       } else {
         return true;
@@ -502,9 +434,7 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
 
     try {
       const keyset = await getDeviceKeyset();
-      logger.log('[WS] Got keyset:', !!keyset);
       if (!keyset) {
-        logger.warn('Device keyset not found - encryption not available');
         return false;
       }
 
@@ -517,15 +447,16 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
         inboxEncryptionPublicKey: keyset.inboxEncryptionPublicKey,
       });
 
-      logger.log('[WS] Device keys set, hasDeviceKeys:', encryptionService.hasDeviceKeys());
-
       // Store our inbox address for checking init messages
       ownInboxAddressRef.current = keyset.inboxAddress;
+      const me = user?.address?.slice(0, 8) ?? '???';
+      logger.debug(
+        `[DEVICE ${me}] ownInbox=${keyset.inboxAddress.slice(0, 16)}`,
+      );
 
       deviceKeysInitialized.current = true;
       return true;
     } catch (error) {
-      logger.log('Failed to initialize device keys:', error);
       return false;
     }
   }, []);
@@ -542,17 +473,7 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
   const handleIncomingMessage = useCallback(
     async (message: EncryptedWebSocketMessage) => {
       try {
-        logger.log(`[WS:${getAddr()}] Received message:`, {
-          inboxAddress: message.inboxAddress,
-          hasEncryptedContent: !!message.encryptedContent,
-          contentType: typeof message.encryptedContent,
-          contentPreview: typeof message.encryptedContent === 'string'
-            ? message.encryptedContent.substring(0, 100)
-            : 'not a string',
-        });
-
         if (!message.encryptedContent) {
-          logger.warn('[WS] Received message without encrypted content');
           return;
         }
 
@@ -567,118 +488,77 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
         const isSpaceInbox = spaceInboxAddresses.includes(message.inboxAddress);
 
         if (isSpaceInbox) {
-          logger.log(`[WS:${getAddr()}] *** SPACE INBOX MESSAGE ***`, {
-            inboxAddress: message.inboxAddress?.substring(0, 12),
-            contentLength: message.encryptedContent?.length,
-            sealedMessageKeys: Object.keys(sealedMessage),
-          });
 
           // Find which space this inbox belongs to
-          let spaceIds: string[];
+          // Use O(1) lookup map instead of O(n) loop
+          let inboxToSpaceMap: Map<string, string>;
           try {
-            spaceIds = getSpaceIds();
+            inboxToSpaceMap = getInboxToSpaceMap();
           } catch (e) {
-            logger.log(`[WS:${getAddr()}] getSpaceIds() failed:`, e);
             return;
           }
 
-          logger.log(`[WS:${getAddr()}] Looking for space with inbox ${message.inboxAddress?.substring(0, 12)}, have ${spaceIds.length} spaces`);
-
           try {
 
-            let spaceId: string | null = null;
+            // O(1) lookup instead of O(n) loop
+            const spaceId = inboxToSpaceMap.get(message.inboxAddress) ?? null;
             let hubKey: { publicKey: string; privateKey: string; address?: string } | null = null;
             let spaceInboxKey: { publicKey: string; privateKey: string; address?: string } | null = null;
 
-            for (const sid of spaceIds) {
-              const inboxKey = getSpaceKey(sid, 'inbox');
-              logger.log(`[WS:${getAddr()}] Space ${sid.substring(0, 12)} inbox: ${inboxKey?.address?.substring(0, 12) || 'none'}`);
-              if (inboxKey?.address === message.inboxAddress) {
-                spaceId = sid;
-                hubKey = getSpaceKey(sid, 'hub');
-                spaceInboxKey = inboxKey;
-                logger.log(`[WS:${getAddr()}] Found matching space! hubKey:`, {
-                  hasAddress: !!hubKey?.address,
-                  hasPublicKey: !!hubKey?.publicKey,
-                  hasPrivateKey: !!hubKey?.privateKey,
-                });
-                break;
-              }
+            if (spaceId) {
+              hubKey = getSpaceKey(spaceId, 'hub');
+              spaceInboxKey = getSpaceKey(spaceId, 'inbox');
             }
 
             if (!spaceId || !hubKey) {
-              logger.log('[WS] Could not find space for inbox:', message.inboxAddress?.substring(0, 12));
-              logger.log('[WS] Available space inboxes:', spaceIds.map(sid => {
-                const ik = getSpaceKey(sid, 'inbox');
-                return `${sid.substring(0, 8)}:${ik?.address?.substring(0, 8) || 'none'}`;
-              }));
               return;
             }
 
             if (!hubKey.privateKey) {
-              logger.log('[WS] Hub key missing privateKey for space:', spaceId.substring(0, 12));
               return;
             }
 
-            logger.log(`[WS:${getAddr()}] Processing space message for space:`, spaceId.substring(0, 12));
-
             // Get config key for hub envelope decryption
             const configKey = getSpaceKey(spaceId, 'config');
-            logger.log(`[WS:${getAddr()}] Config key exists:`, !!configKey, 'publicKey length:', configKey?.publicKey?.length, 'privateKey length:', configKey?.privateKey?.length, 'pubPrefix:', configKey?.publicKey?.substring(0, 16), 'privPrefix:', configKey?.privateKey?.substring(0, 16));
 
-            // Verify the stored public key matches what we derive from the private key
-            if (configKey?.privateKey) {
-              const cryptoCheck = new NativeCryptoProvider();
-              const privKeyBase64 = btoa(String.fromCharCode(...hexToBytes(configKey.privateKey)));
-              const derivedPubBase64 = await cryptoCheck.getPublicKeyX448(privKeyBase64);
-              const derivedPubBinary = atob(derivedPubBase64);
-              let derivedPubHex = '';
-              for (let i = 0; i < derivedPubBinary.length; i++) {
-                derivedPubHex += derivedPubBinary.charCodeAt(i).toString(16).padStart(2, '0');
-              }
-              logger.log(`[WS:${getAddr()}] Derived pubKey from privKey:`, derivedPubHex.substring(0, 16), 'stored pubKey:', configKey.publicKey?.substring(0, 16), 'match:', derivedPubHex === configKey.publicKey);
-            }
-
-            // DEBUG: Also log hub key info to compare
-            logger.log(`[WS:${getAddr()}] Hub key publicKey prefix:`, hubKey.publicKey?.substring(0, 16));
-
-            // Check the outer envelope type to determine how to unseal
-            const outerEnvelopeType = (sealedMessage as { type?: string }).type;
-            logger.log(`[WS:${getAddr()}] Outer envelope type:`, outerEnvelopeType);
-
-            const cryptoProvider = new NativeCryptoProvider();
-            const hubPrivateKeyBytes = hexToBytes(hubKey.privateKey);
+            // Check pre-unsealed cache first (populated by batch native decryption)
+            const cacheKey = `${message.inboxAddress}:${message.timestamp}`;
             let unsealedPayload: string;
+            const cachedPayload = preUnsealedCacheRef.current.get(cacheKey);
+            const cryptoProvider = new NativeCryptoProvider();
 
-            if (outerEnvelopeType === 'sync') {
-              // Sync envelope - directed message using unsealSyncEnvelope with config key
-              logger.log(`[WS:${getAddr()}] Using unsealSyncEnvelope for sync message`);
-              const syncSealedMessage = sealedMessage as unknown as SyncSealedMessage;
-              unsealedPayload = await cryptoProvider.unsealSyncEnvelope(
-                hubPrivateKeyBytes,
-                syncSealedMessage,
-                configKey ? Array.from(hexToBytes(configKey.privateKey)) : undefined
-              );
+            if (cachedPayload) {
+              // Use batch-decrypted result (avoids JS-native bridge crossing)
+              unsealedPayload = cachedPayload;
+              preUnsealedCacheRef.current.delete(cacheKey);
             } else {
-              // Hub broadcast envelope - use unsealHubEnvelope with config key
-              logger.log(`[WS:${getAddr()}] Using unsealHubEnvelope for broadcast message`);
-              const hubSealedMessage = sealedMessage as unknown as {
-                hub_address: string;
-                ephemeral_public_key: string;
-                envelope: string;
-                hub_public_key: string;
-                hub_signature: string;
-              };
-              unsealedPayload = await cryptoProvider.unsealHubEnvelope(
-                hubPrivateKeyBytes,
-                hubSealedMessage.ephemeral_public_key,
-                hubSealedMessage.envelope,
-                configKey ? hexToBytes(configKey.privateKey) : undefined
-              );
-            }
+              // Fallback: individual unseal (for messages not in batch)
+              const outerEnvelopeType = (sealedMessage as { type?: string }).type;
+              const hubPrivateKeyBytes = hexToBytes(hubKey.privateKey);
 
-            logger.log(`[WS:${getAddr()}] Unsealed envelope, payload length:`, unsealedPayload.length);
-            logger.log(`[WS:${getAddr()}] Unsealed payload preview:`, unsealedPayload.substring(0, 200));
+              if (outerEnvelopeType === 'sync') {
+                const syncSealedMessage = sealedMessage as unknown as SyncSealedMessage;
+                unsealedPayload = await cryptoProvider.unsealSyncEnvelope(
+                  hubPrivateKeyBytes,
+                  syncSealedMessage,
+                  configKey ? Array.from(hexToBytes(configKey.privateKey)) : undefined
+                );
+              } else {
+                const hubSealedMessage = sealedMessage as unknown as {
+                  hub_address: string;
+                  ephemeral_public_key: string;
+                  envelope: string;
+                  hub_public_key: string;
+                  hub_signature: string;
+                };
+                unsealedPayload = await cryptoProvider.unsealHubEnvelope(
+                  hubPrivateKeyBytes,
+                  hubSealedMessage.ephemeral_public_key,
+                  hubSealedMessage.envelope,
+                  configKey ? hexToBytes(configKey.privateKey) : undefined
+                );
+              }
+            }
 
             // Parse the unsealed payload - it should be { type: 'message', message: tripleRatchetEnvelope }
             const payload = JSON.parse(unsealedPayload) as {
@@ -688,7 +568,6 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
 
             // Handle control messages (join, leave, kick, sync, etc.)
             if (payload.type === 'control') {
-              logger.log(`[WS:${getAddr()}] Processing control message`);
               const controlPayload = payload as unknown as {
                 type: 'control';
                 message: {
@@ -709,12 +588,10 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
               };
 
               const controlType = controlPayload.message?.type;
-              logger.log(`[WS:${getAddr()}] Control message type:`, controlType);
 
               switch (controlType) {
                 case 'join': {
                   // A new participant joined - update peer maps and member list
-                  logger.log(`[WS:${getAddr()}] Received join control message`);
                   try {
                     const joinPayload = controlPayload.message as {
                       type: 'join';
@@ -736,19 +613,11 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
 
                     const participant = joinPayload.participant;
                     if (!participant) {
-                      logger.warn('[WS] Join message missing participant data');
                       break;
                     }
 
-                    logger.log(`[WS:${getAddr()}] New participant joined:`, {
-                      address: participant.address,
-                      id: participant.id,
-                      displayName: participant.displayName,
-                    });
-
                     // Skip if this is our own join message echoed back
                     if (participant.address === user?.address) {
-                      logger.log(`[WS:${getAddr()}] Ignoring own join message`);
                       break;
                     }
 
@@ -759,14 +628,9 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                     if (encryptionStates.length > 0) {
                       try {
                         const stateData = encryptionStates[0];
-                        // Parse the nested state structure
-                        let ratchetState: Record<string, unknown>;
+                        // Parse the nested state structure (outer parse needed for template/evals)
                         const parsed = JSON.parse(stateData.state);
-                        if (parsed.state && typeof parsed.state === 'string') {
-                          ratchetState = JSON.parse(parsed.state);
-                        } else {
-                          ratchetState = parsed;
-                        }
+                        const ratchetState = parseRatchetState(stateData.state) as Record<string, unknown>;
 
                         // Add new peer to peer_id_map (maps public key to ID)
                         if (!ratchetState.peer_id_map) {
@@ -820,8 +684,7 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                           state: updatedState,
                           timestamp: Date.now(),
                         });
-
-                        logger.log(`[WS:${getAddr()}] Updated peer maps for new participant (preserved template/evals)`);
+                        ratchetStateCacheRef.current.clear();
 
                         // CRITICAL: Also update fallback state with new peer
                         // The fallback state is used for decryption when the main state has evolved
@@ -829,13 +692,7 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                         const fallbackState = encryptionStateStorage.getFallbackState(spaceConversationId, stateData.inboxId);
                         if (fallbackState) {
                           try {
-                            let fallbackRatchetState: Record<string, unknown>;
-                            const fallbackParsed = JSON.parse(fallbackState.state);
-                            if (fallbackParsed.state && typeof fallbackParsed.state === 'string') {
-                              fallbackRatchetState = JSON.parse(fallbackParsed.state);
-                            } else {
-                              fallbackRatchetState = fallbackParsed;
-                            }
+                            const fallbackRatchetState = parseRatchetState(fallbackState.state) as Record<string, unknown>;
 
                             // Add new peer to fallback peer_id_map
                             if (!fallbackRatchetState.peer_id_map) {
@@ -863,7 +720,8 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                             }
 
                             // Save updated fallback state
-                            const updatedFallbackState = fallbackParsed.state
+                            const fallbackOuter = JSON.parse(fallbackState.state);
+                            const updatedFallbackState = (fallbackOuter.state && typeof fallbackOuter.state === 'string')
                               ? JSON.stringify({ state: JSON.stringify(fallbackRatchetState) })
                               : JSON.stringify(fallbackRatchetState);
 
@@ -872,16 +730,12 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                               state: updatedFallbackState,
                               timestamp: Date.now(),
                             });
+                            ratchetStateCacheRef.current.clear();
 
-                            logger.log(`[WS:${getAddr()}] Updated fallback peer maps for new participant (critical for decrypt!)`);
                           } catch (fallbackUpdateError) {
-                            logger.log('[WS] Failed to update fallback peer maps:', fallbackUpdateError);
                           }
-                        } else {
-                          logger.warn(`[WS:${getAddr()}] No fallback state found to update with new peer`);
                         }
                       } catch (peerMapError) {
-                        logger.log('[WS] Failed to update peer maps:', peerMapError);
                       }
                     }
 
@@ -894,10 +748,23 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                       inbox_address: participant.inboxAddress,
                     });
 
-                    // Invalidate space members cache
-                    queryClient.invalidateQueries({ queryKey: queryKeys.spaces.members(spaceId) });
-
-                    logger.log(`[WS:${getAddr()}] Saved new member to storage`);
+                    // Update space members cache directly (member data available from join event)
+                    queryClient.setQueryData(queryKeys.spaces.members(spaceId), (old: SpaceMember[] | undefined) => {
+                      if (!old) return old;
+                      if (old.some((m: SpaceMember) => m.address === participant.address)) {
+                        return old.map((m: SpaceMember) =>
+                          m.address === participant.address
+                            ? { ...m, display_name: participant.displayName, profile_image: participant.userIcon, inbox_address: participant.inboxAddress }
+                            : m
+                        );
+                      }
+                      return [...old, {
+                        address: participant.address,
+                        display_name: participant.displayName,
+                        profile_image: participant.userIcon,
+                        inbox_address: participant.inboxAddress,
+                      }];
+                    });
 
                     // Save join event as a message (matches desktop behavior)
                     const space = getSpace(spaceId);
@@ -924,17 +791,27 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                     };
 
                     await adapter.saveMessage(joinMessage, now, '', '', '', '');
-                    queryClient.invalidateQueries({ queryKey: queryKeys.messages.infinite(spaceId, channelId) });
-                    logger.log(`[WS:${getAddr()}] Saved join event as message`);
+                    // Update cache directly instead of invalidating (avoids refetch)
+                    const messagesKey = queryKeys.messages.infinite(spaceId, channelId);
+                    queryClient.setQueryData<{ pages: { messages: Message[] }[]; pageParams: unknown[] }>(messagesKey, (old) => {
+                      if (!old) return old;
+                      return {
+                        ...old,
+                        pages: old.pages.map((page, index) => {
+                          if (index === 0) {
+                            return { ...page, messages: [...page.messages, joinMessage] };
+                          }
+                          return page;
+                        }),
+                      };
+                    });
                   } catch (joinError) {
-                    logger.log('[WS] Error processing join message:', joinError);
                   }
                   break;
                 }
 
                 case 'leave': {
                   // A participant left the space - mark their inbox as empty
-                  logger.log(`[WS:${getAddr()}] Received leave control message`);
                   try {
                     const leavePayload = controlPayload.message as {
                       type: 'leave';
@@ -944,11 +821,8 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
 
                     const leavingAddress = leavePayload.participant?.address || leavePayload.address;
                     if (!leavingAddress) {
-                      logger.warn('[WS] Leave message missing address');
                       break;
                     }
-
-                    logger.log(`[WS:${getAddr()}] Participant left:`, leavingAddress);
 
                     // Update member in storage - set inbox_address to empty string to mark inactive
                     const adapter = getMMKVAdapter();
@@ -960,12 +834,16 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                       });
                     }
 
-                    // Invalidate space members cache
-                    queryClient.invalidateQueries({ queryKey: queryKeys.spaces.members(spaceId) });
-
-                    logger.log(`[WS:${getAddr()}] Marked member as left`);
+                    // Update space members cache directly (mark member as inactive)
+                    queryClient.setQueryData(queryKeys.spaces.members(spaceId), (old: SpaceMember[] | undefined) => {
+                      if (!old) return old;
+                      return old.map((m: SpaceMember) =>
+                        m.address === leavingAddress
+                          ? { ...m, inbox_address: '' }
+                          : m
+                      );
+                    });
                   } catch (leaveError) {
-                    logger.log('[WS] Error processing leave message:', leaveError);
                   }
                   break;
                 }
@@ -973,10 +851,8 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                 case 'kick': {
                   // A participant was kicked from the space
                   const kickedAddress = controlPayload.message.kick;
-                  logger.log(`[WS:${getAddr()}] Received kick control message:`, kickedAddress);
 
                   if (!kickedAddress) {
-                    logger.warn('[WS] Kick message missing kicked address');
                     break;
                   }
 
@@ -993,17 +869,13 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                           const parsed = JSON.parse(storedUser);
                           ownAddress = parsed.address;
                         }
-                      } catch (e) {
-                        logger.log('[WS] Failed to get user address from storage:', e);
+                      } catch {
+                        // Storage/parse failure — ownAddress stays null
                       }
                     }
-                    logger.log(`[WS:${getAddr()}] Current user address:`, ownAddress);
-                    logger.log(`[WS:${getAddr()}] Kick comparison:`, kickedAddress === ownAddress, 'kicked:', kickedAddress, 'user:', ownAddress);
 
                     // Check if we are being kicked
                     if (ownAddress && kickedAddress === ownAddress) {
-                      logger.warn(`[WS:${getAddr()}] *** WE HAVE BEEN KICKED FROM SPACE ***`);
-
                       // Get space name for notification
                       const space = getSpace(spaceId);
                       const spaceName = space?.spaceName || 'this space';
@@ -1019,12 +891,10 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                       const spaceInboxKey = getSpaceKey(spaceId, 'inbox');
                       const spaceInboxAddress = spaceInboxKey?.address;
                       if (spaceInboxAddress && wsClientRef.current) {
-                        logger.log(`[WS:${getAddr()}] Unsubscribing from space inbox:`, spaceInboxAddress.substring(0, 12));
                         try {
                           await wsClientRef.current.unsubscribe([spaceInboxAddress]);
                           subscribedInboxesRef.current.delete(spaceInboxAddress);
                         } catch (unsubError) {
-                          console.error('[WS] Error unsubscribing from space inbox:', unsubError);
                         }
                       }
 
@@ -1050,15 +920,12 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                         // 3. Delete the space (this clears space data including members)
                         await adapter.deleteSpace(spaceId);
 
-                        logger.log(`[WS:${getAddr()}] Cleaned up local data after kick`);
-
-                        // Invalidate all space-related queries
-                        queryClient.invalidateQueries({ queryKey: queryKeys.spaces.all() });
+                        // Invalidate active space queries (space was deleted from storage)
+                        queryClient.invalidateQueries({ queryKey: queryKeys.spaces.all, refetchType: 'active' });
 
                         // Set kicked space ID so consumers can navigate away
                         setKickedFromSpaceId(spaceId);
                       } catch (cleanupError) {
-                        console.error('[WS] Error cleaning up after kick:', cleanupError);
                       }
                     } else {
                       // Someone else was kicked - mark them as kicked
@@ -1070,1029 +937,32 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                           isKicked: true,
                         });
                       }
-
-                      logger.log(`[WS:${getAddr()}] Marked member as kicked:`, kickedAddress);
                     }
 
-                    // Invalidate space members cache
-                    queryClient.invalidateQueries({ queryKey: queryKeys.spaces.members(spaceId) });
+                    // Update space members cache directly (mark kicked member as inactive)
+                    queryClient.setQueryData(queryKeys.spaces.members(spaceId), (old: SpaceMember[] | undefined) => {
+                      if (!old) return old;
+                      return old.map((m: SpaceMember) =>
+                        m.address === kickedAddress
+                          ? { ...m, inbox_address: '', isKicked: true }
+                          : m
+                      );
+                    });
                   } catch (kickError) {
-                    logger.log('[WS] Error processing kick message:', kickError);
                   }
                   break;
                 }
 
-                case 'sync-peer-map': {
-                  // Peer map synchronization - update local peer_id_map and id_peer_map
-                  logger.log(`[WS:${getAddr()}] Received sync-peer-map control message`);
-                  try {
-                    const peerMapData = controlPayload.message.peerMap;
-                    if (!peerMapData) {
-                      logger.warn('[WS] sync-peer-map missing peerMap data');
-                      break;
-                    }
-
-                    const spaceConversationId = `${spaceId}/${spaceId}`;
-                    const encryptionStates = encryptionStateStorage.getEncryptionStates(spaceConversationId);
-
-                    if (encryptionStates.length > 0) {
-                      const stateData = encryptionStates[0];
-                      // Parse the nested state structure
-                      let ratchetState: Record<string, unknown>;
-                      const parsed = JSON.parse(stateData.state);
-                      if (parsed.state && typeof parsed.state === 'string') {
-                        ratchetState = JSON.parse(parsed.state);
-                      } else {
-                        ratchetState = parsed;
-                      }
-
-                      // MERGE peer maps instead of replacing - preserve our own entries
-                      // This is critical when syncing with a peer that doesn't have us in their map yet
-                      const existingIdPeerMap = (ratchetState.id_peer_map || {}) as Record<string, unknown>;
-                      const existingPeerIdMap = (ratchetState.peer_id_map || {}) as Record<string, unknown>;
-                      const incomingIdPeerMap = (peerMapData.id_peer_map || {}) as Record<string, unknown>;
-                      const incomingPeerIdMap = (peerMapData.peer_id_map || {}) as Record<string, unknown>;
-
-                      logger.log(`[WS:${getAddr()}] sync-peer-map: Merging peer maps`);
-                      logger.log(`[WS:${getAddr()}] sync-peer-map: Existing id_peer_map has ${Object.keys(existingIdPeerMap).length} entries`);
-                      logger.log(`[WS:${getAddr()}] sync-peer-map: Incoming id_peer_map has ${Object.keys(incomingIdPeerMap).length} entries`);
-
-                      ratchetState.id_peer_map = {
-                        ...existingIdPeerMap,
-                        ...incomingIdPeerMap,
-                      };
-                      ratchetState.peer_id_map = {
-                        ...existingPeerIdMap,
-                        ...incomingPeerIdMap,
-                      };
-
-                      logger.log(`[WS:${getAddr()}] sync-peer-map: Merged id_peer_map now has ${Object.keys(ratchetState.id_peer_map as object).length} entries`);
-
-                      // Sync critical ratchet state fields for decryption to work
-                      // These fields are needed for Triple Ratchet to derive the correct keys
-                      if (peerMapData.root_key) {
-                        logger.log(`[WS:${getAddr()}] sync-peer-map: Updating root_key`);
-                        ratchetState.root_key = peerMapData.root_key;
-                      }
-                      if (peerMapData.dkg_ratchet) {
-                        logger.log(`[WS:${getAddr()}] sync-peer-map: Updating dkg_ratchet`);
-                        ratchetState.dkg_ratchet = peerMapData.dkg_ratchet;
-                        ratchetState.next_dkg_ratchet = peerMapData.dkg_ratchet; // Keep in sync
-                      }
-                      if (peerMapData.receiving_group_key) {
-                        ratchetState.receiving_group_key = peerMapData.receiving_group_key;
-                      }
-                      if (peerMapData.receiving_chain_key) {
-                        logger.log(`[WS:${getAddr()}] sync-peer-map: Updating receiving_chain_key`);
-                        ratchetState.receiving_chain_key = peerMapData.receiving_chain_key;
-                      }
-                      if (peerMapData.current_header_key) {
-                        ratchetState.current_header_key = peerMapData.current_header_key;
-                      }
-                      if (peerMapData.next_header_key) {
-                        ratchetState.next_header_key = peerMapData.next_header_key;
-                      }
-                      if (peerMapData.async_dkg_pubkey) {
-                        ratchetState.async_dkg_pubkey = peerMapData.async_dkg_pubkey;
-                      }
-                      if (peerMapData.threshold) {
-                        ratchetState.threshold = peerMapData.threshold;
-                      }
-
-                      // Save updated state - PRESERVE template and evals for invite generation!
-                      let updatedState: string;
-                      if (parsed.state) {
-                        updatedState = JSON.stringify({
-                          state: JSON.stringify(ratchetState),
-                          template: parsed.template,
-                          evals: parsed.evals,
-                        });
-                      } else {
-                        updatedState = JSON.stringify(ratchetState);
-                      }
-
-                      encryptionStateStorage.saveEncryptionState({
-                        ...stateData,
-                        state: updatedState,
-                        timestamp: Date.now(),
-                      });
-
-                      logger.log(`[WS:${getAddr()}] Updated peer maps from sync (preserved template/evals)`);
-
-                      // CRITICAL: Also update fallback state with synced peer maps
-                      const fallbackState = encryptionStateStorage.getFallbackState(spaceConversationId, stateData.inboxId);
-                      if (fallbackState) {
-                        try {
-                          let fallbackRatchetState: Record<string, unknown>;
-                          const fallbackParsed = JSON.parse(fallbackState.state);
-                          if (fallbackParsed.state && typeof fallbackParsed.state === 'string') {
-                            fallbackRatchetState = JSON.parse(fallbackParsed.state);
-                          } else {
-                            fallbackRatchetState = fallbackParsed;
-                          }
-
-                          // MERGE fallback peer maps instead of replacing
-                          const existingFallbackIdPeerMap = (fallbackRatchetState.id_peer_map || {}) as Record<string, unknown>;
-                          const existingFallbackPeerIdMap = (fallbackRatchetState.peer_id_map || {}) as Record<string, unknown>;
-
-                          fallbackRatchetState.id_peer_map = {
-                            ...existingFallbackIdPeerMap,
-                            ...incomingIdPeerMap,
-                          };
-                          fallbackRatchetState.peer_id_map = {
-                            ...existingFallbackPeerIdMap,
-                            ...incomingPeerIdMap,
-                          };
-
-                          // Also sync ratchet state fields to fallback
-                          if (peerMapData.root_key) {
-                            fallbackRatchetState.root_key = peerMapData.root_key;
-                          }
-                          if (peerMapData.dkg_ratchet) {
-                            fallbackRatchetState.dkg_ratchet = peerMapData.dkg_ratchet;
-                            fallbackRatchetState.next_dkg_ratchet = peerMapData.dkg_ratchet;
-                          }
-                          if (peerMapData.receiving_group_key) {
-                            fallbackRatchetState.receiving_group_key = peerMapData.receiving_group_key;
-                          }
-                          if (peerMapData.receiving_chain_key) {
-                            fallbackRatchetState.receiving_chain_key = peerMapData.receiving_chain_key;
-                          }
-                          if (peerMapData.current_header_key) {
-                            fallbackRatchetState.current_header_key = peerMapData.current_header_key;
-                          }
-                          if (peerMapData.next_header_key) {
-                            fallbackRatchetState.next_header_key = peerMapData.next_header_key;
-                          }
-                          if (peerMapData.async_dkg_pubkey) {
-                            fallbackRatchetState.async_dkg_pubkey = peerMapData.async_dkg_pubkey;
-                          }
-                          if (peerMapData.threshold) {
-                            fallbackRatchetState.threshold = peerMapData.threshold;
-                          }
-
-                          // Save updated fallback state
-                          const updatedFallbackState = fallbackParsed.state
-                            ? JSON.stringify({ state: JSON.stringify(fallbackRatchetState) })
-                            : JSON.stringify(fallbackRatchetState);
-
-                          encryptionStateStorage.saveFallbackState({
-                            ...fallbackState,
-                            state: updatedFallbackState,
-                            timestamp: Date.now(),
-                          });
-
-                          logger.log(`[WS:${getAddr()}] Updated fallback peer maps from sync (merged)`);
-                        } catch (fallbackSyncError) {
-                          logger.log('[WS] Failed to update fallback peer maps from sync:', fallbackSyncError);
-                        }
-                      }
-                    }
-                  } catch (syncPeerMapError) {
-                    logger.log('[WS] Error processing sync-peer-map:', syncPeerMapError);
-                  }
-                  break;
-                }
-
-                case 'sync': {
-                  // Sync trigger - synchronize all data to the requesting inbox
-                  logger.log(`[WS:${getAddr()}] Received sync control message`);
-                  try {
-                    const syncPayload = controlPayload.message as {
-                      type: 'sync';
-                      inboxAddress?: string;
-                    };
-
-                    const targetInbox = syncPayload.inboxAddress;
-                    if (!targetInbox) {
-                      logger.warn('[WS] sync message missing inboxAddress');
-                      break;
-                    }
-
-                    logger.log(`[WS:${getAddr()}] Synchronizing data to inbox:`, targetInbox.substring(0, 12));
-
-                    // Get encryption state for peer map
-                    const spaceConversationId = `${spaceId}/${spaceId}`;
-                    const encryptionStates = encryptionStateStorage.getEncryptionStates(spaceConversationId);
-
-                    if (encryptionStates.length > 0) {
-                      const stateData = encryptionStates[0];
-
-                      // Use FALLBACK state for sync - this is what's actually used for encryption
-                      const fallbackState = encryptionStateStorage.getFallbackState(spaceConversationId, stateData.inboxId);
-                      const stateToSync = fallbackState || stateData;
-
-                      let ratchetState: Record<string, unknown>;
-                      const parsed = JSON.parse(stateToSync.state);
-                      if (parsed.state && typeof parsed.state === 'string') {
-                        ratchetState = JSON.parse(parsed.state);
-                      } else {
-                        ratchetState = parsed;
-                      }
-
-                      logger.log(`[WS:${getAddr()}] sync: Using ${fallbackState ? 'FALLBACK' : 'current'} state for sync`);
-                      logger.log(`[WS:${getAddr()}] sync: root_key preview: ${(ratchetState.root_key as string)?.substring(0, 20)}`);
-
-                      const client = wsClientRef.current;
-                      if (client && client.isConnected) {
-                        // 1. Send peer map with critical ratchet state for decryption
-                        if (ratchetState.id_peer_map && ratchetState.peer_id_map) {
-                          const peerMapEnvelope = await sendSyncPeerMapMessage(spaceId, targetInbox, {
-                            id_peer_map: ratchetState.id_peer_map,
-                            peer_id_map: ratchetState.peer_id_map,
-                            // Include critical fields for ratchet sync
-                            root_key: ratchetState.root_key,
-                            dkg_ratchet: ratchetState.dkg_ratchet,
-                            receiving_group_key: ratchetState.receiving_group_key,
-                            receiving_chain_key: ratchetState.receiving_chain_key,
-                            current_header_key: ratchetState.current_header_key,
-                            next_header_key: ratchetState.next_header_key,
-                            async_dkg_pubkey: ratchetState.async_dkg_pubkey,
-                            threshold: ratchetState.threshold,
-                          });
-                          client.enqueueOutbound(async () => [peerMapEnvelope]);
-                          logger.log(`[WS:${getAddr()}] Sent sync-peer-map with ratchet state`);
-                        }
-
-                        // 2. Send members
-                        const adapter = getMMKVAdapter();
-                        const members = await adapter.getSpaceMembers(spaceId);
-                        logger.log(`[WS:${getAddr()}] sync-initiate: Got ${members.length} members to sync`);
-                        if (members.length > 0) {
-                          // Use field names that match desktop's expectations
-                          const memberData = members.map(m => ({
-                            user_address: m.address,
-                            display_name: m.display_name,
-                            user_icon: m.profile_image,
-                            inbox_address: m.inbox_address,
-                          }));
-                          logger.log(`[WS:${getAddr()}] sync-initiate: Member data sample:`, JSON.stringify(memberData[0]));
-                          const memberEnvelopes = await sendSyncMembersMessage(spaceId, targetInbox, memberData);
-                          for (const env of memberEnvelopes) {
-                            client.enqueueOutbound(async () => [env]);
-                          }
-                          logger.log(`[WS:${getAddr()}] Sent ${memberEnvelopes.length} sync-members chunk(s)`);
-                        }
-
-                        // 3. Send messages
-                        const space = getSpace(spaceId);
-                        const channelId = space?.defaultChannelId || spaceId;
-                        const messagesResult = await storage.getMessages({
-                          spaceId,
-                          channelId,
-                          limit: 1000,
-                        });
-                        if (messagesResult.messages.length > 0) {
-                          const messageEnvelopes = await sendSyncMessagesMessage(
-                            spaceId,
-                            targetInbox,
-                            channelId,
-                            messagesResult.messages
-                          );
-                          for (const env of messageEnvelopes) {
-                            client.enqueueOutbound(async () => [env]);
-                          }
-                          logger.log(`[WS:${getAddr()}] Sent ${messageEnvelopes.length} sync-messages chunk(s)`);
-                        }
-                      }
-                    }
-                  } catch (syncError) {
-                    logger.log('[WS] Error processing sync:', syncError);
-                  }
-                  break;
-                }
-
-                case 'sync-request': {
-                  // Another participant is requesting sync - respond with sync-info if we have useful data
-                  // New protocol: uses SyncService with hash-based summary for delta sync
-                  logger.log(`[WS:${getAddr()}] === SYNC-REQUEST RECEIVED ===`);
-                  logger.log(`[WS:${getAddr()}] sync-request controlPayload.message:`, JSON.stringify(controlPayload.message, null, 2));
-                  try {
-                    // Handle both old and new protocol formats
-                    const syncRequestPayload = controlPayload.message as SyncRequestPayload & {
-                      // Legacy fields
-                      memberCount?: number;
-                      messageCount?: number;
-                    };
-
-                    const theirInboxAddress = syncRequestPayload.inboxAddress;
-                    logger.log(`[WS:${getAddr()}] sync-request from: ${theirInboxAddress?.substring(0, 12)}`);
-                    logger.log(`[WS:${getAddr()}] sync-request payload:`, {
-                      type: syncRequestPayload.type,
-                      inboxAddress: theirInboxAddress?.substring(0, 12),
-                      expiry: syncRequestPayload.expiry,
-                      expiryValid: syncRequestPayload.expiry > Date.now(),
-                      hasSummary: !!syncRequestPayload.summary,
-                      summary: syncRequestPayload.summary,
-                    });
-
-                    // Check expiry
-                    if (!syncRequestPayload.expiry || syncRequestPayload.expiry < Date.now()) {
-                      logger.log(`[WS:${getAddr()}] sync-request EXPIRED, skipping`);
-                      break;
-                    }
-
-                    // Deduplication
-                    const syncRequestKey = `${spaceId}:${syncRequestPayload.expiry}:${theirInboxAddress}`;
-                    const now = Date.now();
-                    const lastProcessed = processedSyncRequestsRef.current.get(syncRequestKey);
-                    if (lastProcessed && (now - lastProcessed) < SYNC_REQUEST_DEDUP_EXPIRY_MS) {
-                      logger.log(`[WS:${getAddr()}] Skipping duplicate sync-request`);
-                      break;
-                    }
-                    processedSyncRequestsRef.current.set(syncRequestKey, now);
-                    // Clean up old entries
-                    for (const [key, timestamp] of processedSyncRequestsRef.current) {
-                      if (now - timestamp > SYNC_REQUEST_DEDUP_EXPIRY_MS) {
-                        processedSyncRequestsRef.current.delete(key);
-                      }
-                    }
-
-                    const inboxKey = getSpaceKey(spaceId, 'inbox');
-                    if (!inboxKey || !theirInboxAddress || inboxKey.address === theirInboxAddress) {
-                      logger.log(`[WS:${getAddr()}] sync-request: SKIPPING - self or no inbox key`);
-                      break;
-                    }
-
-                    const syncService = getSyncService();
-                    if (!syncService) {
-                      logger.log(`[WS:${getAddr()}] sync-request: No SyncService available`);
-                      break;
-                    }
-
-                    const space = getSpace(spaceId);
-                    const channelId = space?.defaultChannelId || spaceId;
-
-                    // Build sync-info response using new protocol if summary provided
-                    logger.log(`[WS:${getAddr()}] sync-request: Building response, hasSummary=${!!syncRequestPayload.summary}`);
-                    if (syncRequestPayload.summary) {
-                      // New protocol with SyncSummary
-                      logger.log(`[WS:${getAddr()}] sync-request: Calling buildSyncInfo for space=${spaceId.substring(0, 12)}, channel=${channelId.substring(0, 12)}`);
-                      const syncInfoPayload = await syncService.buildSyncInfo(
-                        spaceId,
-                        channelId,
-                        inboxKey.address!,
-                        syncRequestPayload.summary
-                      );
-
-                      logger.log(`[WS:${getAddr()}] sync-request: buildSyncInfo returned:`, syncInfoPayload ? {
-                        type: syncInfoPayload.type,
-                        inboxAddress: syncInfoPayload.inboxAddress?.substring(0, 12),
-                        summary: syncInfoPayload.summary,
-                      } : 'null');
-
-                      if (!syncInfoPayload) {
-                        logger.log(`[WS:${getAddr()}] sync-request: Nothing to sync (new protocol) - our data matches or is less than theirs`);
-                        break;
-                      }
-
-                      logger.log(`[WS:${getAddr()}] sync-request: Sending sync-info V2 response to ${theirInboxAddress.substring(0, 12)}`);
-                      const syncInfoEnvelope = await sendSyncInfoMessageV2(
-                        spaceId,
-                        theirInboxAddress,
-                        syncInfoPayload
-                      );
-
-                      const client = wsClientRef.current;
-                      if (client && client.isConnected) {
-                        client.enqueueOutbound(async () => [syncInfoEnvelope]);
-                        logger.log(`[WS:${getAddr()}] sync-request: sync-info V2 sent!`);
-                      }
-                    } else {
-                      // Legacy protocol - fall back to old behavior
-                      const adapter = getMMKVAdapter();
-                      const members = await adapter.getSpaceMembers(spaceId);
-                      const messagesResult = await adapter.getMessages({ spaceId, channelId });
-
-                      if (members.length === 0 && messagesResult.messages.length === 0) {
-                        logger.log(`[WS:${getAddr()}] sync-request: SKIPPING - no data (legacy)`);
-                        break;
-                      }
-
-                      logger.log(`[WS:${getAddr()}] sync-request: Sending sync-info response (legacy)`);
-                      const syncInfoEnvelope = await sendSyncInfoMessage(
-                        spaceId,
-                        theirInboxAddress,
-                        messagesResult.messages.length,
-                        members.length
-                      );
-
-                      const client = wsClientRef.current;
-                      if (client && client.isConnected) {
-                        client.enqueueOutbound(async () => [syncInfoEnvelope]);
-                        logger.log(`[WS:${getAddr()}] sync-request: sync-info sent (legacy)!`);
-                      }
-                    }
-                  } catch (syncRequestError) {
-                    logger.log(`[WS:${getAddr()}] sync-request ERROR:`, syncRequestError);
-                  }
-                  break;
-                }
-
-                case 'sync-info': {
-                  // Sync info response - another participant responded to our sync-request
-                  // Add them as a candidate and SyncService will trigger sync-initiate
-                  logger.log(`[WS:${getAddr()}] === SYNC-INFO RECEIVED ===`);
-                  try {
-                    const syncInfoPayload = controlPayload.message as SyncInfoPayload & {
-                      // Legacy fields
-                      messageCount?: number;
-                      memberCount?: number;
-                    };
-
-                    logger.log(`[WS:${getAddr()}] sync-info from: ${syncInfoPayload.inboxAddress?.substring(0, 12)}`);
-                    logger.log(`[WS:${getAddr()}] sync-info payload:`, {
-                      inboxAddress: syncInfoPayload.inboxAddress?.substring(0, 12),
-                      summary: syncInfoPayload.summary,
-                      messageCount: syncInfoPayload.messageCount,
-                      memberCount: syncInfoPayload.memberCount,
-                    });
-
-                    const syncService = getSyncService();
-                    if (!syncService) {
-                      logger.log(`[WS:${getAddr()}] sync-info: No SyncService available`);
-                      break;
-                    }
-
-                    // Check if we have an active session for this space
-                    if (!syncService.hasActiveSession(spaceId)) {
-                      logger.log(`[WS:${getAddr()}] sync-info: No active sync session for space, ignoring`);
-                      break;
-                    }
-
-                    // Build candidate from sync-info
-                    // Support both new protocol (summary) and legacy (messageCount/memberCount)
-                    const candidate = {
-                      inboxAddress: syncInfoPayload.inboxAddress,
-                      summary: syncInfoPayload.summary || {
-                        messageCount: syncInfoPayload.messageCount || 0,
-                        memberCount: syncInfoPayload.memberCount || 0,
-                        newestMessageTimestamp: 0,
-                        oldestMessageTimestamp: 0,
-                        manifestHash: '',
-                      },
-                    };
-
-                    logger.log(`[WS:${getAddr()}] sync-info: Adding candidate`, {
-                      inboxAddress: candidate.inboxAddress?.substring(0, 12),
-                      messageCount: candidate.summary.messageCount,
-                      memberCount: candidate.summary.memberCount,
-                    });
-
-                    // Add candidate - SyncService will schedule sync-initiate via callback
-                    syncService.addCandidate(spaceId, candidate);
-                    logger.log(`[WS:${getAddr()}] sync-info: Candidate added, sync-initiate will be triggered`);
-                  } catch (syncInfoError) {
-                    logger.log(`[WS:${getAddr()}] sync-info ERROR:`, syncInfoError);
-                  }
-                  break;
-                }
-
-                case 'sync-initiate': {
-                  // Sync initiation from another participant - they want our data
-                  // New protocol: receives their manifest, we respond with our manifest
-                  // Old protocol: just sends raw data
-                  logger.log(`[WS:${getAddr()}] === SYNC-INITIATE RECEIVED ===`);
-                  const initiatePayload = controlPayload.message as SyncInitiatePayload & {
-                    // Legacy: old protocol just had inboxAddress
-                  };
-
-                  const targetInbox = initiatePayload.inboxAddress;
-                  if (!targetInbox) {
-                    logger.log(`[WS:${getAddr()}] sync-initiate: No target inbox, skipping`);
-                    break;
-                  }
-
-                  // Check if we're already processing a sync-initiate for this space+target
-                  const syncKey = `${spaceId}:${targetInbox}`;
-                  if (syncInitiateInFlightRef.current.has(syncKey)) {
-                    logger.log(`[WS:${getAddr()}] sync-initiate: Already in-flight for ${targetInbox.substring(0, 12)}, skipping duplicate`);
-                    break;
-                  }
-                  syncInitiateInFlightRef.current.add(syncKey);
-                  logger.log(`[WS:${getAddr()}] sync-initiate: Added to in-flight set, processing for ${targetInbox.substring(0, 12)}`);
-
-                  try {
-                    const client = wsClientRef.current;
-                    if (!client || !client.isConnected) {
-                      logger.log(`[WS:${getAddr()}] sync-initiate: No client connection`);
-                      break;
-                    }
-
-                    // Check if this is new protocol (has manifest) or legacy
-                    if (initiatePayload.manifest) {
-                      // NEW PROTOCOL: Respond with sync-manifest
-                      logger.log(`[WS:${getAddr()}] sync-initiate: New protocol - responding with manifest`);
-                      const syncService = getSyncService();
-                      if (!syncService) {
-                        logger.log(`[WS:${getAddr()}] sync-initiate: No SyncService available`);
-                        break;
-                      }
-
-                      const space = getSpace(spaceId);
-                      const channelId = space?.defaultChannelId || spaceId;
-
-                      // Get our peer IDs from encryption state
-                      const spaceConversationId = `${spaceId}/${spaceId}`;
-                      const encryptionStates = encryptionStateStorage.getEncryptionStates(spaceConversationId);
-                      let peerIds: number[] = [];
-                      if (encryptionStates.length > 0) {
-                        const parsed = JSON.parse(encryptionStates[0].state);
-                        const ratchetState = parsed.state ? JSON.parse(parsed.state) : parsed;
-                        if (ratchetState.id_peer_map) {
-                          peerIds = Object.keys(ratchetState.id_peer_map).map(Number);
-                        }
-                      }
-
-                      // Get our inbox address
-                      const ourInboxKey = getSpaceKey(spaceId, 'inbox');
-                      if (!ourInboxKey?.address) {
-                        logger.log(`[WS:${getAddr()}] sync-initiate: No inbox key found`);
-                        break;
-                      }
-
-                      // Build and send our manifest
-                      const manifestPayload = await syncService.buildSyncManifest(spaceId, channelId, peerIds, ourInboxKey.address);
-                      const manifestEnvelope = await sendSyncManifestMessage(
-                        spaceId,
-                        targetInbox,
-                        manifestPayload
-                      );
-                      client.enqueueOutbound(async () => [manifestEnvelope]);
-                      logger.log(`[WS:${getAddr()}] sync-initiate: Sent sync-manifest response`);
-
-                      // Also build and send delta with data they're missing
-                      // The initiator's manifest is in initiatePayload.manifest
-                      const ourPeerEntries = new Map<number, { peerId: number; publicKey: string }>();
-                      if (encryptionStates.length > 0) {
-                        const parsed = JSON.parse(encryptionStates[0].state);
-                        const ratchetState = parsed.state ? JSON.parse(parsed.state) : parsed;
-                        if (ratchetState.id_peer_map) {
-                          for (const [idStr, pubKey] of Object.entries(ratchetState.id_peer_map)) {
-                            const peerId = parseInt(idStr, 10);
-                            ourPeerEntries.set(peerId, { peerId, publicKey: pubKey as string });
-                          }
-                        }
-                      }
-
-                      const deltaPayloads = await syncService.buildSyncDelta(
-                        spaceId,
-                        channelId,
-                        initiatePayload.manifest,
-                        initiatePayload.memberDigests || [],
-                        initiatePayload.peerIds || [],
-                        ourPeerEntries
-                      );
-
-                      logger.log(`[WS:${getAddr()}] sync-initiate: Built ${deltaPayloads.length} delta payload(s) to send`);
-
-                      if (deltaPayloads.length > 0) {
-                        const deltaEnvelopes = await sendSyncDeltaMessages(
-                          spaceId,
-                          targetInbox,
-                          deltaPayloads
-                        );
-
-                        for (const envelope of deltaEnvelopes) {
-                          client.enqueueOutbound(async () => [envelope]);
-                        }
-                        logger.log(`[WS:${getAddr()}] sync-initiate: Sent ${deltaEnvelopes.length} delta envelope(s)`)
-                      }
-
-                      // Also send sync-peer-map with ratchet state for encryption key sync
-                      if (encryptionStates.length > 0) {
-                        const stateData = encryptionStates[0];
-                        const spaceConversationId = `${spaceId}/${spaceId}`;
-                        const fallbackState = encryptionStateStorage.getFallbackState(spaceConversationId, stateData.inboxId);
-                        const stateToSync = fallbackState || stateData;
-
-                        const parsed = JSON.parse(stateToSync.state);
-                        const ratchetState = parsed.state ? JSON.parse(parsed.state) : parsed;
-
-                        if (ratchetState.id_peer_map && ratchetState.peer_id_map) {
-                          logger.log(`[WS:${getAddr()}] sync-initiate: Sending sync-peer-map with ratchet state`);
-                          const peerMapEnvelope = await sendSyncPeerMapMessage(spaceId, targetInbox, {
-                            id_peer_map: ratchetState.id_peer_map,
-                            peer_id_map: ratchetState.peer_id_map,
-                            root_key: ratchetState.root_key,
-                            dkg_ratchet: ratchetState.dkg_ratchet,
-                            receiving_group_key: ratchetState.receiving_group_key,
-                            receiving_chain_key: ratchetState.receiving_chain_key,
-                            current_header_key: ratchetState.current_header_key,
-                            next_header_key: ratchetState.next_header_key,
-                            async_dkg_pubkey: ratchetState.async_dkg_pubkey,
-                            threshold: ratchetState.threshold,
-                          });
-                          client.enqueueOutbound(async () => [peerMapEnvelope]);
-                          logger.log(`[WS:${getAddr()}] sync-initiate: Sent sync-peer-map`);
-                        }
-                      }
-                    } else {
-                      // LEGACY PROTOCOL: Send raw data
-                      logger.log(`[WS:${getAddr()}] sync-initiate: Legacy protocol - sending raw data`);
-                      const spaceConversationId = `${spaceId}/${spaceId}`;
-                      const encryptionStates = encryptionStateStorage.getEncryptionStates(spaceConversationId);
-
-                      if (encryptionStates.length > 0) {
-                        const stateData = encryptionStates[0];
-
-                        // Use FALLBACK state for sync - this is what's actually used for encryption
-                        const fallbackState = encryptionStateStorage.getFallbackState(spaceConversationId, stateData.inboxId);
-                        const stateToSync = fallbackState || stateData;
-
-                        let ratchetState: Record<string, unknown>;
-                        const parsed = JSON.parse(stateToSync.state);
-                        if (parsed.state && typeof parsed.state === 'string') {
-                          ratchetState = JSON.parse(parsed.state);
-                        } else {
-                          ratchetState = parsed;
-                        }
-
-                        logger.log(`[WS:${getAddr()}] sync-initiate: Using ${fallbackState ? 'FALLBACK' : 'current'} state for sync`);
-                        logger.log(`[WS:${getAddr()}] sync-initiate: root_key preview: ${(ratchetState.root_key as string)?.substring(0, 20)}`);
-
-                        if (ratchetState.id_peer_map && ratchetState.peer_id_map) {
-                          logger.log(`[WS:${getAddr()}] sync-initiate: Sending sync data to ${targetInbox.substring(0, 12)}`);
-                          const peerMapEnvelope = await sendSyncPeerMapMessage(spaceId, targetInbox, {
-                            id_peer_map: ratchetState.id_peer_map,
-                            peer_id_map: ratchetState.peer_id_map,
-                            // Include critical fields for ratchet sync
-                            root_key: ratchetState.root_key,
-                            dkg_ratchet: ratchetState.dkg_ratchet,
-                            receiving_group_key: ratchetState.receiving_group_key,
-                            receiving_chain_key: ratchetState.receiving_chain_key,
-                            current_header_key: ratchetState.current_header_key,
-                            next_header_key: ratchetState.next_header_key,
-                            async_dkg_pubkey: ratchetState.async_dkg_pubkey,
-                            threshold: ratchetState.threshold,
-                          });
-                          client.enqueueOutbound(async () => [peerMapEnvelope]);
-
-                          const adapter = getMMKVAdapter();
-                          const members = await adapter.getSpaceMembers(spaceId);
-                          if (members.length > 0) {
-                            const memberData = members.map(m => ({
-                              user_address: m.address,
-                              display_name: m.display_name,
-                              user_icon: m.profile_image,
-                              inbox_address: m.inbox_address,
-                            }));
-                            const memberEnvelopes = await sendSyncMembersMessage(spaceId, targetInbox, memberData);
-                            for (const env of memberEnvelopes) {
-                              client.enqueueOutbound(async () => [env]);
-                            }
-                          }
-
-                          const space = getSpace(spaceId);
-                          const channelId = space?.defaultChannelId || spaceId;
-                          const messagesResult = await storage.getMessages({
-                            spaceId,
-                            channelId,
-                            limit: 1000,
-                          });
-                          if (messagesResult.messages.length > 0) {
-                            const messageEnvelopes = await sendSyncMessagesMessage(
-                              spaceId,
-                              targetInbox,
-                              channelId,
-                              messagesResult.messages
-                            );
-                            for (const env of messageEnvelopes) {
-                              client.enqueueOutbound(async () => [env]);
-                            }
-                          }
-                          logger.log(`[WS:${getAddr()}] === SYNC-INITIATE COMPLETE (legacy) ===`);
-                        }
-                      }
-                    }
-                  } catch (initiateError) {
-                    logger.log('[WS] Error processing sync-initiate:', initiateError);
-                  } finally {
-                    setTimeout(() => {
-                      syncInitiateInFlightRef.current.delete(syncKey);
-                      logger.log(`[WS:${getAddr()}] sync-initiate: Removed ${targetInbox.substring(0, 12)} from in-flight set`);
-                    }, 5000);
-                  }
-                  break;
-                }
-
-                case 'sync-members': {
-                  // Batch of members from sync
-                  logger.log(`[WS:${getAddr()}] Received sync-members control message`);
-                  try {
-                    // Handle both naming conventions (desktop uses underscore, mobile used camelCase)
-                    const syncMembersPayload = controlPayload.message as {
-                      type: 'sync-members';
-                      members?: {
-                        // Desktop naming (underscore)
-                        user_address?: string;
-                        display_name?: string;
-                        user_icon?: string;
-                        inbox_address?: string;
-                        // Legacy mobile naming (camelCase) - for backwards compatibility
-                        address?: string;
-                        displayName?: string;
-                        userIcon?: string;
-                        inboxAddress?: string;
-                      }[];
-                    };
-
-                    if (syncMembersPayload.members && syncMembersPayload.members.length > 0) {
-                      const adapter = getMMKVAdapter();
-                      for (const member of syncMembersPayload.members) {
-                        // Support both naming conventions
-                        await adapter.saveSpaceMember(spaceId, {
-                          address: member.user_address || member.address || '',
-                          display_name: member.display_name || member.displayName,
-                          profile_image: member.user_icon || member.userIcon,
-                          inbox_address: member.inbox_address || member.inboxAddress || '',
-                        });
-                      }
-                      logger.log(`[WS:${getAddr()}] Synced ${syncMembersPayload.members.length} members`);
-                      queryClient.invalidateQueries({ queryKey: queryKeys.spaces.members(spaceId) });
-                    }
-                  } catch (syncMembersError) {
-                    logger.log('[WS] Error processing sync-members:', syncMembersError);
-                  }
-                  break;
-                }
-
-                case 'sync-messages': {
-                  // Batch of messages from sync (LEGACY - kept for backwards compatibility)
-                  logger.log(`[WS:${getAddr()}] Received sync-messages control message (legacy)`);
-                  try {
-                    const syncMessagesPayload = controlPayload.message as {
-                      type: 'sync-messages';
-                      messages?: Message[];
-                      channelId?: string;
-                    };
-
-                    if (syncMessagesPayload.messages && syncMessagesPayload.messages.length > 0) {
-                      const space = getSpace(spaceId);
-                      const channelId = syncMessagesPayload.channelId || space?.defaultChannelId || spaceId;
-
-                      for (const msg of syncMessagesPayload.messages) {
-                        await storage.saveMessage(
-                          { ...msg, spaceId, channelId },
-                          msg.createdDate || Date.now(),
-                          spaceId,
-                          'space',
-                          space?.iconUrl || '',
-                          space?.spaceName || spaceId.substring(0, 8)
-                        );
-                      }
-                      logger.log(`[WS:${getAddr()}] Synced ${syncMessagesPayload.messages.length} messages (legacy)`);
-
-                      // Invalidate messages cache
-                      queryClient.invalidateQueries({
-                        queryKey: queryKeys.messages.infinite(spaceId, channelId),
-                      });
-                    }
-                  } catch (syncMessagesError) {
-                    logger.log('[WS] Error processing sync-messages:', syncMessagesError);
-                  }
-                  break;
-                }
-
-                case 'sync-manifest': {
-                  // NEW PROTOCOL: Received manifest from peer - compute and send delta
-                  logger.log(`[WS:${getAddr()}] === SYNC-MANIFEST RECEIVED ===`);
-                  try {
-                    const manifestPayload = controlPayload.message as SyncManifestPayload;
-                    const syncService = getSyncService();
-
-                    if (!syncService) {
-                      logger.log(`[WS:${getAddr()}] sync-manifest: No SyncService available`);
-                      break;
-                    }
-
-                    const client = wsClientRef.current;
-                    if (!client || !client.isConnected) {
-                      logger.log(`[WS:${getAddr()}] sync-manifest: No client connection`);
-                      break;
-                    }
-
-                    const inboxKey = getSpaceKey(spaceId, 'inbox');
-                    if (!inboxKey?.address) {
-                      logger.log(`[WS:${getAddr()}] sync-manifest: No inbox key`);
-                      break;
-                    }
-
-                    // Get sender's inbox address to respond to
-                    // We need to find who sent this - the initiator who sent sync-initiate
-                    // For now, we'll need the sender info from the manifest itself or envelope
-                    // TODO: The payload should include inboxAddress for response routing
-                    logger.log(`[WS:${getAddr()}] sync-manifest: received manifest with ${manifestPayload.manifest.digests.length} digests`);
-
-                    // Get our peer entries for delta calculation
-                    const spaceConversationId = `${spaceId}/${spaceId}`;
-                    const encryptionStates = encryptionStateStorage.getEncryptionStates(spaceConversationId);
-                    const ourPeerEntries = new Map<number, { peerId: number; publicKey: string }>();
-                    if (encryptionStates.length > 0) {
-                      const parsed = JSON.parse(encryptionStates[0].state);
-                      const ratchetState = parsed.state ? JSON.parse(parsed.state) : parsed;
-                      if (ratchetState.id_peer_map) {
-                        for (const [idStr, pubKey] of Object.entries(ratchetState.id_peer_map)) {
-                          const peerId = parseInt(idStr, 10);
-                          ourPeerEntries.set(peerId, { peerId, publicKey: pubKey as string });
-                        }
-                      }
-                    }
-
-                    // Build delta payloads
-                    const space = getSpace(spaceId);
-                    const channelId = manifestPayload.manifest.channelId || space?.defaultChannelId || spaceId;
-
-                    const deltaPayloads = await syncService.buildSyncDelta(
-                      spaceId,
-                      channelId,
-                      manifestPayload.manifest,
-                      manifestPayload.memberDigests,
-                      manifestPayload.peerIds,
-                      ourPeerEntries
-                    );
-
-                    logger.log(`[WS:${getAddr()}] sync-manifest: Built ${deltaPayloads.length} delta payload(s)`);
-
-                    // Get target from manifest payload (preferred) or fall back to session
-                    const syncTarget = manifestPayload.inboxAddress || syncService.getSyncTarget(spaceId);
-                    if (!syncTarget) {
-                      logger.log(`[WS:${getAddr()}] sync-manifest: No sync target (inboxAddress or session), cannot send delta`);
-                      break;
-                    }
-
-                    logger.log(`[WS:${getAddr()}] sync-manifest: Sending ${deltaPayloads.length} delta(s) to ${syncTarget.substring(0, 12)}`);
-
-                    // Send all delta payloads
-                    if (deltaPayloads.length > 0) {
-                      const deltaEnvelopes = await sendSyncDeltaMessages(
-                        spaceId,
-                        syncTarget,
-                        deltaPayloads
-                      );
-
-                      for (const envelope of deltaEnvelopes) {
-                        client.enqueueOutbound(async () => [envelope]);
-                      }
-                      logger.log(`[WS:${getAddr()}] sync-manifest: Sent ${deltaEnvelopes.length} delta envelope(s)`);
-                    }
-
-                    // Also send sync-peer-map with ratchet state for encryption key sync
-                    if (encryptionStates.length > 0) {
-                      const stateData = encryptionStates[0];
-                      const fallbackState = encryptionStateStorage.getFallbackState(spaceConversationId, stateData.inboxId);
-                      const stateToSync = fallbackState || stateData;
-
-                      const parsed = JSON.parse(stateToSync.state);
-                      const ratchetState = parsed.state ? JSON.parse(parsed.state) : parsed;
-
-                      if (ratchetState.id_peer_map && ratchetState.peer_id_map) {
-                        logger.log(`[WS:${getAddr()}] sync-manifest: Sending sync-peer-map with ratchet state`);
-                        const peerMapEnvelope = await sendSyncPeerMapMessage(spaceId, syncTarget, {
-                          id_peer_map: ratchetState.id_peer_map,
-                          peer_id_map: ratchetState.peer_id_map,
-                          root_key: ratchetState.root_key,
-                          dkg_ratchet: ratchetState.dkg_ratchet,
-                          receiving_group_key: ratchetState.receiving_group_key,
-                          receiving_chain_key: ratchetState.receiving_chain_key,
-                          current_header_key: ratchetState.current_header_key,
-                          next_header_key: ratchetState.next_header_key,
-                          async_dkg_pubkey: ratchetState.async_dkg_pubkey,
-                          threshold: ratchetState.threshold,
-                        });
-                        client.enqueueOutbound(async () => [peerMapEnvelope]);
-                        logger.log(`[WS:${getAddr()}] sync-manifest: Sent sync-peer-map`);
-                      }
-                    }
-
-                    // Mark sync as complete
-                    syncService.setSyncInProgress(spaceId, false);
-                    logger.log(`[WS:${getAddr()}] sync-manifest: Sync complete`);
-                  } catch (manifestError) {
-                    logger.log('[WS] Error processing sync-manifest:', manifestError);
-                  }
-                  break;
-                }
-
-                case 'sync-delta': {
-                  // NEW PROTOCOL: Received delta from peer - apply to local storage
-                  logger.log(`[WS:${getAddr()}] === SYNC-DELTA RECEIVED ===`);
-                  try {
-                    const deltaPayload = controlPayload.message as SyncDeltaPayload;
-                    const syncService = getSyncService();
-
-                    if (!syncService) {
-                      logger.log(`[WS:${getAddr()}] sync-delta: No SyncService available`);
-                      break;
-                    }
-
-                    const space = getSpace(spaceId);
-
-                    // Apply message delta
-                    if (deltaPayload.messageDelta) {
-                      const msgDelta = deltaPayload.messageDelta;
-                      const channelId = msgDelta.channelId || space?.defaultChannelId || spaceId;
-                      logger.log(`[WS:${getAddr()}] sync-delta: Applying ${msgDelta.newMessages.length} new, ${msgDelta.updatedMessages.length} updated, ${msgDelta.deletedMessageIds.length} deleted messages`);
-
-                      for (const msg of msgDelta.newMessages) {
-                        await storage.saveMessage(
-                          { ...msg, spaceId, channelId },
-                          msg.createdDate || Date.now(),
-                          spaceId,
-                          'space',
-                          space?.iconUrl || '',
-                          space?.spaceName || spaceId.substring(0, 8)
-                        );
-                      }
-
-                      for (const msg of msgDelta.updatedMessages) {
-                        await storage.saveMessage(
-                          { ...msg, spaceId, channelId },
-                          msg.createdDate || Date.now(),
-                          spaceId,
-                          'space',
-                          space?.iconUrl || '',
-                          space?.spaceName || spaceId.substring(0, 8)
-                        );
-                      }
-
-                      for (const msgId of msgDelta.deletedMessageIds) {
-                        await storage.deleteMessage(msgId);
-                      }
-
-                      queryClient.invalidateQueries({
-                        queryKey: queryKeys.messages.infinite(spaceId, channelId),
-                      });
-                    }
-
-                    // Apply reaction delta
-                    if (deltaPayload.reactionDelta) {
-                      logger.log(`[WS:${getAddr()}] sync-delta: Applying reaction delta`);
-                      await syncService.applyReactionDelta(deltaPayload.reactionDelta);
-                      const channelId = deltaPayload.reactionDelta.channelId || space?.defaultChannelId || spaceId;
-                      queryClient.invalidateQueries({
-                        queryKey: queryKeys.messages.infinite(spaceId, channelId),
-                      });
-                    }
-
-                    // Apply member delta
-                    if (deltaPayload.memberDelta) {
-                      logger.log(`[WS:${getAddr()}] sync-delta: Applying ${deltaPayload.memberDelta.members.length} member updates`);
-                      const adapter = getMMKVAdapter();
-                      for (const member of deltaPayload.memberDelta.members) {
-                        await adapter.saveSpaceMember(spaceId, member);
-                      }
-                      queryClient.invalidateQueries({ queryKey: queryKeys.spaces.members(spaceId) });
-                    }
-
-                    // Apply peer map delta (update encryption state)
-                    if (deltaPayload.peerMapDelta && deltaPayload.peerMapDelta.added.length > 0) {
-                      logger.log(`[WS:${getAddr()}] sync-delta: Applying ${deltaPayload.peerMapDelta.added.length} peer map additions`);
-                      const spaceConversationId = `${spaceId}/${spaceId}`;
-                      const encryptionStates = encryptionStateStorage.getEncryptionStates(spaceConversationId);
-
-                      if (encryptionStates.length > 0) {
-                        const stateData = encryptionStates[0];
-                        const parsed = JSON.parse(stateData.state);
-                        let ratchetState = parsed.state ? JSON.parse(parsed.state) : parsed;
-
-                        // Add new peers
-                        for (const peer of deltaPayload.peerMapDelta.added) {
-                          if (!ratchetState.id_peer_map) ratchetState.id_peer_map = {};
-                          if (!ratchetState.peer_id_map) ratchetState.peer_id_map = {};
-                          ratchetState.id_peer_map[peer.peerId] = peer.publicKey;
-                          ratchetState.peer_id_map[peer.publicKey] = peer.peerId;
-                        }
-
-                        // Save updated state
-                        const wasNested = !!parsed.state;
-                        const newStateStr = JSON.stringify(ratchetState);
-                        const stateToSave = wasNested
-                          ? JSON.stringify({ state: newStateStr, template: parsed.template, evals: parsed.evals })
-                          : newStateStr;
-
-                        encryptionStateStorage.saveEncryptionState({
-                          conversationId: spaceConversationId,
-                          inboxId: stateData.inboxId,
-                          state: stateToSave,
-                          timestamp: Date.now(),
-                        });
-                        logger.log(`[WS:${getAddr()}] sync-delta: Saved updated peer map`);
-                      }
-                    }
-
-                    if (deltaPayload.isFinal) {
-                      logger.log(`[WS:${getAddr()}] sync-delta: Received final delta - sync complete`);
-                    }
-                  } catch (deltaError) {
-                    logger.log('[WS] Error processing sync-delta:', deltaError);
-                  }
-                  break;
-                }
+                // 'sync', 'sync-peer-map', 'sync-request', 'sync-info',
+                // 'sync-initiate', 'sync-members', 'sync-messages',
+                // 'sync-manifest', 'sync-delta' — sync handlers removed.
+                // Catch-up is handled by the per-hub log transport
+                // (`listen-hub` + `log-since`); peer-to-peer mesh sync is
+                // gone. New joiners only see messages sent after they
+                // joined.
 
                 case 'verify-kicked': {
                   // Verify kicked status for users
-                  logger.log(`[WS:${getAddr()}] Received verify-kicked control message`);
                   try {
                     const verifyPayload = controlPayload.message as {
                       type: 'verify-kicked';
@@ -2101,7 +971,8 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
 
                     if (verifyPayload.kickedAddresses && verifyPayload.kickedAddresses.length > 0) {
                       const adapter = getMMKVAdapter();
-                      for (const address of verifyPayload.kickedAddresses) {
+                      // Batch get and save in parallel for performance
+                      const updatePromises = verifyPayload.kickedAddresses.map(async (address) => {
                         const member = await adapter.getSpaceMember(spaceId, address);
                         if (member) {
                           await adapter.saveSpaceMember(spaceId, {
@@ -2110,19 +981,26 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                             inbox_address: '',
                           });
                         }
-                      }
-                      logger.log(`[WS:${getAddr()}] Verified ${verifyPayload.kickedAddresses.length} kicked users`);
-                      queryClient.invalidateQueries({ queryKey: queryKeys.spaces.members(spaceId) });
+                      });
+                      await Promise.all(updatePromises);
+                      // Update cache directly (mark kicked members as inactive)
+                      const kickedSet = new Set(verifyPayload.kickedAddresses);
+                      queryClient.setQueryData(queryKeys.spaces.members(spaceId), (old: SpaceMember[] | undefined) => {
+                        if (!old) return old;
+                        return old.map((m: SpaceMember) =>
+                          kickedSet.has(m.address)
+                            ? { ...m, isKicked: true, inbox_address: '' }
+                            : m
+                        );
+                      });
                     }
                   } catch (verifyError) {
-                    logger.log('[WS] Error processing verify-kicked:', verifyError);
                   }
                   break;
                 }
 
                 case 'rekey': {
                   // Re-encryption after kick - update encryption state with new keys
-                  logger.log(`[WS:${getAddr()}] Received rekey control message`);
                   try {
                     const rekeyPayload = controlPayload.message as {
                       type: 'rekey';
@@ -2131,18 +1009,15 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                     };
 
                     if (!rekeyPayload.info) {
-                      logger.warn('[WS] rekey message missing info');
                       break;
                     }
 
                     // Get device keyset for unsealing
                     const deviceKeyset = await getDeviceKeyset();
                     if (!deviceKeyset) {
-                      logger.log('[WS] Cannot process rekey - no device keyset');
                       break;
                     }
                     if (!deviceKeyset.inboxEncryptionPrivateKey || !Array.isArray(deviceKeyset.inboxEncryptionPrivateKey) || deviceKeyset.inboxEncryptionPrivateKey.length === 0) {
-                      logger.log('[WS] Cannot process rekey - inboxEncryptionPrivateKey missing or invalid');
                       break;
                     }
 
@@ -2179,12 +1054,6 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
 
                     // Validate required fields
                     if (!ephemeralPubKey || !ciphertext.ciphertext || !ciphertext.initialization_vector) {
-                      logger.warn('[WS] rekey sealedInfo missing required fields:', {
-                        hasEphemeralKey: !!ephemeralPubKey,
-                        hasCiphertext: !!ciphertext.ciphertext,
-                        hasIV: !!ciphertext.initialization_vector,
-                        rawInfo: rekeyPayload.info.substring(0, 200),
-                      });
                       break;
                     }
 
@@ -2221,7 +1090,6 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                         privateKey: innerEnvelope.configKey,
                         publicKey: configPubKeyHex,
                       });
-                      logger.log(`[WS:${getAddr()}] Saved new config key`);
                     }
 
                     // 2. Update the Triple Ratchet state
@@ -2230,7 +1098,6 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
 
                       // Set peer_key from device's inbox encryption private key
                       if (!deviceKeyset.inboxEncryptionPrivateKey || !Array.isArray(deviceKeyset.inboxEncryptionPrivateKey) || deviceKeyset.inboxEncryptionPrivateKey.length === 0) {
-                        logger.warn('[WS] Cannot update state - inboxEncryptionPrivateKey missing or invalid');
                         break;
                       }
                       template.peer_key = btoa(String.fromCharCode(...deviceKeyset.inboxEncryptionPrivateKey));
@@ -2254,6 +1121,7 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                         state: newState,
                         timestamp: Date.now(),
                       });
+                      ratchetStateCacheRef.current.clear();
 
                       // Also update fallback state for consistency
                       encryptionStateStorage.saveFallbackState({
@@ -2262,14 +1130,13 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                         state: newState,
                         timestamp: Date.now(),
                       });
+                      ratchetStateCacheRef.current.clear();
 
-                      logger.log(`[WS:${getAddr()}] Updated encryption state from rekey`);
                     }
 
                     // 3. Handle kick if included
                     if (rekeyPayload.kick) {
                       const kickedAddress = rekeyPayload.kick;
-                      logger.log(`[WS:${getAddr()}] Rekey includes kick for:`, kickedAddress);
 
                       // Get our address - use ref first, then MMKV storage fallback
                       let ownAddress = fullUserAddrRef.current;
@@ -2280,13 +1147,13 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                             const parsed = JSON.parse(storedUser);
                             ownAddress = parsed.address;
                           }
-                        } catch (e) {
-                          logger.log('[WS] Failed to get user address from storage:', e);
+                        } catch {
+                          // Storage/parse failure — ownAddress stays null
                         }
                       }
 
                       if (ownAddress && kickedAddress === ownAddress) {
-                        logger.warn(`[WS:${getAddr()}] *** WE HAVE BEEN KICKED (via rekey) ***`);
+                        // We are being kicked — handled below via space removal
                       } else {
                         const adapter = getMMKVAdapter();
                         const existingMember = await adapter.getSpaceMember(spaceId, kickedAddress);
@@ -2323,17 +1190,31 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                         };
 
                         await adapter.saveMessage(kickMessage, now, '', '', '', '');
-                        queryClient.invalidateQueries({ queryKey: queryKeys.messages.infinite(spaceId, channelId) });
-                        logger.log(`[WS:${getAddr()}] Saved kick event as message`);
+                        // Update cache directly instead of invalidating (avoids refetch)
+                        const messagesKey = queryKeys.messages.infinite(spaceId, channelId);
+                        queryClient.setQueryData<{ pages: { messages: Message[] }[]; pageParams: unknown[] }>(messagesKey, (old) => {
+                          if (!old) return old;
+                          return {
+                            ...old,
+                            pages: old.pages.map((page, index) => {
+                              if (index === 0) {
+                                return { ...page, messages: [...page.messages, kickMessage] };
+                              }
+                              return page;
+                            }),
+                          };
+                        });
                       }
-                      queryClient.invalidateQueries({ queryKey: queryKeys.spaces.members(spaceId) });
+                      // Members list needs refresh since membership changed (rekey = post-kick)
+                      // Only refetch active queries to avoid unnecessary network calls
+                      queryClient.invalidateQueries({
+                        queryKey: queryKeys.spaces.members(spaceId),
+                        refetchType: 'active',
+                      });
                     }
 
-                    logger.log(`[WS:${getAddr()}] Rekey processed successfully`);
                   } catch (rekeyError) {
-                    logger.log('[WS] Error processing rekey:', rekeyError);
                     if (rekeyError instanceof Error) {
-                      logger.log('[WS] Rekey error details:', rekeyError.message);
                     }
                   }
                   break;
@@ -2341,34 +1222,19 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
 
                 case 'space-manifest':
                   // Space configuration update
-                  logger.log(`[WS:${getAddr()}] *** RECEIVED space-manifest control message ***`);
-                  logger.log(`[WS:${getAddr()}] Full controlPayload.message:`, JSON.stringify(controlPayload.message).substring(0, 500));
                   try {
                     const manifest = controlPayload.message.manifest;
-                    logger.log(`[WS:${getAddr()}] manifest exists:`, !!manifest);
                     if (!manifest) {
-                      logger.log('[WS] space-manifest missing manifest data');
-                      logger.log('[WS] controlPayload.message keys:', Object.keys(controlPayload.message || {}));
                       break;
                     }
 
-                    logger.log(`[WS:${getAddr()}] manifest keys:`, Object.keys(manifest));
-                    logger.log(`[WS:${getAddr()}] manifest.space_manifest length:`, manifest.space_manifest?.length);
-                    logger.log(`[WS:${getAddr()}] manifest.owner_public_key:`, manifest.owner_public_key?.substring(0, 30));
-                    logger.log(`[WS:${getAddr()}] manifest.timestamp:`, manifest.timestamp);
 
                     // Get space registration to verify owner
                     const quorumClient = getQuorumClient();
-                    logger.log(`[WS:${getAddr()}] Fetching space registration for:`, spaceId);
                     const spaceReg = await quorumClient.getSpaceRegistration(spaceId);
-                    logger.log(`[WS:${getAddr()}] spaceReg owner_public_keys:`, spaceReg?.owner_public_keys?.map(k => k.substring(0, 30)));
                     if (!spaceReg?.owner_public_keys?.includes(manifest.owner_public_key)) {
-                      logger.log('[WS] space-manifest owner not authorized');
-                      logger.log('[WS] manifest.owner_public_key:', manifest.owner_public_key);
-                      logger.log('[WS] spaceReg.owner_public_keys:', spaceReg?.owner_public_keys);
                       break;
                     }
-                    logger.log(`[WS:${getAddr()}] Owner authorized, verifying signature...`);
 
                     // Verify signature - native module expects base64 encoded values
                     const signingProvider = new NativeSigningProvider();
@@ -2376,7 +1242,6 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                       ...new TextEncoder().encode(manifest.space_manifest),
                       ...int64ToBytes(manifest.timestamp),
                     ]);
-                    logger.log(`[WS:${getAddr()}] messageToVerify length:`, messageToVerify.length);
 
                     // Convert hex to base64 for the native module
                     // Helper to convert Uint8Array to base64 without stack overflow
@@ -2394,76 +1259,67 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                     const signatureBytes = hexToBytes(manifest.owner_signature);
                     const signatureBase64 = uint8ArrayToBase64(new Uint8Array(signatureBytes));
 
-                    logger.log(`[WS:${getAddr()}] publicKeyBase64 length:`, publicKeyBase64.length);
-                    logger.log(`[WS:${getAddr()}] messageBase64 length:`, messageBase64.length);
-                    logger.log(`[WS:${getAddr()}] signatureBase64 length:`, signatureBase64.length);
 
                     const isValid = await signingProvider.verifyEd448(
                       publicKeyBase64,
                       messageBase64,
                       signatureBase64
                     );
-                    logger.log(`[WS:${getAddr()}] Signature valid:`, isValid);
 
                     if (!isValid) {
-                      logger.log('[WS] space-manifest signature verification failed');
                       break;
                     }
 
                     // Decrypt the manifest using config key
                     const configKey = getSpaceKey(spaceId, 'config');
-                    logger.log(`[WS:${getAddr()}] configKey exists:`, !!configKey);
-                    logger.log(`[WS:${getAddr()}] configKey.publicKey:`, configKey?.publicKey?.substring(0, 30));
                     if (!configKey) {
-                      logger.log('[WS] space-manifest missing config key');
                       break;
                     }
 
-                    logger.log(`[WS:${getAddr()}] Parsing space_manifest ciphertext...`);
                     const ciphertext = JSON.parse(manifest.space_manifest) as {
                       ciphertext: string;
                       initialization_vector: string;
                       associated_data: string;
                     };
-                    logger.log(`[WS:${getAddr()}] ciphertext parsed, IV length:`, ciphertext.initialization_vector?.length);
 
                     const cryptoProvider = new NativeCryptoProvider();
-                    logger.log(`[WS:${getAddr()}] Decrypting with config key...`);
                     const decryptedBytes = await cryptoProvider.decryptInboxMessage({
                       inbox_private_key: Array.from(hexToBytes(configKey.privateKey)),
                       ephemeral_public_key: Array.from(hexToBytes(manifest.ephemeral_public_key)),
                       ciphertext,
                     });
-                    logger.log(`[WS:${getAddr()}] Decrypted ${decryptedBytes.length} bytes`);
 
                     const decryptedText = new TextDecoder().decode(new Uint8Array(decryptedBytes));
-                    logger.log(`[WS:${getAddr()}] Decrypted text preview:`, decryptedText.substring(0, 200));
                     const updatedSpace = JSON.parse(decryptedText) as Space;
 
                     // Save updated space
-                    logger.log(`[WS:${getAddr()}] Saving updated space...`);
                     saveSpace(updatedSpace);
-                    logger.log(`[WS:${getAddr()}] *** SAVED updated space manifest ***:`, {
-                      spaceId: updatedSpace.spaceId,
-                      spaceName: updatedSpace.spaceName,
-                      emojisCount: updatedSpace.emojis?.length ?? 0,
-                      emojiNames: updatedSpace.emojis?.map(e => e.name),
-                    });
 
-                    // Invalidate React Query cache using proper query keys
-                    queryClient.invalidateQueries({ queryKey: queryKeys.spaces.all });
-                    queryClient.invalidateQueries({ queryKey: queryKeys.spaces.detail(spaceId) });
-                    logger.log(`[WS:${getAddr()}] Invalidated React Query cache for spaces`);
+                    // Mirror linked Farcaster channels into the bindings MMKV
+                    // so the picker hook (useSpaceBindings) sees the
+                    // remotely-pushed change without needing to know about
+                    // the manifest field.
+                    const linked = (updatedSpace as Space & { linkedFarcasterChannels?: unknown }).linkedFarcasterChannels;
+                    if (Array.isArray(linked)) {
+                      const keys = linked.filter((k): k is string => typeof k === 'string');
+                      const { setSpaceBindings } = await import('../services/space/channelBindings');
+                      setSpaceBindings(spaceId, keys);
+                    }
+
+                    // Update React Query cache directly with the new space data
+                    queryClient.setQueryData(queryKeys.spaces.detail(spaceId), updatedSpace);
+                    // Update the space in the spaces list cache
+                    queryClient.setQueryData(queryKeys.spaces.all, (old: Space[] | undefined) => {
+                      if (!old) return old;
+                      return old.map((s: Space) => s.spaceId === spaceId ? updatedSpace : s);
+                    });
                   } catch (err) {
-                    logger.log('[WS] Error processing space-manifest:', err);
                     if (err instanceof Error) {
-                      logger.log('[WS] Error stack:', err.stack);
                     }
                   }
                   break;
 
                 default:
-                  logger.log(`[WS:${getAddr()}] Unhandled control message type:`, controlType);
               }
 
               // Delete control message from inbox after successful processing
@@ -2472,14 +1328,13 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                   spaceInboxKey.address,
                   [message.timestamp],
                   { publicKey: spaceInboxKey.publicKey, privateKey: spaceInboxKey.privateKey }
-                ).catch(err => logger.warn('[WS] Failed to delete control message:', err));
+                ).catch(err => {});
               }
 
               return;
             }
 
             if (payload.type !== 'message') {
-              logger.log(`[WS:${getAddr()}] Non-message/control payload type:`, payload.type);
               return;
             }
 
@@ -2495,19 +1350,17 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
 
             if (isPlaintextMessage) {
               // Message is already decrypted (envelope-only encryption path)
-              logger.log(`[WS:${getAddr()}] Message is plaintext (envelope-only encryption)`);
               spaceMessage = payload.message as Message;
 
               // Check if this is our own message echo
               const senderId = (spaceMessage.content as { senderId?: string })?.senderId;
               if (senderId && senderId === user?.address) {
-                logger.log(`[WS:${getAddr()}] Skipping own plaintext message echo:`, spaceMessage.messageId);
                 if (spaceInboxKey?.address && spaceInboxKey.publicKey && spaceInboxKey.privateKey) {
                   deleteSpaceInboxMessages(
                     spaceInboxKey.address,
                     [message.timestamp],
                     { publicKey: spaceInboxKey.publicKey, privateKey: spaceInboxKey.privateKey }
-                  ).catch(err => logger.warn('[WS] Failed to delete own plaintext echo:', err));
+                  ).catch(err => {});
                 }
                 return;
               }
@@ -2517,14 +1370,7 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
               const spaceConversationId = `${spaceId}/${spaceId}`;
               const encryptionStates = encryptionStateStorage.getEncryptionStates(spaceConversationId);
 
-              logger.log(`[WS:${getAddr()}] Encryption states for space:`, {
-                conversationId: spaceConversationId,
-                statesCount: encryptionStates.length,
-                firstStatePreview: encryptionStates[0]?.state?.substring(0, 100),
-              });
-
               if (encryptionStates.length === 0) {
-                logger.log('[WS] No encryption state for space and message is not plaintext:', spaceId.substring(0, 12));
                 return;
               }
 
@@ -2533,14 +1379,10 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
               try {
                 ratchetState = JSON.parse(encryptionStates[0].state);
               } catch (parseError) {
-                logger.log(`[WS:${getAddr()}] Failed to parse ratchet state:`, parseError);
-                logger.log(`[WS:${getAddr()}] Raw state:`, encryptionStates[0].state.substring(0, 200));
                 return;
               }
 
               if (!ratchetState || typeof ratchetState !== 'object') {
-                logger.log(`[WS:${getAddr()}] Invalid ratchet state - not an object:`, typeof ratchetState);
-                logger.log(`[WS:${getAddr()}] State value:`, encryptionStates[0].state.substring(0, 200));
                 return;
               }
 
@@ -2551,7 +1393,6 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
               // Check if this is our own echoed message - skip decryption
               // (Triple Ratchet participants can't decrypt their own messages)
               if (isSentEnvelope(tripleRatchetEnvelope)) {
-              logger.log(`[WS:${getAddr()}] Skipping decryption of our own echoed message`);
               clearSentEnvelope(tripleRatchetEnvelope);
               // Still need to delete from inbox even for our own messages
               if (spaceInboxKey?.address && spaceInboxKey.publicKey && spaceInboxKey.privateKey) {
@@ -2559,18 +1400,12 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                   spaceInboxKey.address,
                   [message.timestamp],
                   { publicKey: spaceInboxKey.publicKey, privateKey: spaceInboxKey.privateKey }
-                ).catch(err => logger.warn('[WS] Failed to delete own sent envelope:', err));
+                ).catch(err => {});
               }
               return;
             }
 
             const ratchetStateObj = ratchetState as Record<string, unknown>;
-            logger.log(`[WS:${getAddr()}] Decrypting with Triple Ratchet:`, {
-              envelopeLength: tripleRatchetEnvelope.length,
-              envelopePreview: tripleRatchetEnvelope.substring(0, 100),
-              ratchetStateKeys: Object.keys(ratchetStateObj),
-              hasNestedState: 'state' in ratchetStateObj,
-            });
 
             let decryptResult;
             let usedFallback = false; // Track whether we used fallback for decrypt
@@ -2581,106 +1416,6 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
             const actualState: string = typeof rawState === 'string' ? rawState : JSON.stringify(rawState);
 
             try {
-              logger.log(`[WS:${getAddr()}] Actual decrypt state (first 200):`, actualState.substring(0, 200));
-
-              // Debug: Parse state to check peer_id_map and our identity
-              try {
-                const parsedState = JSON.parse(actualState);
-
-                // Check our peer_key - derive public key to compare with peer_id_map
-                if (parsedState.peer_key) {
-                  logger.log(`[WS:${getAddr()}] DEBUG peer_key (first 40):`, parsedState.peer_key.substring(0, 40));
-                }
-
-                if (parsedState.peer_id_map) {
-                  logger.log(`[WS:${getAddr()}] peer_id_map entries:`, Object.keys(parsedState.peer_id_map).length);
-                  const peerIdMapKeys = Object.keys(parsedState.peer_id_map);
-                  logger.log(`[WS:${getAddr()}] peer_id_map keys (first 40 chars):`, peerIdMapKeys.map(k => k.substring(0, 40)));
-                  logger.log(`[WS:${getAddr()}] peer_id_map values (IDs):`, peerIdMapKeys.map(k => parsedState.peer_id_map[k]));
-                } else {
-                  logger.warn(`[WS:${getAddr()}] No peer_id_map in decrypt state!`);
-                }
-
-                if (parsedState.id_peer_map) {
-                  logger.log(`[WS:${getAddr()}] id_peer_map IDs:`, Object.keys(parsedState.id_peer_map));
-                } else {
-                  logger.warn(`[WS:${getAddr()}] No id_peer_map in decrypt state!`);
-                }
-
-                // Check root_key
-                if (parsedState.root_key) {
-                  logger.log(`[WS:${getAddr()}] DEBUG root_key preview:`, parsedState.root_key.substring(0, 30));
-                  logger.log(`[WS:${getAddr()}] DEBUG root_key length:`, parsedState.root_key.length);
-                } else {
-                  logger.log(`[WS:${getAddr()}] DEBUG root_key is MISSING!`);
-                }
-
-                // Check receiving_ephemeral_keys
-                if (parsedState.receiving_ephemeral_keys) {
-                  const numKeys = Object.keys(parsedState.receiving_ephemeral_keys).length;
-                  logger.log(`[WS:${getAddr()}] DEBUG receiving_ephemeral_keys count:`, numKeys);
-                  logger.log(`[WS:${getAddr()}] DEBUG receiving_ephemeral_keys keys (first 40):`, Object.keys(parsedState.receiving_ephemeral_keys).map(k => k.substring(0, 40)));
-                } else {
-                  logger.log(`[WS:${getAddr()}] DEBUG receiving_ephemeral_keys is MISSING!`);
-                }
-
-                // Check receiving_group_key - critical for AEAD decrypt
-                if (parsedState.receiving_group_key) {
-                  logger.log(`[WS:${getAddr()}] DEBUG receiving_group_key preview:`, parsedState.receiving_group_key.substring(0, 40));
-                  logger.log(`[WS:${getAddr()}] DEBUG receiving_group_key length:`, parsedState.receiving_group_key.length);
-                } else {
-                  logger.log(`[WS:${getAddr()}] DEBUG receiving_group_key is MISSING - this will cause AEAD errors!`);
-                }
-
-                // Check sending_chain_key
-                if (parsedState.sending_chain_key) {
-                  logger.log(`[WS:${getAddr()}] DEBUG sending_chain_key preview:`, parsedState.sending_chain_key.substring(0, 30));
-                } else {
-                  logger.log(`[WS:${getAddr()}] DEBUG sending_chain_key is MISSING!`);
-                }
-
-                // Check receiving_chain_key
-                if (parsedState.receiving_chain_key) {
-                  const numChains = Object.keys(parsedState.receiving_chain_key).length;
-                  logger.log(`[WS:${getAddr()}] DEBUG receiving_chain_key entries:`, numChains);
-                  logger.log(`[WS:${getAddr()}] DEBUG receiving_chain_key keys (first 40):`, Object.keys(parsedState.receiving_chain_key).map(k => k.substring(0, 40)));
-                } else {
-                  logger.log(`[WS:${getAddr()}] DEBUG receiving_chain_key is MISSING!`);
-                }
-
-                // Check current_header_key and next_header_key - LOG FULL KEY for comparison with sender
-                logger.log(`[WS:${getAddr()}] DEBUG RECV current_header_key exists:`, !!parsedState.current_header_key);
-                logger.log(`[WS:${getAddr()}] DEBUG RECV current_header_key FULL:`, parsedState.current_header_key);
-                logger.log(`[WS:${getAddr()}] DEBUG RECV current_header_key length:`, parsedState.current_header_key?.length);
-                logger.log(`[WS:${getAddr()}] DEBUG RECV next_header_key exists:`, !!parsedState.next_header_key);
-                logger.log(`[WS:${getAddr()}] DEBUG RECV next_header_key FULL:`, parsedState.next_header_key);
-                logger.log(`[WS:${getAddr()}] DEBUG should_ratchet:`, parsedState.should_ratchet);
-
-                // Check async DKG fields - these affect header key changes
-                logger.log(`[WS:${getAddr()}] DEBUG async_dkg_ratchet:`, parsedState.async_dkg_ratchet);
-                logger.log(`[WS:${getAddr()}] DEBUG async_dkg_pubkey exists:`, !!parsedState.async_dkg_pubkey);
-                logger.log(`[WS:${getAddr()}] DEBUG should_dkg_ratchet:`, parsedState.should_dkg_ratchet ? Object.keys(parsedState.should_dkg_ratchet).length : 'N/A');
-                logger.log(`[WS:${getAddr()}] DEBUG threshold:`, parsedState.threshold);
-
-                // Check dkg_ratchet
-                if (parsedState.dkg_ratchet) {
-                  const dkgRatchet = typeof parsedState.dkg_ratchet === 'string'
-                    ? JSON.parse(parsedState.dkg_ratchet)
-                    : parsedState.dkg_ratchet;
-                  logger.log(`[WS:${getAddr()}] DEBUG dkg_ratchet.id:`, dkgRatchet.id);
-                  logger.log(`[WS:${getAddr()}] DEBUG dkg_ratchet.total:`, dkgRatchet.total);
-                  logger.log(`[WS:${getAddr()}] DEBUG dkg_ratchet.round:`, dkgRatchet.round);
-                  logger.log(`[WS:${getAddr()}] DEBUG dkg_ratchet.threshold:`, dkgRatchet.threshold);
-                  logger.log(`[WS:${getAddr()}] DEBUG dkg_ratchet.scalar (first 30):`, dkgRatchet.scalar?.substring?.(0, 30));
-                  logger.log(`[WS:${getAddr()}] DEBUG dkg_ratchet.scalar length:`, dkgRatchet.scalar?.length);
-                  logger.log(`[WS:${getAddr()}] DEBUG dkg_ratchet.point type:`, typeof dkgRatchet.point);
-                  logger.log(`[WS:${getAddr()}] DEBUG dkg_ratchet.point preview:`, JSON.stringify(dkgRatchet.point)?.substring?.(0, 50));
-                  logger.log(`[WS:${getAddr()}] DEBUG dkg_ratchet.secret (first 30):`, dkgRatchet.secret?.substring?.(0, 30));
-                }
-              } catch (e) {
-                logger.log(`[WS:${getAddr()}] Failed to parse state for debug:`, e);
-              }
-
               decryptResult = await cryptoProvider.tripleRatchetDecrypt({
                 ratchet_state: actualState,
                 envelope: tripleRatchetEnvelope,
@@ -2692,18 +1427,13 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                 : JSON.stringify(decryptResult.ratchet_state);
 
               if (ratchetStateStr.includes('invalid') || ratchetStateStr.includes('error')) {
-                logger.log(`[WS:${getAddr()}] Decrypt returned error in ratchet_state:`, ratchetStateStr.substring(0, 200));
                 throw new Error(`Triple Ratchet decrypt failed: ${ratchetStateStr.substring(0, 100)}`);
               }
 
             } catch (decryptError) {
-              logger.log(`[WS:${getAddr()}] Triple Ratchet decrypt FAILED:`, decryptError);
-              logger.log(`[WS:${getAddr()}] Ratchet state for debugging:`, JSON.stringify(ratchetStateObj).substring(0, 500));
-
               // Try fallback state if available (header keys may have changed after encrypt)
               const fallbackState = encryptionStateStorage.getFallbackState(spaceConversationId, encryptionStates[0].inboxId);
               if (fallbackState) {
-                logger.log(`[WS:${getAddr()}] Trying fallback state for decrypt...`);
                 try {
                   // Parse fallback state same way as main state
                   let fallbackRatchetState: unknown;
@@ -2720,29 +1450,10 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
 
                   // Log critical fallback state fields
                   const fallbackParsed = JSON.parse(fallbackActualState);
-                  logger.log(`[WS:${getAddr()}] RECEIVER fallback critical fields:`, {
-                    current_header_key: fallbackParsed.current_header_key,
-                    root_key: fallbackParsed.root_key,  // CRITICAL: must match sender for key derivation
-                    receiving_group_key_exists: !!fallbackParsed.receiving_group_key,
-                    receiving_group_key_preview: fallbackParsed.receiving_group_key?.substring?.(0, 30),
-                    receiving_chain_key_entries: Object.keys(fallbackParsed.receiving_chain_key || {}).length,
-                    receiving_ephemeral_keys_entries: Object.keys(fallbackParsed.receiving_ephemeral_keys || {}).length,
-                    peer_id_map_entries: Object.keys(fallbackParsed.peer_id_map || {}).length,
-                    sending_chain_key_exists: !!fallbackParsed.sending_chain_key,
-                    should_ratchet: fallbackParsed.should_ratchet,
-                  });
 
                   decryptResult = await cryptoProvider.tripleRatchetDecrypt({
                     ratchet_state: fallbackActualState,
                     envelope: tripleRatchetEnvelope,
-                  });
-
-                  // Log raw result for debugging
-                  logger.log(`[WS:${getAddr()}] Fallback decrypt raw result:`, {
-                    ratchetStateType: typeof decryptResult.ratchet_state,
-                    messageType: typeof decryptResult.message,
-                    messageIsArray: Array.isArray(decryptResult.message),
-                    messageLength: decryptResult.message?.length,
                   });
 
                   // Validate fallback decrypt result
@@ -2751,28 +1462,22 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                     : JSON.stringify(decryptResult.ratchet_state);
 
                   // Log the first 300 chars of ratchet_state to see if it's an error
-                  logger.log(`[WS:${getAddr()}] Fallback ratchet_state (first 300):`, fallbackRatchetStateStr.substring(0, 300));
 
                   // Check for error patterns (case-insensitive) or empty message
                   const lowerState = fallbackRatchetStateStr.toLowerCase();
                   if (lowerState.includes('invalid') || lowerState.includes('error') || lowerState.includes('crypto error')) {
-                    logger.log(`[WS:${getAddr()}] Fallback decrypt returned error in state:`, fallbackRatchetStateStr.substring(0, 200));
                     throw new Error(`Fallback Triple Ratchet decrypt failed: ${fallbackRatchetStateStr.substring(0, 100)}`);
                   }
 
                   // Also check if message is empty - this indicates decrypt actually failed
                   if (!decryptResult.message || decryptResult.message.length === 0) {
-                    logger.log(`[WS:${getAddr()}] Fallback decrypt returned empty message - treating as failure`);
-                    logger.log(`[WS:${getAddr()}] Fallback ratchet state preview:`, fallbackRatchetStateStr.substring(0, 300));
                     throw new Error('Fallback Triple Ratchet decrypt returned empty message');
                   }
 
-                  logger.log(`[WS:${getAddr()}] Fallback decrypt SUCCEEDED with ${decryptResult.message.length} bytes`);
                   usedFallback = true; // Mark that we used fallback
                   // DO NOT delete fallback state - keep it for future decrypts
                   // The peer (desktop) may not be advancing its ratchet
                 } catch (fallbackError) {
-                  logger.log(`[WS:${getAddr()}] Fallback decrypt also FAILED:`, fallbackError);
                   throw decryptError; // Throw original error
                 }
               } else {
@@ -2780,24 +1485,17 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
               }
             }
 
-            // Save updated ratchet state (only if decryption was successful AND we didn't use fallback)
-            // When fallback is used, we should NOT update the main state because:
-            // 1. The fallback state is frozen at join/create time
-            // 2. The peer encrypts with their fallback (frozen) state
-            // 3. If we update our main state from fallback decrypts, it will diverge
-            // 4. This causes subsequent main-state decrypts to fail with different chain positions
+            // Skip saving when fallback was used — fallback state is frozen at
+            // join/create time and updating from it would diverge from the peer.
             if (!usedFallback) {
               const ratchetStateStr = typeof decryptResult.ratchet_state === 'string'
                 ? decryptResult.ratchet_state
                 : JSON.stringify(decryptResult.ratchet_state);
 
-              // Don't save if it looks like an error
               if (!ratchetStateStr.includes('invalid') && ratchetStateStr.startsWith('{')) {
-                // Preserve the nesting structure AND template/evals for invite generation!
                 const wasNested = 'state' in ratchetStateObj;
                 let stateToSave: string;
                 if (wasNested) {
-                  // Get original parsed structure to preserve template/evals
                   const originalParsed = JSON.parse(encryptionStates[0].state);
                   stateToSave = JSON.stringify({
                     state: ratchetStateStr,
@@ -2808,84 +1506,55 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                   stateToSave = ratchetStateStr;
                 }
 
-                // Note: Fallback state is saved at join time in useSpaceActions.ts
-                // We keep it forever and never overwrite it - it's the original working state
-
                 encryptionStateStorage.saveEncryptionState({
                   conversationId: spaceConversationId,
                   inboxId: encryptionStates[0].inboxId,
                   state: stateToSave,
                   timestamp: Date.now(),
                 });
+                ratchetStateCacheRef.current.clear();
               }
-            } else {
-              logger.log(`[WS:${getAddr()}] Skipping main state save - used fallback decrypt`);
             }
 
-              // Parse decrypted message
-              logger.log(`[WS:${getAddr()}] Decrypt result:`, {
-                messageType: typeof decryptResult.message,
-                messageLength: decryptResult.message?.length,
-                messagePreview: Array.isArray(decryptResult.message)
-                  ? decryptResult.message.slice(0, 50)
-                  : String(decryptResult.message).substring(0, 100),
-                ratchetStateType: typeof decryptResult.ratchet_state,
-              });
+            if (!decryptResult.message || decryptResult.message.length === 0) {
+              return;
+            }
 
-              if (!decryptResult.message || decryptResult.message.length === 0) {
-                logger.log(`[WS:${getAddr()}] Decrypt returned empty message`);
-                return;
-              }
+            const decryptedBytes = new Uint8Array(decryptResult.message);
+            const decryptedText = new TextDecoder().decode(decryptedBytes);
 
-              const decryptedBytes = new Uint8Array(decryptResult.message);
-              const decryptedText = new TextDecoder().decode(decryptedBytes);
-              logger.log(`[WS:${getAddr()}] Decrypted text (first 200):`, decryptedText.substring(0, 200));
+            try {
+              spaceMessage = JSON.parse(decryptedText) as Message;
+            } catch (parseError) {
+              return;
+            }
 
-              try {
-                spaceMessage = JSON.parse(decryptedText) as Message;
-              } catch (parseError) {
-                logger.log(`[WS:${getAddr()}] Failed to parse decrypted message:`, parseError);
-                logger.log(`[WS:${getAddr()}] Decrypted text length:`, decryptedText.length);
-                logger.log(`[WS:${getAddr()}] Decrypted text (full):`, decryptedText);
-                return;
-              }
 
-              logger.log(`[WS:${getAddr()}] Decrypted space message:`, spaceMessage.messageId, 'type:', spaceMessage.content?.type);
-
-              // Check if this is our own message (echoed back from hub)
-              const senderId = (spaceMessage.content as { senderId?: string })?.senderId;
-              if (senderId && senderId === user?.address) {
-                logger.log(`[WS:${getAddr()}] Skipping own message echo:`, spaceMessage.messageId);
-                // Still need to delete from inbox even for our own echoes
+            const senderId = (spaceMessage.content as { senderId?: string })?.senderId;
+            const ownContentType = spaceMessage.content?.type;
+            if (senderId && senderId === user?.address) {
+              // Space-call messages render even on self-echo (no optimistic update for them).
+              if (ownContentType !== 'space-call-start' && ownContentType !== 'space-call-end') {
                 if (spaceInboxKey?.address && spaceInboxKey.publicKey && spaceInboxKey.privateKey) {
                   deleteSpaceInboxMessages(
                     spaceInboxKey.address,
                     [message.timestamp],
                     { publicKey: spaceInboxKey.publicKey, privateKey: spaceInboxKey.privateKey }
-                  ).catch(err => logger.warn('[WS] Failed to delete own echo:', err));
+                  ).catch(err => {});
                 }
                 return;
               }
-            } // End of TR decryption else block
+            }
+          }
 
             // Get space info for storage
             const space = getSpace(spaceId);
             const channelId = spaceMessage.channelId || space?.defaultChannelId || spaceId;
             const messagesKey = queryKeys.messages.infinite(spaceId, channelId);
 
-            interface MessagesPage {
-              messages: Message[];
-              nextCursor?: string | null;
-              prevCursor?: string | null;
-            }
-
-            interface InfiniteMessagesData {
-              pages: MessagesPage[];
-              pageParams: unknown[];
-            }
-
             // Handle special message types that modify existing messages
             const contentType = spaceMessage.content?.type;
+            logger.debug(`[SpaceMsg] type=${contentType} id=${spaceMessage.messageId?.slice(0, 12)}`);
 
             // Client-side deduplication: Skip if we've already processed this message
             // Regular messages (post, embed, sticker) are deduplicated by checking storage
@@ -2897,14 +1566,13 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                 messageId: spaceMessage.messageId,
               });
               if (existingMessage) {
-                logger.log(`[WS:${getAddr()}] Skipping duplicate message:`, spaceMessage.messageId);
                 // Still need to delete from inbox even for duplicates, otherwise they keep reappearing
                 if (spaceInboxKey?.address && spaceInboxKey.publicKey && spaceInboxKey.privateKey) {
                   deleteSpaceInboxMessages(
                     spaceInboxKey.address,
                     [message.timestamp],
                     { publicKey: spaceInboxKey.publicKey, privateKey: spaceInboxKey.privateKey }
-                  ).catch(err => logger.warn('[WS] Failed to delete duplicate message:', err));
+                  ).catch(err => {});
                 }
                 return;
               }
@@ -2913,7 +1581,6 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
             if (contentType === 'reaction') {
               // Add reaction to target message
               const reactionContent = spaceMessage.content as { messageId: string; reaction: string; senderId: string };
-              logger.log(`[WS:${getAddr()}] Adding reaction:`, reactionContent.reaction, 'to message:', reactionContent.messageId);
 
               // Helper to compute new reactions
               const computeNewReactions = (currentReactions: Message['reactions']) => {
@@ -2978,7 +1645,7 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                   spaceInboxKey.address,
                   [message.timestamp],
                   { publicKey: spaceInboxKey.publicKey, privateKey: spaceInboxKey.privateKey }
-                ).catch(err => logger.warn('[WS] Failed to delete reaction message:', err));
+                ).catch(err => {});
               }
               return;
             }
@@ -2986,7 +1653,6 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
             if (contentType === 'remove-reaction') {
               // Remove reaction from target message
               const reactionContent = spaceMessage.content as { messageId: string; reaction: string; senderId: string };
-              logger.log(`[WS:${getAddr()}] Removing reaction:`, reactionContent.reaction, 'from message:', reactionContent.messageId);
 
               // Helper to compute updated reactions after removal
               const computeRemovedReactions = (currentReactions: Message['reactions']) => {
@@ -3035,7 +1701,7 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                   spaceInboxKey.address,
                   [message.timestamp],
                   { publicKey: spaceInboxKey.publicKey, privateKey: spaceInboxKey.privateKey }
-                ).catch(err => logger.warn('[WS] Failed to delete remove-reaction message:', err));
+                ).catch(err => {});
               }
               return;
             }
@@ -3043,7 +1709,6 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
             if (contentType === 'edit-message') {
               // Update existing message with edit
               const editContent = spaceMessage.content as { originalMessageId: string; editedText: string | string[]; editedAt: number };
-              logger.log(`[WS:${getAddr()}] Editing message:`, editContent.originalMessageId);
 
               queryClient.setQueryData<InfiniteMessagesData>(messagesKey, (old) => {
                 if (!old) return old;
@@ -3075,13 +1740,27 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                   })),
                 };
               });
+              // Persist to storage so the edit survives query invalidation /
+              // remount / navigating away and back. Without this, the cache
+              // update above gets overwritten the next time the infinite
+              // query refetches from MMKV.
+              const existingMsg = await storage.getMessage({ spaceId, channelId, messageId: editContent.originalMessageId });
+              if (existingMsg && existingMsg.content.type === 'post') {
+                const updated: Message = {
+                  ...existingMsg,
+                  modifiedDate: editContent.editedAt,
+                  content: { ...existingMsg.content, text: editContent.editedText },
+                  edits: [...(existingMsg.edits || []), { text: editContent.editedText, modifiedDate: editContent.editedAt, lastModifiedHash: '' }],
+                };
+                await storage.saveMessage(updated, updated.createdDate, '', '', '', '');
+              }
               // Delete edit-message from inbox after processing
               if (spaceInboxKey?.address && spaceInboxKey.publicKey && spaceInboxKey.privateKey) {
                 deleteSpaceInboxMessages(
                   spaceInboxKey.address,
                   [message.timestamp],
                   { publicKey: spaceInboxKey.publicKey, privateKey: spaceInboxKey.privateKey }
-                ).catch(err => logger.warn('[WS] Failed to delete edit-message:', err));
+                ).catch(err => {});
               }
               return;
             }
@@ -3089,7 +1768,6 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
             if (contentType === 'remove-message') {
               // Remove message from cache and storage
               const removeContent = spaceMessage.content as { removeMessageId: string };
-              logger.log(`[WS:${getAddr()}] Removing message:`, removeContent.removeMessageId);
 
               queryClient.setQueryData<InfiniteMessagesData>(messagesKey, (old) => {
                 if (!old) return old;
@@ -3104,14 +1782,96 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
 
               // Also remove from storage
               await storage.deleteMessage(removeContent.removeMessageId);
-              logger.log(`[WS:${getAddr()}] Deleted message from storage:`, removeContent.removeMessageId);
               // Delete remove-message from inbox after processing
               if (spaceInboxKey?.address && spaceInboxKey.publicKey && spaceInboxKey.privateKey) {
                 deleteSpaceInboxMessages(
                   spaceInboxKey.address,
                   [message.timestamp],
                   { publicKey: spaceInboxKey.publicKey, privateKey: spaceInboxKey.privateKey }
-                ).catch(err => logger.warn('[WS] Failed to delete remove-message:', err));
+                ).catch(err => {});
+              }
+              return;
+            }
+
+            if (contentType === 'update-profile') {
+              // Update member profile (display name, icon, bio) in storage and cache.
+              // Two changes vs. the previous implementation:
+              //   1. UPSERT instead of update-only — if we don't have a
+              //      member record yet (joined the space after the sender
+              //      sent their update, or join control was missed), we
+              //      still record the profile so the next member-list
+              //      fetch surfaces the right data.
+              //   2. Treat empty strings as "no change" rather than
+              //      "clear the field". A common partial-update mistake
+              //      on the sender side was to broadcast an avatar
+              //      change with `displayName: ''`, which under the old
+              //      handler clobbered everyone's stored display name.
+              const profileContent = spaceMessage.content as {
+                senderId: string;
+                displayName?: string;
+                userIcon?: string;
+                bio?: string;
+                farcasterFid?: number;
+                farcasterUsername?: string;
+              };
+
+              const adapter = getMMKVAdapter();
+              const existingMember = await adapter.getSpaceMember(spaceId, profileContent.senderId) as
+                | (SpaceMember & { profileTimestamp?: number; farcasterFid?: number; farcasterUsername?: string })
+                | undefined;
+
+              // Stamp the merge with the wire message's createdDate so the
+              // public-profile fallback can decide which is newer when
+              // both exist for the same user.
+              const ts = spaceMessage.createdDate || Date.now();
+
+              // Skip stale updates — older than the timestamp we already
+              // applied for this member.
+              if (existingMember?.profileTimestamp && existingMember.profileTimestamp >= ts) {
+                if (spaceInboxKey?.address && spaceInboxKey.publicKey && spaceInboxKey.privateKey) {
+                  deleteSpaceInboxMessages(
+                    spaceInboxKey.address,
+                    [message.timestamp],
+                    { publicKey: spaceInboxKey.publicKey, privateKey: spaceInboxKey.privateKey }
+                  ).catch(err => {});
+                }
+                return;
+              }
+
+              const merged = {
+                ...(existingMember ?? {
+                  address: profileContent.senderId,
+                  inbox_address: '',
+                }),
+                ...(profileContent.displayName ? { display_name: profileContent.displayName } : {}),
+                ...(profileContent.userIcon ? { profile_image: profileContent.userIcon } : {}),
+                ...(profileContent.bio !== undefined ? { bio: profileContent.bio } : {}),
+                ...(profileContent.farcasterFid !== undefined && profileContent.farcasterFid > 0
+                  ? { farcasterFid: profileContent.farcasterFid }
+                  : {}),
+                ...(profileContent.farcasterUsername ? { farcasterUsername: profileContent.farcasterUsername } : {}),
+                profileTimestamp: ts,
+              } as SpaceMember & { profileTimestamp: number; farcasterFid?: number; farcasterUsername?: string };
+
+              await adapter.saveSpaceMember(spaceId, merged);
+
+              // Update React Query members cache. Insert if missing.
+              queryClient.setQueryData(queryKeys.spaces.members(spaceId), (old: SpaceMember[] | undefined) => {
+                if (!old) return old;
+                const idx = old.findIndex((m) => m.address === profileContent.senderId);
+                if (idx >= 0) {
+                  return old.map((m, i) => (i === idx ? merged : m));
+                }
+                return [...old, merged];
+              });
+
+              // Delete update-profile message from inbox after processing
+              if (spaceInboxKey?.address && spaceInboxKey.publicKey && spaceInboxKey.privateKey) {
+                deleteSpaceInboxMessages(
+                  spaceInboxKey.address,
+                  [message.timestamp],
+                  { publicKey: spaceInboxKey.publicKey, privateKey: spaceInboxKey.privateKey }
+                ).catch(err => {});
               }
               return;
             }
@@ -3131,16 +1891,43 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
               space?.spaceName || spaceId.substring(0, 8)
             );
 
-            logger.log(`[WS:${getAddr()}] Saved space message to storage`);
+            // Track replies to current user
+            if (
+              spaceMessage.replyMetadata?.parentAuthor &&
+              spaceMessage.replyMetadata.parentAuthor === fullUserAddrRef.current &&
+              ('senderId' in spaceMessage.content ? spaceMessage.content.senderId : undefined) !== fullUserAddrRef.current &&
+              fullUserAddrRef.current
+            ) {
+              incrementReplyCount(fullUserAddrRef.current, `${spaceId}:${channelId}`);
+            }
 
-            // Update React Query cache
+            // Track last space activity for inbox sorting + preview
+            {
+              const preview = getSpaceMessagePreview(spaceMessage);
+              const senderId = ('senderId' in spaceMessage.content ? spaceMessage.content.senderId : undefined);
+              const senderMember = spaceId ? await storage.getSpaceMember(spaceId, senderId) : undefined;
+              const senderName = messageSenderName(
+                senderId,
+                fullUserAddrRef.current ?? undefined,
+                senderMember ? { [senderId]: senderMember } : undefined
+              );
+              recordSpaceActivity(spaceId, {
+                timestamp: spaceMessage.createdDate || Date.now(),
+                preview,
+                senderName,
+                channelId,
+              });
+            }
+
+            // Update React Query cache. If there's no existing cache (the
+            // query was unmounted and gc'd, or hasn't mounted yet), leave
+            // it alone — the message is already on disk via saveMessage()
+            // above, and the next mount will load the full list from
+            // MMKV. Synthesizing a single-message page here would clobber
+            // the disk-backed history with just-this-one-message until
+            // the next refetch.
             queryClient.setQueryData<InfiniteMessagesData>(messagesKey, (old) => {
-              if (!old) {
-                return {
-                  pages: [{ messages: [spaceMessage], nextCursor: null, prevCursor: null }],
-                  pageParams: [undefined],
-                };
-              }
+              if (!old) return old;
 
               const messageExists = old.pages.some((page) =>
                 page.messages.some((m) => m.messageId === spaceMessage.messageId)
@@ -3159,12 +1946,9 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
               };
             });
 
-            // Invalidate queries to refresh UI
-            queryClient.invalidateQueries({ queryKey: ['spaces'] });
-            // Also invalidate messages query to ensure UI re-renders
-            queryClient.invalidateQueries({ queryKey: messagesKey });
+            // Note: We already updated the cache with setQueryData above
+            // No need to invalidateQueries which would trigger a full refetch
 
-            logger.log(`[WS:${getAddr()}] Space message processed successfully`);
 
             // Delete message from inbox after successful processing
             if (spaceInboxKey?.address && spaceInboxKey.publicKey && spaceInboxKey.privateKey) {
@@ -3172,13 +1956,10 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                 spaceInboxKey.address,
                 [message.timestamp],
                 { publicKey: spaceInboxKey.publicKey, privateKey: spaceInboxKey.privateKey }
-              ).catch(err => logger.warn('[WS] Failed to delete space message:', err));
+              ).catch(err => {});
             }
-
           } catch (spaceError) {
-            logger.log(`[WS:${getAddr()}] Failed to process space message:`, spaceError);
             if (spaceError instanceof Error) {
-              logger.log(`[WS:${getAddr()}] Error stack:`, spaceError.stack);
             }
           }
 
@@ -3203,49 +1984,19 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
         const isDoubleRatchetEnvelope = envelopeData && 'protocol_identifier' in envelopeData;
         const isInitEnvelope = envelopeData && 'ciphertext' in envelopeData && 'initialization_vector' in envelopeData;
 
-        // A message is an init message if:
-        // 1. It arrives on our device inbox, AND
-        // 2. The envelope format is MessageCiphertext (has ciphertext + initialization_vector)
-        // NOTE: We use envelope format as the primary discriminator, NOT inbox mapping.
-        // This is because multiple different senders can send init messages to our device inbox,
-        // and we may have an inbox mapping from a previous conversation that doesn't apply.
+        // Init message = device inbox + MessageCiphertext envelope.
+        // Discriminate by envelope shape, not inbox mapping — a stale
+        // mapping from a previous conversation would misclassify.
         const isInitMessage = isOnDeviceInbox && isInitEnvelope;
 
-        // Log message structure for debugging
         const sealedAny = sealedMessage as unknown as Record<string, unknown>;
-        logger.log(`[WS:${getAddr()}] Message structure:`, {
-          hasInboxAddress: !!sealedMessage.inbox_address,
-          hasEphemeralKey: !!sealedMessage.ephemeral_public_key,
-          hasEnvelope: !!sealedMessage.envelope,
-          hasHubAddress: !!sealedAny.hub_address,
-          isOnDeviceInbox,
-          hasExistingSession: !!existingMapping,
-          isDoubleRatchetEnvelope,
-          isInitEnvelope,
-          isInitMessage,
-          ourInbox: ownInboxAddressRef.current?.substring(0, 12),
-          messageInbox: message.inboxAddress?.substring(0, 12),
-        });
 
-        // Check if this is a message we sent ourselves (echo from server)
-        // The server broadcasts messages to all subscribers including the sender
-        // For initialization messages (new conversations), the sealed message has inbox_address field
-        // pointing to the RECIPIENT's inbox. If we sent it, inbox_address won't be our own inbox.
-        // For subsequent messages, there's an envelope field at the root level with hub_address.
-        //
-        // IMPORTANT: We must NOT filter out messages arriving at our conversation-specific inboxes!
-        // When we initiate a conversation, we create a per-conversation inbox and subscribe to it.
-        // Replies from the recipient will arrive at that inbox and have inbox_address + ephemeral_public_key.
+        // Per-conversation inboxes (subscribed when we initiate) must NOT
+        // be filtered as echoes — replies legitimately arrive there.
         const isOurConversationInbox = encryptionStateStorage.getConversationInboxKeypairByAddress(message.inboxAddress) !== null;
 
-        if (isOurConversationInbox) {
-          logger.log(`[WS:${getAddr()}] Message arriving at our conversation inbox: ${message.inboxAddress?.substring(0, 12)}`);
-        }
-
         if (!isOnDeviceInbox && !isOurConversationInbox && sealedMessage.inbox_address && sealedMessage.ephemeral_public_key) {
-          // This looks like an outbound initialization message format (has inbox_address field)
-          // and it's NOT addressed to our inbox or a conversation inbox we created, so it's an echo
-          logger.log('[WS] Ignoring echoed outbound message (init format to other inbox)');
+          // Echo: outbound init format addressed elsewhere.
           return;
         }
 
@@ -3256,7 +2007,6 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
           // that isn't our own device inbox. Check if we have a session for this inbox.
           // Also check if this is a conversation inbox we created - those are legitimate.
           if (!existingMapping && !isOurConversationInbox) {
-            logger.log('[WS] Ignoring message on unknown inbox (likely echo):', message.inboxAddress?.substring(0, 12));
             return;
           }
         }
@@ -3269,47 +2019,38 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
 
         if (isInitMessage) {
           // === Path 1: First message from new sender ===
-          logger.log(`[E2E:${getAddr()}] Received initialization envelope on device inbox`);
-
           try {
             // Unseal the envelope using our inbox encryption key
             const unsealed = await encryptionService.unsealInitializationEnvelope(sealedMessage);
-            logger.log(`[E2E:${getAddr()}] Envelope unsealed, sender:`, unsealed.user_address);
 
             // Initialize recipient session (performs X3DH and sets up Double Ratchet)
             // Pass the inbox address where we received this message so state is stored correctly
+            // Returns null if decryption fails (expected for multi-device)
             const sessionResult = await encryptionService.initializeRecipientSession(
               unsealed,
               message.inboxAddress  // Our device inbox where we received this init
             );
 
+            if (!sessionResult) {
+              // Decryption failed - message was likely for a different device
+              return;
+            }
+
             conversationId = sessionResult.conversationId;
             userProfileFromEnvelope = sessionResult.userProfile;
-
-            // Log the decrypted message for debugging
-            logger.log(`[E2E:${getAddr()}] sessionResult.message preview:`, sessionResult.message.substring(0, 200));
-            if (userProfileFromEnvelope) {
-              logger.log(`[E2E:${getAddr()}] User profile from envelope:`, userProfileFromEnvelope);
-            }
 
             // The message should now be properly decrypted plaintext JSON
             decryptedMessage = JSON.parse(sessionResult.message) as Message;
 
-            logger.log(`[E2E:${getAddr()}] Session initialized for conversation:`, conversationId);
-
-            // IMPORTANT: Subscribe to our conversation inbox for receiving future replies
-            // The receiver needs to listen on their own conversation inbox, not the sender's
+            // Subscribe to our conversation inbox so future replies arrive.
             if (sessionResult.ourConversationInbox) {
-              logger.log(`[E2E:${getAddr()}] Subscribing to our conversation inbox:`, sessionResult.ourConversationInbox.substring(0, 12));
               const client = wsClientRef.current;
               if (client && client.isConnected) {
                 await client.subscribe([sessionResult.ourConversationInbox]);
                 subscribedInboxesRef.current.add(sessionResult.ourConversationInbox);
-                logger.log(`[E2E:${getAddr()}] Subscribed to conversation inbox successfully`);
               }
             }
           } catch (initError) {
-            logger.log(`[E2E:${getAddr()}] Failed to initialize session from envelope:`, initError);
             // Manual reset via resetDMSession() is available if needed
             return;
           }
@@ -3321,43 +2062,28 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
           // multiple conversations share the same device inbox and the inbox mapping
           // can be wrong (overwritten by the most recent conversation).
           if (isOnDeviceInbox && isDoubleRatchetEnvelope) {
-            logger.log(`[E2E:${getAddr()}] Double Ratchet envelope on device inbox, using trial decryption`);
-
             // Get all states that have this inbox ID
             const statesForInbox = encryptionStateStorage.getStatesByInboxId(message.inboxAddress);
-            logger.log(`[E2E:${getAddr()}] Found ${statesForInbox.length} states for inbox ${message.inboxAddress.substring(0, 12)}`);
 
             for (const { conversationId: convId } of statesForInbox) {
-              try {
-                logger.log(`[E2E:${getAddr()}] Trying conversation: ${convId.substring(0, 20)}`);
+              // Try to decrypt with this session
+              // Returns null if decryption fails (expected for multi-device)
+              const result = await encryptionService.decryptMessage(
+                convId,
+                message.inboxAddress,
+                sealedMessage.envelope
+              );
 
-                // Try to decrypt with this session
-                const result = await encryptionService.decryptMessage(
-                  convId,
-                  message.inboxAddress,
-                  sealedMessage.envelope
-                );
-
-                // Check if decryption actually succeeded (not an error message)
-                if (result && result.length > 0 && !result.startsWith('Decryption failed')) {
-                  logger.log(`[E2E:${getAddr()}] Trial decryption succeeded for conversation: ${convId.substring(0, 20)}`);
-                  decryptedText = result;
-                  conversationId = convId;
-                  break;
-                }
-              } catch (decryptError) {
-                // Decryption failed for this conversation, try next
-                logger.log(`[E2E:${getAddr()}] Trial failed for ${convId.substring(0, 20)}:`,
-                  decryptError instanceof Error ? decryptError.message : String(decryptError));
-                continue;
+              // Check if decryption succeeded
+              if (result && result.length > 0) {
+                decryptedText = result;
+                conversationId = convId;
+                break;
               }
+              // Null result means decryption failed, try next session
             }
 
             if (!decryptedText) {
-              logger.warn(
-                `[E2E:${getAddr()}] Cannot decrypt: no matching session found for device inbox.`,
-                message.inboxAddress?.substring(0, 12)
-              );
               return;
             }
           } else {
@@ -3375,23 +2101,18 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
               // After unsealing, the content could be:
               // 1. An InitializationEnvelope (unconfirmed session)
               // 2. A raw Double Ratchet envelope (confirmed session)
-              logger.log(`[E2E:${getAddr()}] Sealed message at conversation inbox, unsealing with conversation keypair`);
-
               try {
                 // Unseal using our conversation inbox private key
                 const unsealedContent = await unsealWithConversationKeypair(sealedMessage, conversationKeypair);
 
                 if (unsealedContent.type === 'dr') {
                   // === Raw Double Ratchet envelope (confirmed session) ===
-                  logger.log(`[E2E:${getAddr()}] Unsealed raw DR envelope, length:`, unsealedContent.envelope.length);
-
                   // Get conversation ID from the keypair
                   conversationId = conversationKeypair.conversationId;
 
                   // Get the encryption state for this conversation at this inbox
                   const encState = encryptionStateStorage.getEncryptionState(conversationId, message.inboxAddress);
                   if (!encState) {
-                    logger.log(`[E2E:${getAddr()}] No encryption state for conversation inbox`);
                     return;
                   }
 
@@ -3401,12 +2122,9 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                     message.inboxAddress,
                     unsealedContent.envelope
                   );
-
-                  logger.log(`[E2E:${getAddr()}] Decrypted confirmed session message`);
                 } else {
                   // === InitializationEnvelope (unconfirmed session) ===
                   const unsealed = unsealedContent.envelope;
-                  logger.log(`[E2E:${getAddr()}] Unsealed InitEnvelope from:`, unsealed.user_address);
 
                   // Determine conversation ID from the unsealed envelope
                   conversationId = `${unsealed.user_address}/${unsealed.user_address}`;
@@ -3416,13 +2134,9 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                   const existingStates = encryptionStateStorage.getEncryptionStates(conversationId);
                   const hasExistingSession = existingStates.length > 0;
 
-                  logger.log(`[E2E:${getAddr()}] Conversation ${conversationId.substring(0, 20)}... hasExistingSession: ${hasExistingSession}`);
-
                   if (hasExistingSession) {
                     // === Use existing session to decrypt ===
                     // The message is wrapped in InitEnvelope but we already have a session
-                    logger.log(`[E2E:${getAddr()}] Using existing session to decrypt init envelope message`);
-
                     // Try to decrypt with existing states (trial decryption)
                     let successInboxId: string | null = null;
                     for (const encState of existingStates) {
@@ -3433,7 +2147,6 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                           unsealed.message  // The Double Ratchet envelope inside the InitEnvelope
                         );
                         if (decryptedText && !decryptedText.startsWith('Decryption failed')) {
-                          logger.log(`[E2E:${getAddr()}] Decrypted with existing session on inbox:`, encState.inboxId.substring(0, 12));
                           successInboxId = encState.inboxId;
 
                           // Extract user profile from envelope
@@ -3443,13 +2156,10 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                           break;
                         }
                       } catch (decryptErr) {
-                        logger.log(`[E2E:${getAddr()}] Trial decrypt failed for inbox ${encState.inboxId.substring(0, 12)}:`,
-                          decryptErr instanceof Error ? decryptErr.message : String(decryptErr));
                       }
                     }
 
                     if (!decryptedText || decryptedText.startsWith('Decryption failed') || !successInboxId) {
-                      logger.log(`[E2E:${getAddr()}] Failed to decrypt with any existing session`);
                       return;
                     }
 
@@ -3468,17 +2178,21 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                           ...currentState,
                           sendingInbox: updatedSendingInbox,
                         }, false);
-                        logger.log(`[E2E:${getAddr()}] Updated sendingInbox from InitEnvelope:`, unsealed.return_inbox_address.substring(0, 12));
+                        ratchetStateCacheRef.current.clear();
                       }
                     }
                   } else {
                     // === First message from this sender - initialize new session ===
-                    logger.log(`[E2E:${getAddr()}] No existing session, initializing recipient session`);
-
+                    // Returns null if decryption fails (expected for multi-device)
                     const sessionResult = await encryptionService.initializeRecipientSession(
                       unsealed,
                       message.inboxAddress  // Our conversation inbox where we received this
                     );
+
+                    if (!sessionResult) {
+                      // Decryption failed - message was likely for a different device
+                      return;
+                    }
 
                     conversationId = sessionResult.conversationId;
                     decryptedText = sessionResult.message;
@@ -3486,23 +2200,15 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
 
                     // Subscribe to our conversation inbox for receiving future replies
                     if (sessionResult.ourConversationInbox) {
-                      logger.log(`[E2E:${getAddr()}] Subscribing to our conversation inbox:`, sessionResult.ourConversationInbox.substring(0, 12));
                       const client = wsClientRef.current;
                       if (client && client.isConnected) {
                         await client.subscribe([sessionResult.ourConversationInbox]);
                         subscribedInboxesRef.current.add(sessionResult.ourConversationInbox);
-                        logger.log(`[E2E:${getAddr()}] Subscribed to conversation inbox successfully`);
                       }
                     }
                   }
                 }
-
-                logger.log(`[E2E:${getAddr()}] Processed message, conversationId:`, conversationId);
-                if (userProfileFromEnvelope) {
-                  logger.log(`[E2E:${getAddr()}] User profile from envelope:`, userProfileFromEnvelope);
-                }
               } catch (unsealError) {
-                logger.log(`[E2E:${getAddr()}] Failed to unseal conversation inbox message:`, unsealError);
                 return;
               }
             } else {
@@ -3511,24 +2217,10 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
               const mapping = encryptionStateStorage.getInboxMapping(message.inboxAddress);
 
               if (!mapping) {
-                logger.warn(
-                  `[E2E] No inbox mapping found for address: ${message.inboxAddress}`
-                );
                 return;
               }
 
               conversationId = mapping.conversationId;
-
-              // Log envelope details before decryption
-              logger.log(`[E2E:${getAddr()}] Decrypting subsequent message:`, {
-                conversationId: conversationId.substring(0, 30),
-                inboxAddress: message.inboxAddress?.substring(0, 12),
-                envelopeType: typeof sealedMessage.envelope,
-                envelopeLength: sealedMessage.envelope?.length,
-                envelopePreview: sealedMessage.envelope?.substring(0, 200),
-                isDoubleRatchetEnvelope,
-                isInitEnvelope,
-              });
 
               // Decrypt using existing session
               try {
@@ -3538,15 +2230,8 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
                   sealedMessage.envelope
                 );
               } catch (decryptError) {
-                // Log detailed error info
-                logger.log(`[E2E:${getAddr()}] Decryption failed:`, {
-                  error: decryptError instanceof Error ? decryptError.message : String(decryptError),
-                  conversationId: conversationId.substring(0, 30),
-                  inboxAddress: message.inboxAddress?.substring(0, 12),
-                });
                 // If this is a "no state" error, it's likely stale data - skip gracefully
                 if (decryptError instanceof Error && decryptError.message.includes('No encryption state')) {
-                  logger.warn(`[E2E:${getAddr()}] Skipping message with no matching session (likely stale data)`);
                   return;
                 }
                 throw decryptError;
@@ -3554,15 +2239,23 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
             }
           }
 
-          logger.log(`[E2E:${getAddr()}] Decrypted text length:`, decryptedText?.length);
-          logger.log(`[E2E:${getAddr()}] Decrypted text (first 200 chars):`, decryptedText?.substring(0, 200));
 
           if (!decryptedText || decryptedText.length === 0 || decryptedText.startsWith('Decryption failed')) {
-            logger.log(`[E2E:${getAddr()}] Decryption returned empty or error result:`, decryptedText?.substring(0, 50));
             return;
           }
 
           decryptedMessage = JSON.parse(decryptedText) as Message;
+
+          // Intercept call signaling messages — forward to CallContext, don't display in chat.
+          // call-event is the exception: it renders in chat history as a system message.
+          if (decryptedMessage.content?.type?.startsWith('call-') && decryptedMessage.content?.type !== 'call-event') {
+            callSignalingHandlerRef.current?.(decryptedMessage);
+            // Best-effort: delete from server so stale signals don't replay on next launch
+            getDeviceKeyset().then(dk => {
+              if (dk) deleteInboxMessages(message.inboxAddress, [message.timestamp], dk).catch(() => {});
+            });
+            return;
+          }
 
           // Handle same-user multi-device sync:
           // When receiving a message from our own address (different device),
@@ -3571,7 +2264,6 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
           const senderAddress = conversationId.split('/')[0];
           if (senderAddress === user?.address && decryptedMessage.channelId) {
             const actualRecipient = decryptedMessage.channelId;
-            logger.log(`[E2E:${getAddr()}] Self-sync detected. Redirecting conversationId from ${senderAddress.substring(0, 12)} to ${actualRecipient.substring(0, 12)}`);
             conversationId = `${actualRecipient}/${actualRecipient}`;
           }
         }
@@ -3581,19 +2273,43 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
 
         // Save conversation to storage (creates new or updates existing)
         const existingConversation = await storage.getConversation(conversationId);
+        // Get sender display name for preview
+        const senderDisplayName = userProfileFromEnvelope?.displayName || existingConversation?.displayName || senderAddress.substring(0, 8);
+        // Determine preview text based on message type
+        const getMessagePreview = (msg: Message): string => {
+          const contentType = msg.content?.type;
+          if (contentType === 'embed') {
+            return '📷 Image';
+          } else if (contentType === 'sticker') {
+            return '🎨 Sticker';
+          } else if (contentType === 'call-event') {
+            const c = msg.content as any;
+            const icon = c.mediaType === 'video' ? '📹' : '📞';
+            if (c.event === 'completed') return `${icon} Call`;
+            if (c.event === 'missed') return `${icon} Missed call`;
+            return `${icon} Call`;
+          } else if (contentType === 'post' || contentType === 'event') {
+            const textContent = ('text' in msg.content ? msg.content.text : undefined);
+            if (Array.isArray(textContent)) {
+              return textContent.join('');
+            }
+            return textContent || '';
+          }
+          return '';
+        };
+        const messagePreview = getMessagePreview(decryptedMessage);
         if (!existingConversation) {
-          // Create new conversation for this sender
-          // Use profile data from InitializationEnvelope if available
           const newConversation: Conversation = {
             conversationId,
             address: senderAddress,
-            displayName: userProfileFromEnvelope?.displayName || senderAddress.substring(0, 8),
+            displayName: senderDisplayName,
             icon: userProfileFromEnvelope?.userIcon || '',
             timestamp: decryptedMessage.createdDate || Date.now(),
             type: 'direct',
+            lastMessagePreview: messagePreview,
+            lastMessageSenderName: senderDisplayName,
           };
           await storage.saveConversation(newConversation);
-          logger.log(`[WS:${getAddr()}] Created new conversation:`, conversationId, 'with displayName:', newConversation.displayName);
         } else {
           // Update existing conversation - update profile if we have new info
           const updatedConversation: Conversation = {
@@ -3602,9 +2318,10 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
             // Update display name and icon if we have new profile data
             displayName: userProfileFromEnvelope?.displayName || existingConversation.displayName,
             icon: userProfileFromEnvelope?.userIcon || existingConversation.icon,
+            lastMessagePreview: messagePreview,
+            lastMessageSenderName: senderDisplayName,
           };
           await storage.saveConversation(updatedConversation);
-          logger.log(`[WS:${getAddr()}] Updated conversation:`, conversationId);
         }
 
         // Save message to storage
@@ -3621,39 +2338,17 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
           '', // No icon
           senderAddress.substring(0, 8) // Display name
         );
-        logger.log(`[WS:${getAddr()}] Saved message:`, decryptedMessage.messageId);
 
-        // Update React Query cache with the new message
-        // IMPORTANT: Use the same query key format as useSendDirectMessage hook
-        // The send hook uses queryKeys.messages.infinite(recipientAddress, recipientAddress)
-        // When receiving, the sender is the "other person" (their recipientAddress from our perspective)
+        // Key shape must match useSendDirectMessage:
+        // queryKeys.messages.infinite(otherPartyAddress, otherPartyAddress).
         const messagesKey = queryKeys.messages.infinite(senderAddress, senderAddress);
-        logger.log(`[WS:${getAddr()}] Updating cache with key:`, messagesKey);
-
-        interface MessagesPage {
-          messages: Message[];
-          nextCursor?: string | null;
-          prevCursor?: string | null;
-        }
-
-        interface InfiniteMessagesData {
-          pages: MessagesPage[];
-          pageParams: unknown[];
-        }
 
         queryClient.setQueryData<InfiniteMessagesData>(messagesKey, (old) => {
-          if (!old) {
-            return {
-              pages: [
-                {
-                  messages: [decryptedMessage],
-                  nextCursor: null,
-                  prevCursor: null,
-                },
-              ],
-              pageParams: [undefined],
-            };
-          }
+          // No existing cache — leave it alone. saveMessage() above already
+          // wrote to MMKV, and a fresh mount will read the full list from
+          // disk. Synthesizing a single-message page would clobber the
+          // disk-backed history.
+          if (!old) return old;
 
           // Check if message already exists (by messageId)
           const messageExists = old.pages.some((page) =>
@@ -3680,18 +2375,17 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
         });
 
         // Update conversation list to show latest message
-        // NOTE: We intentionally do NOT invalidate messagesKey here because:
-        // 1. We already updated the cache with setQueryData above
-        // 2. Invalidating would trigger a refetch that could race with storage writes
-        // 3. This was causing messages to "disappear" during alternating send/receive
+        // Skip invalidating messagesKey: setQueryData above is canonical
+        // and a refetch races with storage writes.
         queryClient.invalidateQueries({
           queryKey: queryKeys.conversations.all('direct'),
+          refetchType: 'active',
         });
         queryClient.invalidateQueries({
           queryKey: queryKeys.conversations.detail(conversationId),
+          refetchType: 'active',
         });
 
-        logger.log(`[WS:${getAddr()}] Received and processed message:`, decryptedMessage.messageId);
 
         // Delete the message from the server inbox after successful processing
         // This prevents re-delivery on reconnect which would cause decryption failures
@@ -3707,27 +2401,1135 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
               publicKey: bytesToHex(conversationKeypair.signingPublicKey),
               privateKey: bytesToHex(conversationKeypair.signingPrivateKey),
             };
-            // Fire and forget - don't block on deletion
-            deleteConversationInboxMessages(message.inboxAddress, [message.timestamp], signingKey).catch(err => {
-              logger.warn('[WS] Background conversation inbox delete failed:', err);
-            });
+            // Best-effort: fire and forget — don't block on deletion
+            deleteConversationInboxMessages(message.inboxAddress, [message.timestamp], signingKey).catch(() => {});
           } else {
             // Device inbox - use device keyset signing key for deletion
             const deviceKeyset = await getDeviceKeyset();
             if (deviceKeyset) {
-              // Fire and forget - don't block on deletion
-              deleteInboxMessages(message.inboxAddress, [message.timestamp], deviceKeyset).catch(err => {
-                logger.warn('[WS] Background inbox delete failed:', err);
-              });
+              // Best-effort: fire and forget — don't block on deletion
+              deleteInboxMessages(message.inboxAddress, [message.timestamp], deviceKeyset).catch(() => {});
             }
           }
         }
-      } catch (error) {
-        logger.log('Failed to process incoming message:', error);
+      } catch {
+        // Message processing failed — isolate so other messages continue processing
       }
     },
     [queryClient, storage]
   );
+
+  /**
+   * Batch pre-unseal space messages to populate the cache.
+   * Groups messages by spaceId, does a single native call per space,
+   * and stores results in preUnsealedCacheRef for handleIncomingMessage to consume.
+   */
+  const batchPreUnsealSpaceMessages = useCallback(async (
+    messages: EncryptedWebSocketMessage[]
+  ): Promise<void> => {
+    // Classify messages: space inbox vs other
+    const spaceInboxAddresses = getAllSpaceInboxAddresses();
+    const spaceInboxSet = new Set(spaceInboxAddresses);
+
+    // Group space messages by spaceId
+    const spaceGroups = new Map<string, {
+      hubPrivateKey: number[];
+      configPrivateKey: number[] | undefined;
+      entries: { message: EncryptedWebSocketMessage; ephemeral_public_key: string; envelope: string }[];
+    }>();
+
+    let inboxToSpaceMap: Map<string, string>;
+    try {
+      inboxToSpaceMap = getInboxToSpaceMap();
+    } catch {
+      return; // Can't batch without map
+    }
+
+    for (const msg of messages) {
+      if (!msg.encryptedContent || !spaceInboxSet.has(msg.inboxAddress)) continue;
+
+      const spaceId = inboxToSpaceMap.get(msg.inboxAddress);
+      if (!spaceId) continue;
+
+      const hubKey = getSpaceKey(spaceId, 'hub');
+      if (!hubKey?.privateKey) continue;
+
+      let sealedMessage: Record<string, unknown>;
+      try {
+        sealedMessage = JSON.parse(msg.encryptedContent) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+
+      // Extract ephemeral_public_key and envelope from either hub or sync format
+      let ephemeralPubKey: string | undefined;
+      let envelope: string | undefined;
+
+      if (sealedMessage.type === 'sync') {
+        ephemeralPubKey = sealedMessage.ephemeral_public_key as string;
+        envelope = sealedMessage.envelope as string;
+      } else {
+        ephemeralPubKey = sealedMessage.ephemeral_public_key as string;
+        envelope = sealedMessage.envelope as string;
+      }
+
+      if (!ephemeralPubKey || !envelope) continue;
+
+      if (!spaceGroups.has(spaceId)) {
+        const configKey = getSpaceKey(spaceId, 'config');
+        spaceGroups.set(spaceId, {
+          hubPrivateKey: hexToBytes(hubKey.privateKey),
+          configPrivateKey: configKey ? hexToBytes(configKey.privateKey) : undefined,
+          entries: [],
+        });
+      }
+
+      spaceGroups.get(spaceId)!.entries.push({
+        message: msg,
+        ephemeral_public_key: ephemeralPubKey,
+        envelope,
+      });
+    }
+
+    // Batch unseal each space group
+    const cryptoProvider = new NativeCryptoProvider();
+
+    for (const [, group] of spaceGroups) {
+      if (group.entries.length === 0) continue;
+
+      try {
+        const results = await cryptoProvider.batchUnsealEnvelopes(
+          group.hubPrivateKey,
+          group.entries.map(e => ({
+            ephemeral_public_key: e.ephemeral_public_key,
+            envelope: e.envelope,
+          })),
+          group.configPrivateKey
+        );
+
+        // Store successful results in cache
+        for (let i = 0; i < results.length; i++) {
+          const result = results[i];
+          if ('plaintext' in result) {
+            const entry = group.entries[i];
+            const cacheKey = `${entry.message.inboxAddress}:${entry.message.timestamp}`;
+            if (preUnsealedCacheRef.current.size >= MAX_PRE_UNSEALED_CACHE_SIZE) {
+              // Evict oldest entries (first 100)
+              const keys = Array.from(preUnsealedCacheRef.current.keys());
+              for (let i = 0; i < 100; i++) {
+                preUnsealedCacheRef.current.delete(keys[i]);
+              }
+            }
+            preUnsealedCacheRef.current.set(cacheKey, result.plaintext);
+          }
+          // Errors are silently skipped - handleIncomingMessage will fall back to individual unseal
+        }
+      } catch {
+        // If batch fails, individual processing will still work as fallback
+      }
+    }
+  }, []);
+
+  /**
+   * Build the batch input for native processing.
+   * Classifies messages as space/DM, gathers crypto state from MMKV.
+   */
+  const preclassifyAndGatherState = useCallback((
+    batch: EncryptedWebSocketMessage[]
+  ): { batchInput: BatchProcessInput; nonBatchMessages: EncryptedWebSocketMessage[] } => {
+    const spaceInboxAddresses = getAllSpaceInboxAddresses();
+    const spaceInboxSet = new Set(spaceInboxAddresses);
+
+    let inboxToSpaceMap: Map<string, string>;
+    try {
+      inboxToSpaceMap = getInboxToSpaceMap();
+    } catch {
+      return { batchInput: { user_address: fullUserAddrRef.current || '', space_groups: [], dm_groups: [] }, nonBatchMessages: batch };
+    }
+
+    const spaceGroupMap = new Map<string, BatchSpaceGroup>();
+    const dmGroupMap = new Map<string, BatchDMGroup>();
+    const nonBatchMessages: EncryptedWebSocketMessage[] = [];
+
+    for (const msg of batch) {
+      if (!msg.encryptedContent) {
+        nonBatchMessages.push(msg);
+        continue;
+      }
+
+      const isSpaceInbox = spaceInboxSet.has(msg.inboxAddress);
+      const isOnDeviceInbox = msg.inboxAddress === ownInboxAddressRef.current;
+
+      if (isSpaceInbox) {
+        // Space message - add to space group
+        const spaceId = inboxToSpaceMap.get(msg.inboxAddress);
+        if (!spaceId) {
+          nonBatchMessages.push(msg);
+          continue;
+        }
+
+        const hubKey = getSpaceKey(spaceId, 'hub');
+        if (!hubKey?.privateKey) {
+          nonBatchMessages.push(msg);
+          continue;
+        }
+
+        let sealedMessage: Record<string, unknown>;
+        try {
+          sealedMessage = JSON.parse(msg.encryptedContent) as Record<string, unknown>;
+        } catch {
+          nonBatchMessages.push(msg);
+          continue;
+        }
+
+        const ephemeralPubKey = sealedMessage.ephemeral_public_key as string;
+        const envelope = sealedMessage.envelope as string;
+        if (!ephemeralPubKey || !envelope) {
+          nonBatchMessages.push(msg);
+          continue;
+        }
+
+        if (!spaceGroupMap.has(spaceId)) {
+          const configKey = getSpaceKey(spaceId, 'config');
+          const spaceConversationId = `${spaceId}/${spaceId}`;
+          const encryptionStates = encryptionStateStorage.getEncryptionStates(spaceConversationId);
+
+          let trState = '';
+          let trFallbackState: string | null = null;
+          let trStateIsNested = false;
+
+          if (encryptionStates.length > 0) {
+            const parsed = JSON.parse(encryptionStates[0].state);
+            if (parsed.state && typeof parsed.state === 'string') {
+              trState = parsed.state;
+              trStateIsNested = true;
+            } else {
+              trState = encryptionStates[0].state;
+            }
+
+            const fallback = encryptionStateStorage.getFallbackState(spaceConversationId, encryptionStates[0].inboxId);
+            if (fallback) {
+              const fallbackParsed = JSON.parse(fallback.state);
+              trFallbackState = (fallbackParsed.state && typeof fallbackParsed.state === 'string')
+                ? fallbackParsed.state
+                : fallback.state;
+            }
+          }
+
+          spaceGroupMap.set(spaceId, {
+            space_id: spaceId,
+            hub_private_key: hexToBytes(hubKey.privateKey),
+            config_private_key: configKey ? hexToBytes(configKey.privateKey) : null,
+            tr_state: trState,
+            tr_fallback_state: trFallbackState,
+            tr_state_is_nested: trStateIsNested,
+            sent_envelope_fingerprints: [], // Populated below
+            messages: [],
+          });
+        }
+
+        const envelopeType: 'hub' | 'sync' = sealedMessage.type === 'sync' ? 'sync' : 'hub';
+
+        spaceGroupMap.get(spaceId)!.messages.push({
+          inbox_address: msg.inboxAddress,
+          timestamp: msg.timestamp,
+          envelope_type: envelopeType,
+          ephemeral_public_key: ephemeralPubKey,
+          envelope,
+        });
+      } else if (isOnDeviceInbox) {
+        // DM on device inbox - check if DR envelope for batch processing
+        let sealedMessage: Record<string, unknown>;
+        try {
+          sealedMessage = JSON.parse(msg.encryptedContent) as Record<string, unknown>;
+        } catch {
+          nonBatchMessages.push(msg);
+          continue;
+        }
+
+        let envelopeData: Record<string, unknown> | null = null;
+        try {
+          const envStr = typeof sealedMessage.envelope === 'string' ? sealedMessage.envelope : JSON.stringify(sealedMessage.envelope);
+          envelopeData = JSON.parse(envStr) as Record<string, unknown>;
+        } catch { /* ignore */ }
+
+        const isDoubleRatchetEnvelope = envelopeData && 'protocol_identifier' in envelopeData;
+        const isInitEnvelope = envelopeData && 'ciphertext' in envelopeData && 'initialization_vector' in envelopeData;
+
+        // Both DR and init envelopes on device inbox go through native batch
+        const groupKey = `device_inbox:${msg.inboxAddress}`;
+        if (!dmGroupMap.has(groupKey)) {
+          // Gather all DR states for this inbox
+          const statesForInbox = encryptionStateStorage.getStatesByInboxId(msg.inboxAddress);
+          const drStates: BatchDRState[] = statesForInbox.map(s => ({
+            conversation_id: s.conversationId,
+            inbox_id: s.state.inboxId || msg.inboxAddress,
+            state: s.state.state,
+          }));
+
+          // Get device keys for init envelope processing
+          const deviceKeys = encryptionService.getDeviceKeys();
+
+          dmGroupMap.set(groupKey, {
+            conversation_id: '', // Multiple possible conversations
+            message_type: 'device_inbox',
+            device_inbox_private_key: null,
+            device_inbox_encryption_private_key: deviceKeys?.inboxEncryptionPrivateKey || null,
+            conversation_inbox_private_key: null,
+            conversation_inbox_signing_private_key: null,
+            identity_private_key: deviceKeys?.identityPrivateKey || [],
+            pre_key_private_key: deviceKeys?.preKeyPrivateKey || [],
+            dr_states: drStates,
+            messages: [],
+          });
+        }
+
+        dmGroupMap.get(groupKey)!.messages.push({
+          inbox_address: msg.inboxAddress,
+          timestamp: msg.timestamp,
+          encrypted_content: msg.encryptedContent,
+          is_double_ratchet_envelope: !!isDoubleRatchetEnvelope && !isInitEnvelope,
+          is_init_envelope: !!isInitEnvelope,
+        });
+      } else {
+        // Conversation inbox or unknown - check if we can batch
+        const conversationKeypair = encryptionStateStorage.getConversationInboxKeypairByAddress(msg.inboxAddress);
+        if (conversationKeypair) {
+          let sealedMessage: Record<string, unknown>;
+          try {
+            sealedMessage = JSON.parse(msg.encryptedContent) as Record<string, unknown>;
+          } catch {
+            nonBatchMessages.push(msg);
+            continue;
+          }
+
+          // Check if we have existing states for this conversation
+          const existingStates = encryptionStateStorage.getEncryptionStates(conversationKeypair.conversationId);
+          if (existingStates.length > 0) {
+            const groupKey = `conv_inbox:${msg.inboxAddress}`;
+            if (!dmGroupMap.has(groupKey)) {
+              const drStates: BatchDRState[] = existingStates.map(s => ({
+                conversation_id: s.conversationId,
+                inbox_id: s.inboxId || msg.inboxAddress,
+                state: s.state,
+              }));
+
+              dmGroupMap.set(groupKey, {
+                conversation_id: conversationKeypair.conversationId,
+                message_type: 'conversation_inbox',
+                device_inbox_private_key: null,
+                device_inbox_encryption_private_key: null,
+                conversation_inbox_private_key: conversationKeypair.encryptionPrivateKey ? Array.from(conversationKeypair.encryptionPrivateKey) : null,
+                conversation_inbox_signing_private_key: conversationKeypair.signingPrivateKey ? Array.from(conversationKeypair.signingPrivateKey) : null,
+                identity_private_key: [],
+                pre_key_private_key: [],
+                dr_states: drStates,
+                messages: [],
+              });
+            }
+
+            dmGroupMap.get(groupKey)!.messages.push({
+              inbox_address: msg.inboxAddress,
+              timestamp: msg.timestamp,
+              encrypted_content: msg.encryptedContent,
+              // Fast path: assume raw Double Ratchet after unseal. If the
+              // inner content turns out to be an InitializationEnvelope (e.g.
+              // the peer's session isn't confirmed yet and they still wrap),
+              // the native batch returns `unseal_failed` and the fallback in
+              // `applyDMGroupResults` routes the message to JS
+              // `handleIncomingMessage` which handles both envelope types.
+              is_double_ratchet_envelope: true,
+              is_init_envelope: false,
+            });
+          } else {
+            // No existing states - init message, fall back to JS
+            nonBatchMessages.push(msg);
+          }
+        } else {
+          // Unknown inbox - fall back
+          nonBatchMessages.push(msg);
+        }
+      }
+    }
+
+    const batchInput: BatchProcessInput = {
+      user_address: fullUserAddrRef.current || '',
+      space_groups: Array.from(spaceGroupMap.values()),
+      dm_groups: Array.from(dmGroupMap.values()),
+    };
+
+    return { batchInput, nonBatchMessages };
+  }, []);
+
+  /**
+   * Apply space message results from batch native processing.
+   * Handles: save to storage, React Query cache updates, reactions, edits, removes, etc.
+   */
+  const applySpaceGroupResults = useCallback(async (
+    results: BatchSpaceGroupResult[],
+    batch: EncryptedWebSocketMessage[]
+  ) => {
+    for (const groupResult of results) {
+      const spaceId = groupResult.space_id;
+      const spaceInboxKey = getSpaceKey(spaceId, 'inbox');
+
+      // TR state is now written directly by native MMKV — no JS state write needed
+
+      // Process each message result
+      const deleteTimestamps: number[] = [];
+
+      for (const msgResult of groupResult.messages) {
+        deleteTimestamps.push(msgResult.timestamp);
+
+        if (msgResult.status === 'unseal_failed' || msgResult.status === 'decrypt_failed') {
+          continue;
+        }
+
+        if (msgResult.status === 'self_echo') {
+          // Self-echoes of space-call messages still need to be rendered
+          // (no optimistic update was added when sending)
+          if (msgResult.decrypted_message) {
+            try {
+              const selfMsg = JSON.parse(msgResult.decrypted_message) as Message;
+              if (selfMsg.content?.type === 'space-call-start' || selfMsg.content?.type === 'space-call-end') {
+                // Fall through to normal processing below
+              } else {
+                continue;
+              }
+            } catch {
+              continue;
+            }
+          } else {
+            continue;
+          }
+        }
+
+        if (msgResult.status === 'control' && msgResult.control_payload) {
+          // Control messages must be processed by JS for side effects
+          // Find the original message in the batch by timestamp
+          const originalMsg = batch.find(m => m.timestamp === msgResult.timestamp && m.encryptedContent);
+          if (originalMsg) {
+            // Re-populate the preUnsealedCacheRef so handleIncomingMessage can use it
+            const cacheKey = `${originalMsg.inboxAddress}:${originalMsg.timestamp}`;
+            if (preUnsealedCacheRef.current.size >= MAX_PRE_UNSEALED_CACHE_SIZE) {
+              // Evict oldest entries (first 100)
+              const keys = Array.from(preUnsealedCacheRef.current.keys());
+              for (let i = 0; i < 100; i++) {
+                preUnsealedCacheRef.current.delete(keys[i]);
+              }
+            }
+            preUnsealedCacheRef.current.set(cacheKey, msgResult.control_payload);
+            try {
+              await handleIncomingMessage(originalMsg);
+            } catch { /* ignore */ }
+          }
+          continue;
+        }
+
+        if ((msgResult.status === 'decrypted' || msgResult.status === 'plaintext') && msgResult.decrypted_message) {
+          // Apply decrypted space message
+          let spaceMessage: Message;
+          try {
+            spaceMessage = JSON.parse(msgResult.decrypted_message) as Message;
+          } catch {
+            continue;
+          }
+
+          const space = getSpace(spaceId);
+          const channelId = spaceMessage.channelId || space?.defaultChannelId || spaceId;
+          const messagesKey = queryKeys.messages.infinite(spaceId, channelId);
+          const contentType = spaceMessage.content?.type;
+
+          // Deduplication for regular messages
+          if (contentType === 'post' || contentType === 'embed' || contentType === 'sticker') {
+            const existingMessage = await storage.getMessage({ spaceId, channelId, messageId: spaceMessage.messageId });
+            if (existingMessage) continue;
+          }
+
+          // Handle special message types
+          if (contentType === 'reaction') {
+            const reactionContent = spaceMessage.content as { messageId: string; reaction: string; senderId: string };
+            const computeNewReactions = (currentReactions: Message['reactions']) => {
+              const reactions = currentReactions || [];
+              const existing = reactions.find(r => r.emojiId === reactionContent.reaction);
+              if (existing) {
+                if (!existing.memberIds.includes(reactionContent.senderId)) {
+                  return reactions.map(r => r.emojiId === reactionContent.reaction
+                    ? { ...r, count: r.count + 1, memberIds: [...r.memberIds, reactionContent.senderId] }
+                    : r);
+                }
+                return reactions;
+              }
+              return [...reactions, {
+                emojiId: reactionContent.reaction,
+                emojiName: reactionContent.reaction,
+                spaceId,
+                count: 1,
+                memberIds: [reactionContent.senderId],
+              }];
+            };
+
+            queryClient.setQueryData<InfiniteMessagesData>(messagesKey, (old) => {
+              if (!old) return old;
+              return { ...old, pages: old.pages.map(page => ({
+                ...page,
+                messages: page.messages.map(msg =>
+                  msg.messageId === reactionContent.messageId
+                    ? { ...msg, reactions: computeNewReactions(msg.reactions) }
+                    : msg
+                ),
+              })) };
+            });
+
+            const existingMsg = await storage.getMessage({ spaceId, channelId, messageId: reactionContent.messageId });
+            if (existingMsg) {
+              await storage.saveMessage({ ...existingMsg, reactions: computeNewReactions(existingMsg.reactions) }, existingMsg.createdDate, '', '', '', '');
+            }
+            continue;
+          }
+
+          if (contentType === 'remove-reaction') {
+            const reactionContent = spaceMessage.content as { messageId: string; reaction: string; senderId: string };
+            const computeRemoved = (cur: Message['reactions']) =>
+              (cur || []).map(r => r.emojiId === reactionContent.reaction
+                ? { ...r, count: r.count - 1, memberIds: r.memberIds.filter(id => id !== reactionContent.senderId) }
+                : r).filter(r => r.count > 0);
+
+            queryClient.setQueryData<InfiniteMessagesData>(messagesKey, (old) => {
+              if (!old) return old;
+              return { ...old, pages: old.pages.map(page => ({
+                ...page,
+                messages: page.messages.map(msg =>
+                  msg.messageId === reactionContent.messageId
+                    ? { ...msg, reactions: computeRemoved(msg.reactions) }
+                    : msg
+                ),
+              })) };
+            });
+
+            const existingMsg = await storage.getMessage({ spaceId, channelId, messageId: reactionContent.messageId });
+            if (existingMsg) {
+              await storage.saveMessage({ ...existingMsg, reactions: computeRemoved(existingMsg.reactions) }, existingMsg.createdDate, '', '', '', '');
+            }
+            continue;
+          }
+
+          if (contentType === 'edit-message') {
+            const editContent = spaceMessage.content as { originalMessageId: string; editedText: string | string[]; editedAt: number };
+            queryClient.setQueryData<InfiniteMessagesData>(messagesKey, (old) => {
+              if (!old) return old;
+              return { ...old, pages: old.pages.map(page => ({
+                ...page,
+                messages: page.messages.map(msg => {
+                  if (msg.messageId === editContent.originalMessageId && msg.content.type === 'post') {
+                    return {
+                      ...msg,
+                      modifiedDate: editContent.editedAt,
+                      content: { ...msg.content, text: editContent.editedText },
+                      edits: [...(msg.edits || []), { text: editContent.editedText, modifiedDate: editContent.editedAt, lastModifiedHash: '' }],
+                    };
+                  }
+                  return msg;
+                }),
+              })) };
+            });
+            // Persist to storage too. Cache-only updates revert as soon as the
+            // query refetches from disk (e.g. on remount, invalidate, or when
+            // the user navigates away and back), so the edit appears to "snap
+            // back" to the original. Match what the cache update did above.
+            const existingMsg = await storage.getMessage({ spaceId, channelId, messageId: editContent.originalMessageId });
+            if (existingMsg && existingMsg.content.type === 'post') {
+              const updated: Message = {
+                ...existingMsg,
+                modifiedDate: editContent.editedAt,
+                content: { ...existingMsg.content, text: editContent.editedText },
+                edits: [...(existingMsg.edits || []), { text: editContent.editedText, modifiedDate: editContent.editedAt, lastModifiedHash: '' }],
+              };
+              await storage.saveMessage(updated, updated.createdDate, '', '', '', '');
+            }
+            continue;
+          }
+
+          if (contentType === 'remove-message') {
+            const removeContent = spaceMessage.content as { removeMessageId: string };
+            queryClient.setQueryData<InfiniteMessagesData>(messagesKey, (old) => {
+              if (!old) return old;
+              return { ...old, pages: old.pages.map(page => ({
+                ...page,
+                messages: page.messages.filter(msg => msg.messageId !== removeContent.removeMessageId),
+              })) };
+            });
+            await storage.deleteMessage(removeContent.removeMessageId);
+            continue;
+          }
+
+          if (contentType === 'update-profile') {
+            // Mirror of the legacy handler at the top of this file. Without
+            // this branch the batch path falls through to the "Regular
+            // message" save below and the profile broadcast renders as a
+            // chat post (getMessageRenderType defaults unknown types to
+            // 'post'). The once-per-launch profile re-broadcast that fires
+            // on every connect would then spam every space with a phantom
+            // message every time anyone opened the app.
+            const profileContent = spaceMessage.content as {
+              senderId: string;
+              displayName?: string;
+              userIcon?: string;
+              bio?: string;
+              farcasterFid?: number;
+              farcasterUsername?: string;
+            };
+            const adapter = getMMKVAdapter();
+            const existingMember = await adapter.getSpaceMember(spaceId, profileContent.senderId) as
+              | (SpaceMember & { profileTimestamp?: number; farcasterFid?: number; farcasterUsername?: string })
+              | undefined;
+            const ts = spaceMessage.createdDate || Date.now();
+
+            // Skip stale updates.
+            if (existingMember?.profileTimestamp && existingMember.profileTimestamp >= ts) {
+              continue;
+            }
+
+            // Spread-only-if-truthy: an empty string in the wire content
+            // means "no change", not "clear it". Same rule as the legacy
+            // handler; without it a partial broadcast (e.g. avatar-only)
+            // would clobber everyone's stored display name.
+            const merged = {
+              ...(existingMember ?? {
+                address: profileContent.senderId,
+                inbox_address: '',
+              }),
+              ...(profileContent.displayName ? { display_name: profileContent.displayName } : {}),
+              ...(profileContent.userIcon ? { profile_image: profileContent.userIcon } : {}),
+              ...(profileContent.bio !== undefined ? { bio: profileContent.bio } : {}),
+              ...(profileContent.farcasterFid !== undefined && profileContent.farcasterFid > 0
+                ? { farcasterFid: profileContent.farcasterFid }
+                : {}),
+              ...(profileContent.farcasterUsername ? { farcasterUsername: profileContent.farcasterUsername } : {}),
+              profileTimestamp: ts,
+            } as SpaceMember & { profileTimestamp: number; farcasterFid?: number; farcasterUsername?: string };
+
+            await adapter.saveSpaceMember(spaceId, merged);
+
+            queryClient.setQueryData(queryKeys.spaces.members(spaceId), (old: SpaceMember[] | undefined) => {
+              if (!old) return old;
+              const idx = old.findIndex((m) => m.address === profileContent.senderId);
+              if (idx >= 0) return old.map((m, i) => (i === idx ? merged : m));
+              return [...old, merged];
+            });
+
+            continue;
+          }
+
+          // Regular message - save and update cache
+          await storage.saveMessage(
+            { ...spaceMessage, spaceId, channelId },
+            spaceMessage.createdDate || Date.now(),
+            spaceId, 'space',
+            space?.iconUrl || '',
+            space?.spaceName || spaceId.substring(0, 8)
+          );
+
+          // Track replies
+          if (
+            spaceMessage.replyMetadata?.parentAuthor &&
+            spaceMessage.replyMetadata.parentAuthor === fullUserAddrRef.current &&
+            ('senderId' in spaceMessage.content ? spaceMessage.content.senderId : undefined) !== fullUserAddrRef.current &&
+            fullUserAddrRef.current
+          ) {
+            incrementReplyCount(fullUserAddrRef.current, `${spaceId}:${channelId}`);
+          }
+
+          // Track last space activity for inbox sorting + preview
+          {
+            const preview = getSpaceMessagePreview(spaceMessage);
+            const senderId = ('senderId' in spaceMessage.content ? spaceMessage.content.senderId : undefined);
+            const senderMember = spaceId ? await storage.getSpaceMember(spaceId, senderId) : undefined;
+            const senderName = messageSenderName(
+              senderId,
+              fullUserAddrRef.current ?? undefined,
+              senderMember ? { [senderId]: senderMember } : undefined
+            );
+            recordSpaceActivity(spaceId, {
+              timestamp: spaceMessage.createdDate || Date.now(),
+              preview,
+              senderName,
+              channelId,
+            });
+          }
+
+          queryClient.setQueryData<InfiniteMessagesData>(messagesKey, (old) => {
+            // No existing cache — leave it alone (saveMessage above wrote
+            // to MMKV; next mount loads the full history from disk).
+            if (!old) return old;
+            if (old.pages.some(page => page.messages.some(m => m.messageId === spaceMessage.messageId))) return old;
+            return { ...old, pages: old.pages.map((page, i) => i === 0 ? { ...page, messages: [...page.messages, spaceMessage] } : page) };
+          });
+        }
+      }
+
+      // Best-effort: batch delete processed messages from inbox
+      if (deleteTimestamps.length > 0 && spaceInboxKey?.address && spaceInboxKey.publicKey && spaceInboxKey.privateKey) {
+        deleteSpaceInboxMessages(
+          spaceInboxKey.address,
+          deleteTimestamps,
+          { publicKey: spaceInboxKey.publicKey, privateKey: spaceInboxKey.privateKey }
+        ).catch(() => {});
+      }
+    }
+  }, [queryClient, storage, handleIncomingMessage]);
+
+  /**
+   * Apply DM message results from batch native processing.
+   */
+  const applyDMGroupResults = useCallback(async (
+    results: BatchProcessOutput['dm_results'],
+    batch: EncryptedWebSocketMessage[]
+  ) => {
+    // Collect messages the native batch couldn't handle so we can fall back
+    // to the full JS handleIncomingMessage path. The common case that
+    // reaches the fallback: the peer's session isn't confirmed yet, so they
+    // wrap their reply in an InitializationEnvelope inside a conversation
+    // inbox seal — the batch's DR-only path returns `unseal_failed`.
+    const fallbackMessages: EncryptedWebSocketMessage[] = [];
+    const processedKeys = new Set<string>();
+    const batchKey = (m: EncryptedWebSocketMessage) => `${m.inboxAddress}:${m.timestamp}`;
+
+    for (const groupResult of results) {
+      // DR states and init session state are now written directly by native MMKV — no JS state write needed
+
+      // Subscribe to new conversation inbox if init created one
+      if (groupResult.new_conversation_inbox) {
+        const client = wsClientRef.current;
+        if (client && client.isConnected) {
+          await client.subscribe([groupResult.new_conversation_inbox]);
+        }
+        subscribedInboxesRef.current.add(groupResult.new_conversation_inbox);
+      }
+
+      // Process each DM message result
+      for (const msgResult of groupResult.messages) {
+        if ((msgResult.status !== 'decrypted' && msgResult.status !== 'init_decrypted') || !msgResult.decrypted_message) {
+          // Batch couldn't decrypt. Most common reason: conversation-inbox
+          // message where the inner unsealed content is an
+          // InitializationEnvelope rather than a raw DR envelope. Route it
+          // back to the JS path which correctly handles both.
+          if (msgResult.timestamp != null) {
+            const original = batch.find(
+              (m) =>
+                m.timestamp === msgResult.timestamp &&
+                !processedKeys.has(batchKey(m)),
+            );
+            if (original) {
+              fallbackMessages.push(original);
+              processedKeys.add(batchKey(original));
+            }
+          }
+          continue;
+        }
+        if (msgResult.timestamp != null) {
+          const original = batch.find((m) => m.timestamp === msgResult.timestamp);
+          if (original) processedKeys.add(batchKey(original));
+        }
+
+        let conversationId = msgResult.conversation_id || groupResult.conversation_id;
+        let decryptedMessage: Message;
+        try {
+          decryptedMessage = JSON.parse(msgResult.decrypted_message) as Message;
+        } catch {
+          continue;
+        }
+
+        // Intercept call signaling messages — forward to CallContext, don't display in chat.
+        // call-event passes through to render in chat history.
+        if (decryptedMessage.content?.type?.startsWith('call-') && decryptedMessage.content?.type !== 'call-event') {
+          callSignalingHandlerRef.current?.(decryptedMessage);
+          // Best-effort: delete from server so stale signals don't replay on next launch
+          const originalMsg = batch.find(m => m.timestamp === msgResult.timestamp);
+          if (originalMsg) {
+            getDeviceKeyset().then(dk => {
+              if (dk) deleteInboxMessages(originalMsg.inboxAddress, [originalMsg.timestamp], dk).catch(() => {});
+            });
+          }
+          continue;
+        }
+
+        // Handle same-user multi-device sync
+        const senderAddress = conversationId.split('/')[0];
+        if (senderAddress === fullUserAddrRef.current && decryptedMessage.channelId) {
+          const actualRecipient = decryptedMessage.channelId;
+          conversationId = `${actualRecipient}/${actualRecipient}`;
+        }
+
+        const resolvedSenderAddress = conversationId.split('/')[0];
+
+        // Save conversation
+        const existingConversation = await storage.getConversation(conversationId);
+        const senderDisplayName = msgResult.user_profile?.display_name || existingConversation?.displayName || resolvedSenderAddress.substring(0, 8);
+        const senderIcon = msgResult.user_profile?.user_icon || existingConversation?.icon || '';
+        const getMessagePreview = (msg: Message): string => {
+          const ct = msg.content?.type;
+          if (ct === 'embed') return '📷 Image';
+          if (ct === 'sticker') return '🎨 Sticker';
+          if (ct === 'call-event') {
+            const c = msg.content as any;
+            const icon = c.mediaType === 'video' ? '📹' : '📞';
+            if (c.event === 'completed') return `${icon} Call`;
+            if (c.event === 'missed') return `${icon} Missed call`;
+            return `${icon} Call`;
+          }
+          if (ct === 'post' || ct === 'event') {
+            const textContent = ('text' in msg.content ? msg.content.text : undefined);
+            return Array.isArray(textContent) ? textContent.join('') : textContent || '';
+          }
+          return '';
+        };
+        const messagePreview = getMessagePreview(decryptedMessage);
+
+        if (!existingConversation) {
+          const newConversation: Conversation = {
+            conversationId,
+            address: resolvedSenderAddress,
+            displayName: senderDisplayName,
+            icon: senderIcon,
+            timestamp: decryptedMessage.createdDate || Date.now(),
+            type: 'direct',
+            lastMessagePreview: messagePreview,
+            lastMessageSenderName: senderDisplayName,
+          };
+          await storage.saveConversation(newConversation);
+        } else {
+          const updatedConversation: Conversation = {
+            ...existingConversation,
+            displayName: senderDisplayName,
+            icon: senderIcon,
+            timestamp: decryptedMessage.createdDate || Date.now(),
+            lastMessagePreview: messagePreview,
+            lastMessageSenderName: senderDisplayName,
+          };
+          await storage.saveConversation(updatedConversation);
+        }
+
+        const messagesKey = queryKeys.messages.infinite(resolvedSenderAddress, resolvedSenderAddress);
+
+        // Reactions are control messages, not standalone chat entries — they
+        // fold into the target message's `reactions` field. Without this
+        // branch the peer's reaction would be saved as a ghost message and
+        // never appear on the target. Mirrors the space-side handler at
+        // applySpaceGroupResults (reaction / remove-reaction).
+        const dmContentType = decryptedMessage.content?.type;
+        if (dmContentType === 'reaction' || dmContentType === 'remove-reaction') {
+          const rc = decryptedMessage.content as { messageId: string; reaction: string; senderId: string };
+          const apply = (cur: Message['reactions']): Message['reactions'] => {
+            const reactions = cur || [];
+            if (dmContentType === 'reaction') {
+              const existing = reactions.find(r => r.emojiId === rc.reaction || r.emojiName === rc.reaction);
+              if (existing) {
+                if (existing.memberIds.includes(rc.senderId)) return reactions;
+                return reactions.map(r => r === existing
+                  ? { ...r, count: r.count + 1, memberIds: [...r.memberIds, rc.senderId] }
+                  : r);
+              }
+              return [...reactions, {
+                emojiId: rc.reaction,
+                emojiName: rc.reaction,
+                spaceId: resolvedSenderAddress,
+                count: 1,
+                memberIds: [rc.senderId],
+              }];
+            }
+            // remove-reaction
+            return reactions
+              .map(r => {
+                if (r.emojiId !== rc.reaction && r.emojiName !== rc.reaction) return r;
+                const newMembers = r.memberIds.filter(id => id !== rc.senderId);
+                if (newMembers.length === 0) return null;
+                return { ...r, count: newMembers.length, memberIds: newMembers };
+              })
+              .filter((r): r is NonNullable<typeof r> => r !== null);
+          };
+
+          queryClient.setQueryData<InfiniteMessagesData>(messagesKey, (old) => {
+            if (!old) return old;
+            return { ...old, pages: old.pages.map(page => ({
+              ...page,
+              messages: page.messages.map(msg =>
+                msg.messageId === rc.messageId ? { ...msg, reactions: apply(msg.reactions) } : msg
+              ),
+            })) };
+          });
+
+          const targetMsg = await storage.getMessage({
+            spaceId: resolvedSenderAddress,
+            channelId: resolvedSenderAddress,
+            messageId: rc.messageId,
+          });
+          if (targetMsg) {
+            await storage.saveMessage(
+              { ...targetMsg, reactions: apply(targetMsg.reactions) },
+              targetMsg.createdDate,
+              resolvedSenderAddress, 'direct', senderIcon, senderDisplayName,
+            );
+          }
+
+          // Best-effort: delete processed message from inbox (same as below)
+          const originalReactionMsg = batch.find(m => m.timestamp === msgResult.timestamp);
+          if (originalReactionMsg) {
+            const conversationKeypair = encryptionStateStorage.getConversationInboxKeypairByAddress(originalReactionMsg.inboxAddress);
+            if (conversationKeypair?.signingPrivateKey && conversationKeypair?.signingPublicKey) {
+              const signingKey = {
+                publicKey: conversationKeypair.signingPublicKey,
+                privateKey: conversationKeypair.signingPrivateKey,
+              };
+              deleteInboxMessages(originalReactionMsg.inboxAddress, [originalReactionMsg.timestamp], signingKey).catch(() => {});
+            } else {
+              getDeviceKeyset().then(dk => {
+                if (dk) deleteInboxMessages(originalReactionMsg.inboxAddress, [originalReactionMsg.timestamp], dk).catch(() => {});
+              });
+            }
+          }
+          continue;
+        }
+
+        // Save message
+        await storage.saveMessage(
+          { ...decryptedMessage, spaceId: resolvedSenderAddress, channelId: resolvedSenderAddress },
+          decryptedMessage.createdDate || Date.now(),
+          resolvedSenderAddress, 'direct', senderIcon, senderDisplayName
+        );
+
+        // Update React Query cache
+        queryClient.setQueryData<InfiniteMessagesData>(messagesKey, (old) => {
+          // No existing cache — leave it alone (the message is already in
+          // MMKV; next mount reads the full history from disk).
+          if (!old) return old;
+          if (old.pages.some(page => page.messages.some(m => m.messageId === decryptedMessage.messageId))) return old;
+          return { ...old, pages: old.pages.map((page, i) => i === 0 ? { ...page, messages: [...page.messages, decryptedMessage] } : page) };
+        });
+
+        // Only refetch active conversation queries (data already saved to storage)
+        queryClient.invalidateQueries({ queryKey: queryKeys.conversations.all('direct'), refetchType: 'active' });
+        queryClient.invalidateQueries({ queryKey: queryKeys.conversations.detail(conversationId), refetchType: 'active' });
+
+        // Best-effort: delete processed message from inbox
+        const originalMsg = batch.find(m => m.timestamp === msgResult.timestamp);
+        if (originalMsg) {
+          const conversationKeypair = encryptionStateStorage.getConversationInboxKeypairByAddress(originalMsg.inboxAddress);
+          if (conversationKeypair?.signingPrivateKey && conversationKeypair?.signingPublicKey) {
+            const signingKey = {
+              publicKey: bytesToHex(conversationKeypair.signingPublicKey),
+              privateKey: bytesToHex(conversationKeypair.signingPrivateKey),
+            };
+            deleteConversationInboxMessages(originalMsg.inboxAddress, [originalMsg.timestamp], signingKey).catch(() => {});
+          } else {
+            getDeviceKeyset().then(dk => {
+              if (dk) deleteInboxMessages(originalMsg.inboxAddress, [originalMsg.timestamp], dk).catch(() => {});
+            });
+          }
+        }
+      }
+    }
+
+    // Fallback: run the full JS path for any batch messages the native
+    // processor couldn't decrypt. This catches the init-envelope-wrapped-in-
+    // conversation-inbox case among others.
+    const meFb = fullUserAddrRef.current?.slice(0, 8) ?? '???';
+    if (fallbackMessages.length > 0) {
+      logger.debug(
+        `[DM-fallback ${meFb}] batch failed for ${fallbackMessages.length} msg(s), routing to JS`,
+        fallbackMessages.map((m) => ({
+          inboxAddress: m.inboxAddress.substring(0, 12) + '...',
+          timestamp: m.timestamp,
+        })),
+      );
+    }
+    for (const msg of fallbackMessages) {
+      try {
+        await handleIncomingMessage(msg);
+      } catch (err) {
+        logger.debug(`[DM-fallback ${meFb}] handleIncomingMessage threw`, err);
+      }
+    }
+  }, [queryClient, storage, handleIncomingMessage]);
+
+  /**
+   * Process message queue with throttling to prevent CPU overload
+   * Uses batch native processing for space, DM, and init messages (1 bridge crossing per batch)
+   * Falls back to individual handleIncomingMessage for control messages and edge cases
+   */
+  const processMessageQueue = useCallback(async () => {
+    if (isProcessingQueueRef.current) return;
+    isProcessingQueueRef.current = true;
+
+    while (messageQueueRef.current.length > 0) {
+      // Drain current batch of messages
+      const batch = messageQueueRef.current.splice(0, messageQueueRef.current.length);
+
+      try {
+        // Classify messages and gather crypto state
+        const { batchInput, nonBatchMessages } = preclassifyAndGatherState(batch);
+
+        // Diagnostic: log how each incoming batch gets routed so we can see
+        // whether DM messages are reaching the native fast path or the JS
+        // slow path.
+        const me = fullUserAddrRef.current?.slice(0, 8) ?? '???';
+        if (batch.length > 0) {
+          logger.debug(
+            `[DM-classify ${me}]`,
+            JSON.stringify({
+              total: batch.length,
+              inboxes: batch.map((m) => m.inboxAddress.slice(0, 12)),
+              space_groups: batchInput.space_groups.length,
+              dm_groups: batchInput.dm_groups.map((g) => ({
+                type: g.message_type,
+                conv: g.conversation_id?.slice(0, 12),
+                msgs: g.messages.length,
+                states: g.dr_states.length,
+                stateInboxIds: g.dr_states.map((s) => s.inbox_id.slice(0, 12)),
+              })),
+              nonBatch: nonBatchMessages.map((m) => ({
+                inbox: m.inboxAddress.slice(0, 12),
+                ts: m.timestamp,
+              })),
+            }),
+          );
+        }
+
+        // Process batch natively if there are batchable messages
+        if (batchInput.space_groups.length > 0 || batchInput.dm_groups.length > 0) {
+          const cryptoProvider = new NativeCryptoProvider();
+          const batchOutput = await cryptoProvider.batchProcessMessages(batchInput);
+
+          if (batchOutput.dm_results.length > 0) {
+            logger.debug(
+              `[DM-batch-result ${me}]`,
+              JSON.stringify(
+                batchOutput.dm_results.map((r) => ({
+                  conv: r.conversation_id?.slice(0, 12),
+                  msgs: r.messages.map((m) => ({
+                    status: m.status,
+                    ts: m.timestamp,
+                    hasMsg: !!m.decrypted_message,
+                  })),
+                })),
+              ),
+            );
+          }
+
+          // Apply results
+          if (batchOutput.space_results.length > 0) {
+            await applySpaceGroupResults(batchOutput.space_results, batch);
+          }
+          if (batchOutput.dm_results.length > 0) {
+            await applyDMGroupResults(batchOutput.dm_results, batch);
+          }
+        }
+
+        // Process non-batchable messages (control messages, edge cases) individually
+        for (let i = 0; i < nonBatchMessages.length; i++) {
+          // Yield to UI thread every 5 messages to prevent jank
+          if (i % 5 === 0) {
+            await new Promise<void>(resolve => {
+              InteractionManager.runAfterInteractions(() => resolve());
+            });
+          }
+
+          try {
+            await handleIncomingMessage(nonBatchMessages[i]);
+          } catch { /* ignore */ }
+
+          // Brief yield between messages only if more work remains
+          if (i < nonBatchMessages.length - 1 || messageQueueRef.current.length > 0) {
+            await new Promise(resolve => setTimeout(resolve, MESSAGE_PROCESS_DELAY_MS));
+          }
+        }
+      } catch (batchError) {
+        // Fallback: if batch processing fails entirely, process all individually
+        await batchPreUnsealSpaceMessages(batch);
+        for (const message of batch) {
+          await new Promise<void>(resolve => {
+            InteractionManager.runAfterInteractions(() => resolve());
+          });
+          try {
+            await handleIncomingMessage(message);
+          } catch { /* ignore */ }
+        }
+      }
+
+      // Per-hub log cursor advance: after a batch is fully drained, scan for
+      // synthetic messages tagged with their log seq. Advance the cursor only
+      // along a contiguous run from the prior cursor — if there's a gap (e.g.
+      // queue-overflow dropped older entries), stop at the gap so the next
+      // log-since refetches what we lost. Doing this AFTER persistence means
+      // a crash mid-batch leaves the cursor unchanged.
+      const seqsByHub = new Map<string, number[]>();
+      for (const msg of batch) {
+        const m = msg as { __logSeq?: number; __logHub?: string };
+        if (m.__logSeq && m.__logHub) {
+          const list = seqsByHub.get(m.__logHub) ?? [];
+          list.push(m.__logSeq);
+          seqsByHub.set(m.__logHub, list);
+        }
+      }
+      seqsByHub.forEach((seqs, hub) => {
+        seqs.sort((a, b) => a - b);
+        let advance = getHubLastSeq(hub);
+        for (const seq of seqs) {
+          if (seq <= advance) continue;
+          if (seq === advance + 1) advance = seq;
+          else break; // gap — stop and let next log-since refetch
+        }
+        if (advance > getHubLastSeq(hub)) setHubLastSeq(hub, advance);
+      });
+    }
+
+    isProcessingQueueRef.current = false;
+  }, [handleIncomingMessage, batchPreUnsealSpaceMessages, preclassifyAndGatherState, applySpaceGroupResults, applyDMGroupResults]);
+
+  /**
+   * Throttled message handler - queues messages for processing
+   * This prevents the UI from freezing when many messages arrive at once
+   */
+  const throttledMessageHandler = useCallback((message: EncryptedWebSocketMessage) => {
+    const me = fullUserAddrRef.current?.slice(0, 8) ?? '???';
+    // Diagnostic: confirm WS messages are reaching the client at all.
+    if ('error' in message && message.error) {
+      logger.debug(`[WS-in ${me}] error msg`, message.error);
+      return;
+    }
+
+    // Per-space log transport frames carry a `type` discriminator and no
+    // encryptedContent — route them before the decrypt pipeline.
+    const frameType = (message as any).type;
+    if (
+      frameType === 'log-update' ||
+      frameType === 'log-append-ack' ||
+      frameType === 'log-since-result'
+    ) {
+      const hubAddress = (message as any).hub_address as string | undefined;
+      const seqOrCount = frameType === 'log-since-result'
+        ? `entries=${(message as any).entries?.length ?? 0} hasMore=${(message as any).has_more}`
+        : `seq=${(message as any).seq}`;
+      logger.debug(`[WS-in ${me}] ${frameType} hub=${hubAddress?.slice(0, 12) ?? '?'} ${seqOrCount}`);
+      const handlers = logFrameHandlersRef.current;
+      handlers.forEach((h) => {
+        try { h(message as unknown as LogFrame); }
+        catch (e) { logger.warn('[WS-in] log handler threw', e); }
+      });
+      return;
+    }
+
+    logger.debug(
+      `[WS-in ${me}] inbox=${message.inboxAddress?.slice(0, 12)}... ts=${message.timestamp}`,
+    );
+    // Backpressure: drop oldest messages if queue is overloaded
+    if (messageQueueRef.current.length >= MAX_MESSAGE_QUEUE_SIZE) {
+      messageQueueRef.current.splice(0, messageQueueRef.current.length - MAX_MESSAGE_QUEUE_SIZE + 1);
+    }
+    messageQueueRef.current.push(message);
+    // Start processing if not already in progress
+    processMessageQueue();
+  }, [processMessageQueue]);
 
   /**
    * Resubscribe to all previously subscribed inboxes
@@ -3758,19 +3560,24 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
     const conversationInboxes = encryptionStateStorage.getAllConversationInboxAddresses();
     for (const addr of conversationInboxes) {
       inboxes.add(addr);
-      logger.log(`[WS] Resubscribing to conversation inbox: ${addr.substring(0, 12)}`);
     }
 
     // Add all space inboxes for receiving space/hub messages
     const spaceInboxes = getAllSpaceInboxAddresses();
     for (const addr of spaceInboxes) {
       inboxes.add(addr);
-      logger.log(`[WS] Resubscribing to space inbox: ${addr.substring(0, 12)}`);
     }
 
     const inboxArray = Array.from(inboxes);
+    const me = fullUserAddrRef.current?.slice(0, 8) ?? '???';
+    logger.debug(
+      `[WS-sub ${me}] resubscribing to ${inboxArray.length} inbox(es):`,
+      JSON.stringify({
+        deviceInbox: ownInboxAddressRef.current?.slice(0, 16) ?? null,
+        all: inboxArray.map((a) => a.slice(0, 16)),
+      }),
+    );
     if (inboxArray.length > 0) {
-      logger.log(`[WS] Resubscribing to ${inboxArray.length} inbox(es)`);
       await client.subscribe(inboxArray);
     }
   }, []);
@@ -3783,7 +3590,7 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
       return wsClientRef.current;
     }
 
-    const config = API_CONFIG;
+    const config = getApiConfig();
 
     const client = createRNWebSocketClient({
       url: config.wsUrl,
@@ -3792,8 +3599,8 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
       queueProcessInterval: 500,
     });
 
-    // Set up handlers
-    client.setMessageHandler(handleIncomingMessage);
+    // Set up handlers - use throttled handler to prevent CPU overload
+    client.setMessageHandler(throttledMessageHandler);
     client.setResubscribeHandler(handleResubscribe);
 
     // Track state changes
@@ -3802,12 +3609,11 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
     });
 
     client.onError((error) => {
-      logger.log('WebSocket error:', error);
     });
 
     wsClientRef.current = client;
     return client;
-  }, [handleIncomingMessage, handleResubscribe]);
+  }, [throttledMessageHandler, handleResubscribe]);
 
   /**
    * Connect to WebSocket server
@@ -3816,7 +3622,6 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
     // First, initialize device keys
     const keysReady = await initializeDeviceKeys();
     if (!keysReady) {
-      logger.warn('Cannot connect - device keys not available');
       return;
     }
 
@@ -3830,25 +3635,20 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
       try {
         await client.subscribe([ownInboxAddress]);
         subscribedInboxesRef.current.add(ownInboxAddress);
-        logger.log('[WS] Subscribed to own inbox:', ownInboxAddress);
       } catch (error) {
-        logger.log('[WS] Failed to subscribe to own inbox:', error);
+        // Failed to subscribe to device inbox
       }
     }
 
     // Subscribe to all space inboxes for receiving space/hub messages
     const spaceInboxes = getAllSpaceInboxAddresses();
-    logger.log(`[WS] Found ${spaceInboxes.length} space inbox(es) to subscribe to`);
     if (spaceInboxes.length > 0) {
       try {
         await client.subscribe(spaceInboxes);
         spaceInboxes.forEach((addr) => subscribedInboxesRef.current.add(addr));
-        logger.log(`[WS] Subscribed to ${spaceInboxes.length} space inbox(es):`, spaceInboxes.map(a => a.substring(0, 12)));
       } catch (error) {
-        logger.log('[WS] Failed to subscribe to space inboxes:', error);
+        // Failed to subscribe to space inboxes
       }
-    } else {
-      logger.log('[WS] No space inboxes to subscribe to');
     }
 
     // Subscribe to all conversation inboxes
@@ -3857,9 +3657,8 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
       try {
         await client.subscribe(conversationInboxes);
         conversationInboxes.forEach((addr) => subscribedInboxesRef.current.add(addr));
-        logger.log(`[WS] Subscribed to ${conversationInboxes.length} conversation inbox(es)`);
       } catch (error) {
-        logger.log('[WS] Failed to subscribe to conversation inboxes:', error);
+        // Failed to subscribe to conversation inboxes
       }
     }
   }, [getOrCreateClient, initializeDeviceKeys]);
@@ -3880,11 +3679,32 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
   const enqueueOutbound = useCallback(
     (prepareMessage: () => Promise<string[]>) => {
       const client = wsClientRef.current;
+      const me = fullUserAddrRef.current?.slice(0, 8) ?? '???';
       if (!client) {
-        logger.warn('WebSocket client not initialized');
+        logger.debug(`[WS-send ${me}] dropped — no client`);
         return;
       }
-      client.enqueueOutbound(prepareMessage);
+      // Wrap to log what's actually going on the wire.
+      client.enqueueOutbound(async () => {
+        let envelopes: string[] = [];
+        try {
+          envelopes = await prepareMessage();
+        } catch (err) {
+          logger.debug(`[WS-send ${me}] prepareMessage threw`, err);
+          throw err;
+        }
+        for (const env of envelopes) {
+          try {
+            const parsed = JSON.parse(env) as Record<string, unknown>;
+            logger.debug(
+              `[WS-send ${me}] inbox=${String(parsed.inbox_address ?? '???').slice(0, 12)} hub=${String(parsed.hub_address ?? '').slice(0, 12)} keys=${Object.keys(parsed).slice(0, 8).join(',')}`,
+            );
+          } catch {
+            logger.debug(`[WS-send ${me}] non-JSON envelope (${env.length} chars)`);
+          }
+        }
+        return envelopes;
+      });
     },
     []
   );
@@ -3894,6 +3714,12 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
    */
   const subscribe = useCallback(async (inboxAddresses: string[]) => {
     const client = wsClientRef.current;
+    const me = fullUserAddrRef.current?.slice(0, 8) ?? '???';
+    logger.debug(
+      `[WS-sub ${me}] subscribe request for:`,
+      inboxAddresses.map((a) => a.slice(0, 12)),
+      'connected=', !!client?.isConnected,
+    );
     if (!client || !client.isConnected) {
       // Queue for later subscription
       inboxAddresses.forEach((addr) => subscribedInboxesRef.current.add(addr));
@@ -3916,57 +3742,9 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
     inboxAddresses.forEach((addr) => subscribedInboxesRef.current.delete(addr));
   }, []);
 
-  /**
-   * Trigger a sync request for a space/channel
-   * Used when joining a space to sync existing messages
-   */
-  const triggerSyncRequest = useCallback(async (spaceId: string, channelId: string) => {
-    logger.log(`[WS] triggerSyncRequest for space ${spaceId.substring(0, 12)}, channel ${channelId.substring(0, 12)}`);
-
-    try {
-      // Get our inbox address for this space
-      const inboxKey = getSpaceKey(spaceId, 'inbox');
-      if (!inboxKey?.address) {
-        logger.warn(`[WS] triggerSyncRequest: No inbox key for space ${spaceId.substring(0, 12)}`);
-        return;
-      }
-
-      const syncService = getSyncService();
-      if (!syncService) {
-        logger.warn(`[WS] triggerSyncRequest: No SyncService available`);
-        return;
-      }
-
-      // Build the sync request payload
-      const syncRequestPayload = await syncService.buildSyncRequest(
-        spaceId,
-        channelId,
-        inboxKey.address
-      );
-
-      logger.log(`[WS] triggerSyncRequest: Built payload`, {
-        inboxAddress: inboxKey.address.substring(0, 12),
-        expiry: syncRequestPayload.expiry,
-        summary: syncRequestPayload.summary,
-      });
-
-      // Build and send the sync request message
-      const syncRequestEnvelope = await sendSyncRequestMessage(spaceId, syncRequestPayload);
-
-      enqueueOutbound(async () => [syncRequestEnvelope]);
-
-      logger.log(`[WS] triggerSyncRequest: Sent sync-request for space ${spaceId.substring(0, 12)}`);
-    } catch (error) {
-      console.error(`[WS] triggerSyncRequest failed:`, error);
-    }
-  }, [getSyncService, enqueueOutbound]);
-
-  // Set the E2E log prefix when user becomes available
-  useEffect(() => {
-    if (user?.address) {
-      setE2ELogPrefix(user.address);
-    }
-  }, [user?.address]);
+  // triggerSyncRequest removed — peer-to-peer mesh sync is gone. Catch-up
+  // is handled exclusively by the per-hub log transport (listen-hub +
+  // log-since). Joiners do not request history from peers.
 
   // Connect/disconnect based on auth state
   useEffect(() => {
@@ -4004,34 +3782,237 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
     };
   }, [isAuthenticated, connect]);
 
-  // Trigger sync for all spaces shortly after connection is established
-  // This fetches member data and messages from other devices in the space
+  // Per-hub log transport: subscribe to log-update notifications and catch up
+  // from our stored cursor. Ingestion fans out to the same message queue that
+  // serves live `'group'` fan-out messages, so the existing decrypt/persist
+  // pipeline applies unchanged. Old clients still hit the legacy `'group'`
+  // path; the server dual-writes to the log so we don't double-process here
+  // (the dedupe is messageId-based downstream).
   useEffect(() => {
     if (connectionState !== 'connected') return;
 
-    const syncTimeoutId = setTimeout(() => {
-      logger.log('[WS] Triggering sync for all spaces after connection');
+    let cancelled = false;
+    const inflight = new Set<string>(); // hubAddress with an in-flight log-since
 
+    const requestLogSince = async (hubAddress: string, since: number) => {
+      if (cancelled || inflight.has(hubAddress)) return;
+      const space = getSpaceByHubAddress(hubAddress);
+      if (!space) return;
+      const hubKey = getSpaceKey(space.spaceId, 'hub');
+      if (!hubKey?.address || !hubKey.privateKey || !hubKey.publicKey) return;
+      inflight.add(hubAddress);
+      try {
+        const frame = await buildLogSinceFrame(
+          { address: hubKey.address, publicKey: hubKey.publicKey, privateKey: hubKey.privateKey },
+          since,
+          200,
+        );
+        enqueueOutbound(async () => [frame]);
+      } catch {
+        inflight.delete(hubAddress);
+      }
+    };
+
+    const ingestEntries = (
+      hubAddress: string,
+      entries: Array<{ seq: number; ts: number; payload: { ts: number; data: any } }>,
+    ) => {
+      // Find which space this hub belongs to and its inbox address — the
+      // existing decrypt path indexes by inbox address.
+      const space = getSpaceByHubAddress(hubAddress);
+      if (!space) return;
+      const inboxKey = getSpaceKey(space.spaceId, 'inbox');
+      if (!inboxKey?.address) return;
+
+      for (const entry of entries) {
+        const sealedEnvelope = entry.payload?.data;
+        if (!sealedEnvelope) continue;
+        // Tag with __logSeq / __logHub so processMessageQueue can advance the
+        // hub cursor only after persistence — see post-batch hook there.
+        const synthetic = {
+          inboxAddress: inboxKey.address,
+          encryptedContent: typeof sealedEnvelope === 'string'
+            ? sealedEnvelope
+            : JSON.stringify(sealedEnvelope),
+          timestamp: entry.payload.ts ?? entry.ts,
+          __logSeq: entry.seq,
+          __logHub: hubAddress,
+        } as EncryptedWebSocketMessage & { __logSeq: number; __logHub: string };
+
+        if (messageQueueRef.current.length >= MAX_MESSAGE_QUEUE_SIZE) {
+          messageQueueRef.current.splice(
+            0,
+            messageQueueRef.current.length - MAX_MESSAGE_QUEUE_SIZE + 1,
+          );
+        }
+        messageQueueRef.current.push(synthetic);
+      }
+      if (entries.length > 0) {
+        processMessageQueue();
+      }
+    };
+
+    const unsubscribe = registerLogFrameHandler((frame) => {
+      const hubAddress = (frame as any).hub_address;
+      if (!hubAddress) return;
+      if (frame.type === 'log-since-result') {
+        inflight.delete(hubAddress);
+        ingestEntries(hubAddress, frame.entries);
+        if (frame.has_more && frame.entries.length > 0) {
+          const last = frame.entries[frame.entries.length - 1].seq;
+          requestLogSince(hubAddress, last);
+        }
+      } else if (frame.type === 'log-update') {
+        const lastRead = getHubLastSeq(hubAddress);
+        if (frame.seq > lastRead) {
+          requestLogSince(hubAddress, lastRead);
+        }
+      } else if (frame.type === 'log-append-ack') {
+        // Our own write succeeded — cursor will advance via the log-update
+        // broadcast; nothing to do here for now.
+      }
+    });
+
+    // Stabilize WS, then for each space: listen-hub + initial catch-up.
+    // Wrapped end-to-end so a thrown helper can never crash the React tree.
+    const setupTimeout = setTimeout(async () => {
+      if (cancelled) return;
       try {
         const spaceIds = getSpaceIds();
-        logger.log(`[WS] Found ${spaceIds.length} spaces to sync`);
-
         for (const spaceId of spaceIds) {
-          const space = getSpace(spaceId);
-          if (space?.defaultChannelId) {
-            logger.log(`[WS] Triggering sync for space ${spaceId.substring(0, 12)}`);
-            triggerSyncRequest(spaceId, space.defaultChannelId);
+          if (cancelled) break;
+          const hubKey = getSpaceKey(spaceId, 'hub');
+          const inboxKey = getSpaceKey(spaceId, 'inbox');
+          if (
+            !hubKey?.address || !hubKey.privateKey || !hubKey.publicKey ||
+            !inboxKey?.address
+          ) continue;
+          try {
+            const listenFrame = await buildListenHubFrame(
+              { address: hubKey.address, publicKey: hubKey.publicKey, privateKey: hubKey.privateKey },
+              inboxKey.address,
+            );
+            logger.debug(`[hub-log] listen-hub hub=${hubKey.address.slice(0, 12)} inbox=${inboxKey.address.slice(0, 12)}`);
+            enqueueOutbound(async () => [listenFrame]);
+          } catch (e) {
+            logger.warn('[hub-log] listen-hub build failed', e);
+            continue;
+          }
+          const lastSeq = getHubLastSeq(hubKey.address);
+          try {
+            await requestLogSince(hubKey.address, lastSeq);
+          } catch (e) {
+            logger.warn('[hub-log] log-since build failed', e);
           }
         }
-      } catch (error) {
-        console.error('[WS] Failed to trigger sync for spaces:', error);
+      } catch (e) {
+        logger.warn('[hub-log] setup failed', e);
       }
-    }, 3000); // 3 seconds - enough for connection to stabilize
+    }, 1500);
 
     return () => {
-      clearTimeout(syncTimeoutId);
+      cancelled = true;
+      clearTimeout(setupTimeout);
+      unsubscribe();
     };
-  }, [connectionState, triggerSyncRequest]);
+  }, [connectionState, registerLogFrameHandler, enqueueOutbound, processMessageQueue]);
+
+  // On-connect catch-up is handled exclusively by the per-hub log effect
+  // above — listen-hub + log-since fetches everything since the stored
+  // cursor. No peer-to-peer sync; new joiners only see messages sent after
+  // they joined.
+
+  // Per-launch profile re-broadcast, fingerprinted on the broadcast-
+  // relevant user fields. Heals the case where the user joined a space
+  // before setting their profile (join control message captured empty
+  // userIcon + displayName), AND the case where Farcaster auth hydrated
+  // AFTER an earlier rebroadcast fired without farcasterFid populated.
+  //
+  // The previous implementation used a once-per-launch ref guard, which
+  // meant a slow Farcaster hydration window (auth token validates after
+  // the 4s rebroadcast timer) would record a fid-less signature in the
+  // gate, and nothing in the rest of the session would re-fire to add
+  // it. Fingerprinting on the broadcast-relevant fields lets the
+  // useEffect re-run when those fields change, while the existing
+  // signature gate inside maybeSendUpdateProfileMessage still
+  // suppresses no-op resends per (sender, space).
+  const lastProfileRebroadcastSigRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (connectionState !== 'connected') return;
+    if (!user?.address) return;
+    const displayName = user.displayName || user.username;
+    const userIcon = user.profileImage;
+    const fcFid = user.farcaster?.fid;
+    const fcUsername = user.farcaster?.username;
+    // Nothing useful to share at all. A Farcaster-only profile is still
+    // worth broadcasting because peers' UserProfileModal renders the FC
+    // row from the linkage alone.
+    if (!displayName && !userIcon && !fcFid) return;
+
+    // Fingerprint of the per-launch broadcast intent. Identical to the
+    // last attempt → don't even import the service.
+    const sig = JSON.stringify({
+      d: displayName ?? '',
+      i: userIcon ?? '',
+      f: fcFid ?? 0,
+      u: fcUsername ?? '',
+    });
+    if (lastProfileRebroadcastSigRef.current === sig) return;
+    lastProfileRebroadcastSigRef.current = sig;
+
+    const t = setTimeout(async () => {
+      try {
+        const { maybeSendUpdateProfileMessage, runProfileBroadcastMigrations } = await import('../services/space/spaceMessageService');
+        const { getAllSpaces } = await import('../services/config/spaceStorage');
+        // Apply any pending profile-broadcast migrations BEFORE the
+        // rebroadcast loop so the gate's signature cache reflects the
+        // current wire shape. Currently used to force a one-time
+        // re-broadcast after add-farcaster-fields-v1 so devices learn
+        // each other's Farcaster linkage. Each tag is idempotent —
+        // running this on every connect is cheap and safe.
+        runProfileBroadcastMigrations();
+        const spaces = getAllSpaces();
+        if (spaces.length === 0) return;
+        for (const space of spaces) {
+          try {
+            const res = await maybeSendUpdateProfileMessage({
+              spaceId: space.spaceId,
+              channelId: space.defaultChannelId,
+              senderAddress: user.address,
+              displayName: displayName || undefined,
+              userIcon: userIcon || undefined,
+              // Include Farcaster linkage if linked so peers can
+              // surface it in UserProfileModal. Gate dedupes on
+              // signature so this is a no-op once recorded.
+              farcasterFid: user.farcaster?.fid,
+              farcasterUsername: user.farcaster?.username,
+            });
+            if (res) {
+              enqueueOutbound(async () => [res.wsEnvelope]);
+            }
+          } catch {
+            // Per-space failure is non-fatal — others still get the broadcast.
+          }
+        }
+      } catch {
+        // Module imports / spaces lookup failed; clear the fingerprint
+        // so the next dep change retries instead of treating this
+        // failed attempt as the canonical last broadcast.
+        lastProfileRebroadcastSigRef.current = null;
+      }
+    }, 4000); // Stagger after the log catch-up's setupTimeout.
+
+    return () => clearTimeout(t);
+  }, [
+    connectionState,
+    user?.address,
+    user?.displayName,
+    user?.username,
+    user?.profileImage,
+    user?.farcaster?.fid,
+    user?.farcaster?.username,
+    enqueueOutbound,
+  ]);
 
   const value = useMemo<WebSocketContextValue>(
     () => ({
@@ -4042,11 +4023,12 @@ export function WebSocketProvider({ children }: WebSocketProviderProps) {
       enqueueOutbound,
       subscribe,
       unsubscribe,
-      triggerSyncRequest,
       kickedFromSpaceId,
       clearKickedFromSpace,
+      registerCallSignalingHandler,
+      registerLogFrameHandler,
     }),
-    [connectionState, connect, disconnect, enqueueOutbound, subscribe, unsubscribe, triggerSyncRequest, kickedFromSpaceId, clearKickedFromSpace]
+    [connectionState, connect, disconnect, enqueueOutbound, subscribe, unsubscribe, kickedFromSpaceId, clearKickedFromSpace, registerCallSignalingHandler, registerLogFrameHandler]
   );
 
   return (

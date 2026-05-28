@@ -11,7 +11,6 @@
  * 2. Hub message (space-manifest control message via WebSocket)
  */
 
-import { logger } from '@quilibrium/quorum-shared';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   getSpace,
@@ -80,7 +79,6 @@ export function useUpdateSpace() {
       saveSpace(updatedSpace);
       const adapter = getMMKVAdapter();
       await adapter.saveSpace(updatedSpace);
-      logger.log('[useUpdateSpace] Space saved locally');
 
       // Broadcast to all members (API + hub)
       enqueueOutbound(async () => {

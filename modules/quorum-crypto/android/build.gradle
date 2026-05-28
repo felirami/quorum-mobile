@@ -74,8 +74,14 @@ repositories {
 dependencies {
   implementation project(':expo-modules-core')
   implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk7:${getKotlinVersion()}"
+  // Coroutines for background crypto operations
+  implementation "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3"
+  implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3"
   // JNA required by uniffi-generated bindings
   implementation "net.java.dev.jna:jna:5.14.0@aar"
+  // MMKV for direct native read/write of encryption state storage
+  // compileOnly: classes already provided at runtime by react-native-mmkv (io.github.zhongwuzw:mmkv)
+  compileOnly "com.tencent:mmkv-static:2.2.4"
 }
 
 def getKotlinVersion() {

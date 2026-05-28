@@ -10,8 +10,8 @@
  * This mirrors the desktop's ConfigService space sync logic.
  */
 
-import { logger } from '@quilibrium/quorum-shared';
-import { sha256 } from '@noble/hashes/sha2';
+import { base64ToHex, numberArrayToBase64 } from '@/utils/encoding';
+import { sha256 } from '@noble/hashes/sha2.js';
 import bs58 from 'bs58';
 import * as multihashes from 'multihashes';
 import { getQuorumClient } from '../api/quorumClient';
@@ -66,30 +66,6 @@ function deriveAddress(publicKeyBytes: Uint8Array): string {
 }
 
 /**
- * Convert number array to base64 string
- */
-function numberArrayToBase64(arr: number[]): string {
-  const uint8 = new Uint8Array(arr);
-  let binary = '';
-  for (let i = 0; i < uint8.length; i++) {
-    binary += String.fromCharCode(uint8[i]);
-  }
-  return btoa(binary);
-}
-
-/**
- * Convert base64 string to hex
- */
-function base64ToHex(base64: string): string {
-  const binary = atob(base64);
-  let hex = '';
-  for (let i = 0; i < binary.length; i++) {
-    hex += binary.charCodeAt(i).toString(16).padStart(2, '0');
-  }
-  return hex;
-}
-
-/**
  * Sync a space from config to local storage
  *
  * @param spaceKeyInfo - Space key info from UserConfig.spaceKeys
@@ -107,7 +83,6 @@ export async function syncSpaceFromConfig(
   // Check if space already exists locally
   const existingSpace = getSpace(spaceId);
   if (existingSpace) {
-    logger.log(`[SpaceSync] Space ${spaceId} already exists locally, skipping`);
     return true;
   }
 
@@ -117,12 +92,10 @@ export async function syncSpaceFromConfig(
     const hubKey = keys.find((k) => k.keyId === 'hub');
 
     if (!configKey) {
-      logger.warn(`[SpaceSync] Space ${spaceId} has no config key, skipping`);
       return false;
     }
 
     if (!hubKey) {
-      logger.warn(`[SpaceSync] Space ${spaceId} has no hub key, skipping`);
       return false;
     }
 
@@ -136,7 +109,6 @@ export async function syncSpaceFromConfig(
         privateKey: key.privateKey,
       });
     }
-    logger.log(`[SpaceSync] Saved ${keys.length} keys for space ${spaceId}`);
 
     // Fetch space registration info
     const client = getQuorumClient();
@@ -144,7 +116,6 @@ export async function syncSpaceFromConfig(
     try {
       spaceRegistration = await client.fetchSpace(spaceId);
     } catch (error) {
-      console.error(`[SpaceSync] Failed to fetch space ${spaceId}:`, error);
       return false;
     }
 
@@ -153,12 +124,10 @@ export async function syncSpaceFromConfig(
     try {
       manifestPayload = await client.getSpaceManifest(spaceId);
     } catch (error) {
-      console.error(`[SpaceSync] Failed to fetch manifest for ${spaceId}:`, error);
       return false;
     }
 
     if (!manifestPayload || !manifestPayload.space_manifest) {
-      logger.warn(`[SpaceSync] No manifest found for space ${spaceId}`);
       return false;
     }
 
@@ -171,7 +140,6 @@ export async function syncSpaceFromConfig(
         associated_data?: string;
       };
     } catch (error) {
-      console.error(`[SpaceSync] Failed to parse manifest for ${spaceId}:`, error);
       return false;
     }
 
@@ -179,17 +147,6 @@ export async function syncSpaceFromConfig(
     const cryptoProvider = new NativeCryptoProvider();
     const configPrivateKeyBytes = hexToBytes(configKey.privateKey);
     const ephemeralPublicKeyBytes = hexToBytes(manifestPayload.ephemeral_public_key);
-
-    logger.log(`[SpaceSync] Decrypting manifest for ${spaceId}:`, {
-      configKeyLength: configKey.privateKey.length,
-      ephemeralKeyLength: manifestPayload.ephemeral_public_key.length,
-      configPrivateKeyBytesLength: configPrivateKeyBytes.length,
-      ephemeralPublicKeyBytesLength: ephemeralPublicKeyBytes.length,
-      hasCiphertext: !!ciphertext.ciphertext,
-      hasIV: !!ciphertext.initialization_vector,
-      hasAD: !!ciphertext.associated_data,
-      ciphertextPrefix: ciphertext.ciphertext?.substring(0, 20),
-    });
 
     let decryptedManifest: Space;
     try {
@@ -205,25 +162,9 @@ export async function syncSpaceFromConfig(
       decryptedManifest = JSON.parse(
         new TextDecoder().decode(new Uint8Array(decryptResult))
       ) as Space;
-    } catch (error) {
-      // AEAD errors typically mean the key is invalid - this can happen if:
-      // 1. The user was kicked from the space (manifest re-encrypted with new key)
-      // 2. The config key was rotated since this sync config was created
-      // 3. The manifest data is corrupted
-      const errorStr = String(error);
-      if (errorStr.includes('aead') || errorStr.includes('Decryption failed')) {
-        logger.warn(
-          `[SpaceSync] Cannot decrypt manifest for ${spaceId} - user may have been removed from this space`
-        );
-      } else {
-        console.error(`[SpaceSync] Failed to decrypt manifest for ${spaceId}:`, error);
-      }
-      logger.log(`[SpaceSync] Decrypt error details:`, {
-        spaceId,
-        configKeyId: configKey.keyId,
-        configPublicKey: configKey.publicKey?.substring(0, 20),
-        error: errorStr,
-      });
+    } catch {
+      // Decryption can fail if the user was kicked (manifest re-encrypted with new key),
+      // the config key was rotated, or the manifest data is corrupted
       return false;
     }
 
@@ -233,7 +174,6 @@ export async function syncSpaceFromConfig(
 
     // Save the space
     saveSpace(decryptedManifest);
-    logger.log(`[SpaceSync] Saved space: ${decryptedManifest.spaceName || spaceId}`);
 
     // Save encryption state with new inbox address
     encryptionStateStorage.saveEncryptionState(
@@ -275,9 +215,7 @@ export async function syncSpaceFromConfig(
         inbox_public_key: bytesToHex(new Uint8Array(inboxKeypair.public_key)),
         inbox_signature: inboxSignatureHex,
       });
-      logger.log(`[SpaceSync] Registered inbox with hub for ${spaceId}`);
     } catch (error) {
-      console.error(`[SpaceSync] Failed to register with hub for ${spaceId}:`, error);
       // Continue - the space is saved, just won't receive real-time updates
     }
 
@@ -304,13 +242,10 @@ export async function syncSpaceFromConfig(
         profile_image: userInfo.profileImage,
         inbox_address: inboxAddress,
       });
-      logger.log(`[SpaceSync] Saved user as member of space ${spaceId}`);
     }
 
-    logger.log(`[SpaceSync] Successfully synced space ${spaceId}`);
     return true;
   } catch (error) {
-    console.error(`[SpaceSync] Failed to sync space ${spaceId}:`, error);
     return false;
   }
 }
@@ -328,15 +263,23 @@ export async function syncSpacesFromConfig(
   userInfo?: SyncUserInfo,
   onListenRequest?: (inboxAddresses: string[]) => void
 ): Promise<number> {
+  // Process spaces sequentially with delays to avoid CPU overload
+  // Parallel processing causes UI freezes due to heavy crypto operations
+  const DELAY_BETWEEN_SPACES_MS = 1000; // 1 second between spaces for smoother UI
   let successCount = 0;
 
-  for (const spaceKeyInfo of spaceKeys) {
-    const success = await syncSpaceFromConfig(spaceKeyInfo, userInfo, onListenRequest);
-    if (success) {
+  for (let i = 0; i < spaceKeys.length; i++) {
+    const spaceKeyInfo = spaceKeys[i];
+    const result = await syncSpaceFromConfig(spaceKeyInfo, userInfo, onListenRequest);
+    if (result) {
       successCount++;
+    }
+
+    // Add delay between spaces to yield to UI thread (except for last one)
+    if (i < spaceKeys.length - 1) {
+      await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_SPACES_MS));
     }
   }
 
-  logger.log(`[SpaceSync] Synced ${successCount}/${spaceKeys.length} spaces`);
   return successCount;
 }

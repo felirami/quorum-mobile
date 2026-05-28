@@ -1,26 +1,28 @@
-import React, { useState } from 'react';
+import type { AppTheme } from '@/theme';
+import React, { useMemo, useState } from 'react';
 import {
   ActivityIndicator,
-  FlatList,
-  Image,
   Pressable,
+  StyleSheet,
   Text,
   TouchableOpacity,
   View,
 } from 'react-native';
+import { Image } from 'expo-image';
+import { FlashList } from '@shopify/flash-list';
+import { CachedAvatar } from '@/components/ui/CachedAvatar';
 import { IconSymbol } from '@/components/ui/IconSymbol';
 import { useFarcasterChannel, type ChannelCast } from '@/hooks/useFarcasterChannel';
 import type { EmbeddedCast } from '@/hooks/useFarcasterFeed';
 import { ImageViewer, AutoHeightImage, ImageCarousel, VideoPlayer } from '../media';
-import { CastText, LinkPreview, QuoteCast, FrameEmbed } from '../content';
+import { CastText, LinkPreview, QuoteCast, FrameEmbed, LikeIcon, getLikeIconType } from '../content';
+import { QuorumIdentityBadge } from '../content/QuorumIdentityBadge';
 import { SCREEN_WIDTH, SCREEN_HEIGHT, formatTimestamp, lookupUserByUsername } from '../utils';
-
-const AVATAR_FALLBACK = require('@/assets/images/quorum-symbol-bg-blue.png');
 
 interface ChannelViewProps {
   channelKey: string;
   token?: string;
-  theme: any;
+  theme: AppTheme;
   onClose: () => void;
   onOpenThread: (username: string, hashPrefix: string) => void;
   onOpenMiniApp: (url: string) => void;
@@ -54,7 +56,9 @@ export function ChannelView({
     fetchNextPage,
   } = useFarcasterChannel({ channelKey, token });
 
-  const [viewerImage, setViewerImage] = useState<string | null>(null);
+  const [viewerState, setViewerState] = useState<{ images: string[]; index: number } | null>(null);
+
+  const styles = useMemo(() => createStyles(theme), [theme]);
 
   const handleMentionPress = async (username: string) => {
     const fid = await lookupUserByUsername(username);
@@ -69,71 +73,46 @@ export function ChannelView({
     const miniAppTitle = frameEmbed?.button?.title || channel?.headerAction?.title;
 
     return (
-      <View style={{ backgroundColor: theme.colors.background }}>
+      <View style={styles.headerBackground}>
         {/* Header Image */}
         {channel?.headerImageUrl && (
           <Image
             source={{ uri: channel.headerImageUrl }}
-            style={{
-              width: SCREEN_WIDTH,
-              height: 100,
-              backgroundColor: theme.colors.surface3,
-            }}
-            resizeMode="cover"
+            style={styles.headerImage}
+            contentFit="cover"
+            cachePolicy="disk"
           />
         )}
 
         {/* Back button overlay */}
         <TouchableOpacity
           onPress={onClose}
-          style={{
-            position: 'absolute',
-            top: 12,
-            left: 12,
-            backgroundColor: 'rgba(0,0,0,0.5)',
-            borderRadius: 20,
-            padding: 8,
-            zIndex: 10,
-          }}
+          style={staticStyles.backButton}
         >
           <IconSymbol name="chevron.left" color="#fff" size={20} />
         </TouchableOpacity>
 
         {/* Channel Info */}
-        <View style={{ padding: 16, marginTop: channel?.headerImageUrl ? -24 : 0 }}>
-          <View style={{ flexDirection: 'row', alignItems: 'flex-end' }}>
+        <View style={[staticStyles.channelInfoContainer, { marginTop: channel?.headerImageUrl ? -24 : 0 }]}>
+          <View style={staticStyles.channelInfoRow}>
             {channel?.imageUrl ? (
               <Image
                 source={{ uri: channel.imageUrl }}
-                style={{
-                  width: 64,
-                  height: 64,
-                  borderRadius: 12,
-                  marginRight: 12,
-                  backgroundColor: theme.colors.surface3,
-                  borderWidth: channel?.headerImageUrl ? 3 : 0,
-                  borderColor: theme.colors.background,
-                }}
+                style={[
+                  styles.channelImage,
+                  { borderWidth: channel?.headerImageUrl ? 3 : 0 },
+                ]}
+                cachePolicy="disk"
               />
             ) : (
-              <View
-                style={{
-                  width: 64,
-                  height: 64,
-                  borderRadius: 12,
-                  marginRight: 12,
-                  backgroundColor: theme.colors.accent,
-                  justifyContent: 'center',
-                  alignItems: 'center',
-                }}
-              >
-                <Text style={{ color: '#fff', fontSize: 24, fontWeight: '700' }}>
+              <View style={styles.channelImagePlaceholder}>
+                <Text style={staticStyles.channelImagePlaceholderText}>
                   /{channelKey.charAt(0).toUpperCase()}
                 </Text>
               </View>
             )}
-            <View style={{ flex: 1, paddingBottom: 4 }}>
-              <Text style={{ color: theme.colors.textStrong, fontSize: 22, fontWeight: '700' }}>
+            <View style={staticStyles.channelNameContainer}>
+              <Text style={styles.channelName}>
                 /{channel?.name || channelKey}
               </Text>
             </View>
@@ -141,27 +120,27 @@ export function ChannelView({
 
           {/* Description */}
           {channel?.description && (
-            <Text style={{ color: theme.colors.textMain, fontSize: 15, lineHeight: 21, marginTop: 12 }}>
+            <Text style={styles.channelDescription}>
               {channel.description}
             </Text>
           )}
 
           {/* Channel stats */}
-          <View style={{ flexDirection: 'row', gap: 16, marginTop: 12 }}>
+          <View style={staticStyles.statsRow}>
             {channel?.followerCount !== undefined && (
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
-                <Text style={{ color: theme.colors.textStrong, fontWeight: '600', fontSize: 15 }}>
+              <View style={staticStyles.statItem}>
+                <Text style={styles.statCount}>
                   {channel.followerCount.toLocaleString()}
                 </Text>
-                <Text style={{ color: theme.colors.textMuted, fontSize: 14 }}>Followers</Text>
+                <Text style={styles.statLabel}>Followers</Text>
               </View>
             )}
             {channel?.memberCount !== undefined && (
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
-                <Text style={{ color: theme.colors.textStrong, fontWeight: '600', fontSize: 15 }}>
+              <View style={staticStyles.statItem}>
+                <Text style={styles.statCount}>
                   {channel.memberCount.toLocaleString()}
                 </Text>
-                <Text style={{ color: theme.colors.textMuted, fontSize: 14 }}>Members</Text>
+                <Text style={styles.statLabel}>Members</Text>
               </View>
             )}
           </View>
@@ -170,27 +149,17 @@ export function ChannelView({
           {miniAppUrl && miniAppTitle && (
             <TouchableOpacity
               onPress={() => onOpenMiniApp(miniAppUrl)}
-              style={{
-                backgroundColor: theme.colors.accent,
-                borderRadius: 20,
-                paddingVertical: 10,
-                paddingHorizontal: 20,
-                marginTop: 16,
-                flexDirection: 'row',
-                alignItems: 'center',
-                justifyContent: 'center',
-                gap: 8,
-              }}
+              style={styles.miniAppButton}
             >
               <IconSymbol name="play.fill" color="#fff" size={16} />
-              <Text style={{ color: '#fff', fontSize: 15, fontWeight: '600' }}>
+              <Text style={staticStyles.miniAppButtonText}>
                 {miniAppTitle}
               </Text>
             </TouchableOpacity>
           )}
         </View>
 
-        <View style={{ height: 1, backgroundColor: theme.colors.surface3 }} />
+        <View style={styles.headerDivider} />
       </View>
     );
   };
@@ -230,40 +199,28 @@ export function ChannelView({
     return (
       <View
         key={cast.hash}
-        style={{
-          borderBottomWidth: 1,
-          borderBottomColor: theme.colors.surface3,
-          paddingTop: 12,
-          paddingBottom: 14,
-          paddingHorizontal: 12,
-          gap: 10,
-        }}
+        style={styles.castContainer}
       >
         <Pressable onPress={navigateToThread}>
-          <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+          <View style={staticStyles.castHeaderRow}>
             <TouchableOpacity onPress={() => onOpenProfile(cast.author.fid, cast.author.username)}>
-              <Image
-                source={cast.author.pfp?.url ? { uri: cast.author.pfp.url } : AVATAR_FALLBACK}
-                style={{
-                  width: 44,
-                  height: 44,
-                  borderRadius: 22,
-                  marginRight: 12,
-                  backgroundColor: theme.colors.surface3,
-                }}
+              <CachedAvatar
+                source={cast.author.pfp?.url ? { uri: cast.author.pfp.url } : null}
+                style={styles.castAvatar}
               />
             </TouchableOpacity>
-            <View style={{ flex: 1 }}>
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+            <View style={staticStyles.flex1}>
+              <View style={staticStyles.castAuthorRow}>
                 <TouchableOpacity onPress={() => onOpenProfile(cast.author.fid, cast.author.username)}>
-                  <Text style={{ color: theme.colors.textStrong, fontWeight: '600', fontSize: 15 }}>
+                  <Text style={styles.castAuthorName}>
                     {cast.author.displayName}
                   </Text>
                 </TouchableOpacity>
               </View>
-              <Text style={{ color: theme.colors.textMuted, fontSize: 13, marginTop: 2 }}>
+              <Text style={styles.castAuthorMeta}>
                 @{cast.author.username} • {formatTimestamp(cast.timestamp)}
               </Text>
+              <QuorumIdentityBadge fid={cast.author.fid} theme={theme} compact />
             </View>
           </View>
         </Pressable>
@@ -272,7 +229,7 @@ export function ChannelView({
           {cast.text.length > 0 && (
             <CastText
               text={cast.text}
-              style={{ color: theme.colors.textMain, fontSize: 15, lineHeight: 20 }}
+              style={styles.castText}
               theme={theme}
               onMentionPress={handleMentionPress}
               onChannelPress={onOpenChannel}
@@ -281,27 +238,27 @@ export function ChannelView({
         </Pressable>
 
         {hasImages && (
-          <View style={{ marginHorizontal: -12 }}>
+          <View style={staticStyles.mediaContainer}>
             {imageUrls.length === 1 ? (
               <AutoHeightImage
                 uri={imageUrls[0]}
                 maxHeight={SCREEN_HEIGHT * 0.8}
-                style={{ backgroundColor: theme.colors.surface3 }}
-                onPress={() => setViewerImage(imageUrls[0])}
+                style={styles.imagePlaceholderBg}
+                onPress={() => setViewerState({ images: imageUrls, index: 0 })}
               />
             ) : (
               <ImageCarousel
                 urls={imageUrls}
                 maxHeight={SCREEN_HEIGHT * 0.8}
                 theme={theme}
-                onImagePress={setViewerImage}
+                onImagePress={(_, index) => setViewerState({ images: imageUrls, index })}
               />
             )}
           </View>
         )}
 
         {hasVideos && (
-          <View style={{ marginHorizontal: -12 }}>
+          <View style={staticStyles.mediaContainer}>
             {videos.map((video, index) => (
               <VideoPlayer
                 key={index}
@@ -317,7 +274,7 @@ export function ChannelView({
         )}
 
         {frameEmbeds.length > 0 && (
-          <View style={{ marginHorizontal: -12, gap: 8 }}>
+          <View style={staticStyles.frameEmbedsContainer}>
             {frameEmbeds.map((frame, index) => (
               <FrameEmbed
                 key={index}
@@ -332,7 +289,7 @@ export function ChannelView({
         )}
 
         {urlPreviews.length > 0 && (
-          <View style={{ gap: 8 }}>
+          <View style={staticStyles.gap8}>
             {urlPreviews.map((urlEmbed, index) => {
               const linkUrl = urlEmbed.openGraph?.url || urlEmbed.openGraph?.sourceUrl;
               return (
@@ -353,7 +310,7 @@ export function ChannelView({
         )}
 
         {quoteCasts.length > 0 && (
-          <View style={{ gap: 8 }}>
+          <View style={staticStyles.gap8}>
             {quoteCasts.map((embeddedCast, index) => (
               <QuoteCast
                 key={index}
@@ -365,37 +322,39 @@ export function ChannelView({
           </View>
         )}
 
-        <View style={{ flexDirection: 'row', gap: 16, marginTop: 4 }}>
+        <View style={staticStyles.actionsRow}>
           <TouchableOpacity
-            style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}
+            style={staticStyles.actionButton}
             onPress={() => onLikeToggle(cast.hash, isLiked, likeCount)}
           >
-            <IconSymbol
-              name={isLiked ? 'heart.fill' : 'heart'}
-              color={isLiked ? theme.colors.danger : theme.colors.textMuted}
+            <LikeIcon
+              type={getLikeIconType(cast.text)}
+              isLiked={isLiked}
+              color={theme.colors.textMuted}
+              activeColor={theme.colors.danger}
               size={16}
             />
             {likeCount > 0 && (
-              <Text style={{ color: theme.colors.textMuted, fontSize: 13 }}>{likeCount}</Text>
+              <Text style={styles.actionCount}>{likeCount}</Text>
             )}
           </TouchableOpacity>
           <TouchableOpacity
-            style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}
+            style={staticStyles.actionButton}
             onPress={navigateToThread}
           >
             <IconSymbol name="bubble.left" color={theme.colors.textMuted} size={16} />
             {(cast.replies?.count ?? 0) > 0 && (
-              <Text style={{ color: theme.colors.textMuted, fontSize: 13 }}>{cast.replies?.count}</Text>
+              <Text style={styles.actionCount}>{cast.replies?.count}</Text>
             )}
           </TouchableOpacity>
-          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+          <View style={staticStyles.actionButton}>
             <IconSymbol
               name={cast.viewerContext?.recast ? 'arrowshape.turn.up.right.fill' : 'arrowshape.turn.up.right'}
               color={cast.viewerContext?.recast ? theme.colors.success : theme.colors.textMuted}
               size={16}
             />
             {(cast.recasts?.count ?? 0) > 0 && (
-              <Text style={{ color: theme.colors.textMuted, fontSize: 13 }}>{cast.recasts?.count}</Text>
+              <Text style={styles.actionCount}>{cast.recasts?.count}</Text>
             )}
           </View>
         </View>
@@ -404,20 +363,20 @@ export function ChannelView({
   };
 
   return (
-    <View style={{ flex: 1, backgroundColor: theme.colors.background }}>
+    <View style={styles.container}>
       {isLoading && casts.length === 0 && (
-        <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
+        <View style={staticStyles.loadingContainer}>
           <ActivityIndicator color={theme.colors.accent} />
         </View>
       )}
 
       {error && (
-        <View style={{ padding: 20 }}>
-          <Text style={{ color: theme.colors.danger }}>{error}</Text>
+        <View style={staticStyles.errorContainer}>
+          <Text style={styles.errorText}>{error}</Text>
         </View>
       )}
 
-      <FlatList
+      <FlashList
         data={casts}
         keyExtractor={(item) => item.hash}
         ListHeaderComponent={renderChannelHeader}
@@ -432,7 +391,7 @@ export function ChannelView({
         onEndReachedThreshold={0.5}
         ListFooterComponent={
           isFetchingNextPage ? (
-            <View style={{ paddingVertical: 20, alignItems: 'center' }}>
+            <View style={staticStyles.footerLoading}>
               <ActivityIndicator color={theme.colors.accent} />
             </View>
           ) : null
@@ -440,12 +399,209 @@ export function ChannelView({
       />
 
       <ImageViewer
-        visible={viewerImage !== null}
-        imageUrl={viewerImage}
-        onClose={() => setViewerImage(null)}
+        visible={viewerState !== null}
+        images={viewerState?.images}
+        initialIndex={viewerState?.index}
+        onClose={() => setViewerState(null)}
       />
     </View>
   );
 }
 
 export default ChannelView;
+
+const staticStyles = StyleSheet.create({
+  backButton: {
+    position: 'absolute',
+    top: 12,
+    left: 12,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    borderRadius: 20,
+    padding: 8,
+    zIndex: 10,
+  },
+  channelInfoContainer: {
+    padding: 16,
+  },
+  channelInfoRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+  },
+  channelImagePlaceholderText: {
+    color: '#fff',
+    fontSize: 24,
+    fontWeight: '700',
+  },
+  channelNameContainer: {
+    flex: 1,
+    paddingBottom: 4,
+  },
+  statsRow: {
+    flexDirection: 'row',
+    gap: 16,
+    marginTop: 12,
+  },
+  statItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+  },
+  miniAppButtonText: {
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  castHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  flex1: {
+    flex: 1,
+  },
+  castAuthorRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  mediaContainer: {
+    marginHorizontal: -12,
+  },
+  frameEmbedsContainer: {
+    marginHorizontal: -12,
+    gap: 8,
+  },
+  gap8: {
+    gap: 8,
+  },
+  actionsRow: {
+    flexDirection: 'row',
+    gap: 16,
+    marginTop: 4,
+  },
+  actionButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  loadingContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  errorContainer: {
+    padding: 20,
+  },
+  footerLoading: {
+    paddingVertical: 20,
+    alignItems: 'center',
+  },
+});
+
+function createStyles(theme: AppTheme) {
+  return StyleSheet.create({
+    container: {
+      flex: 1,
+      backgroundColor: theme.colors.background,
+    },
+    headerBackground: {
+      backgroundColor: theme.colors.background,
+    },
+    headerImage: {
+      width: SCREEN_WIDTH,
+      height: 100,
+      backgroundColor: theme.colors.surface3,
+    },
+    channelImage: {
+      width: 64,
+      height: 64,
+      borderRadius: 12,
+      marginRight: 12,
+      backgroundColor: theme.colors.surface3,
+      borderColor: theme.colors.background,
+    },
+    channelImagePlaceholder: {
+      width: 64,
+      height: 64,
+      borderRadius: 12,
+      marginRight: 12,
+      backgroundColor: theme.colors.accent,
+      justifyContent: 'center',
+      alignItems: 'center',
+    },
+    channelName: {
+      color: theme.colors.textStrong,
+      fontSize: 22,
+      fontWeight: '700',
+    },
+    channelDescription: {
+      color: theme.colors.textMain,
+      fontSize: 15,
+      lineHeight: 21,
+      marginTop: 12,
+    },
+    statCount: {
+      color: theme.colors.textStrong,
+      fontWeight: '600',
+      fontSize: 15,
+    },
+    statLabel: {
+      color: theme.colors.textMuted,
+      fontSize: 14,
+    },
+    miniAppButton: {
+      backgroundColor: theme.colors.accent,
+      borderRadius: 20,
+      paddingVertical: 10,
+      paddingHorizontal: 20,
+      marginTop: 16,
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 8,
+    },
+    headerDivider: {
+      height: 1,
+      backgroundColor: theme.colors.surface3,
+    },
+    castContainer: {
+      borderBottomWidth: 1,
+      borderBottomColor: theme.colors.surface3,
+      paddingTop: 12,
+      paddingBottom: 14,
+      paddingHorizontal: 12,
+      gap: 10,
+    },
+    castAvatar: {
+      width: 44,
+      height: 44,
+      borderRadius: 22,
+      marginRight: 12,
+      backgroundColor: theme.colors.surface3,
+    },
+    castAuthorName: {
+      color: theme.colors.textStrong,
+      fontWeight: '600',
+      fontSize: 15,
+    },
+    castAuthorMeta: {
+      color: theme.colors.textMuted,
+      fontSize: 13,
+      marginTop: 2,
+    },
+    castText: {
+      color: theme.colors.textMain,
+      fontSize: 15,
+      lineHeight: 20,
+    },
+    imagePlaceholderBg: {
+      backgroundColor: theme.colors.surface3,
+    },
+    actionCount: {
+      color: theme.colors.textMuted,
+      fontSize: 13,
+    },
+    errorText: {
+      color: theme.colors.danger,
+    },
+  });
+}

@@ -5,7 +5,6 @@
  * Auth-based redirects (authenticated -> home) are handled by AuthRouter in _layout.tsx.
  */
 
-import { logger } from '@quilibrium/quorum-shared';
 import { useAuth, useOnboardingState } from '@/context';
 import { useTheme } from '@/theme';
 import { Redirect } from 'expo-router';
@@ -15,8 +14,6 @@ export default function OnboardingIndex() {
   const { currentStep } = useOnboardingState();
   const { authState } = useAuth();
   const { theme } = useTheme();
-
-  logger.log('OnboardingIndex:', { currentStep, authState });
 
   // If authenticated, just show loading - AuthRouter will redirect to home
   // This prevents any further redirects from this component during auth navigation

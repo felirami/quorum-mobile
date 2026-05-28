@@ -1,4 +1,4 @@
-/**
+/*
  * SpaceMessageService - Handles encrypted space message sending
  *
  * Provides functionality to:
@@ -13,8 +13,7 @@
  * 4. Send via postHub API endpoint
  */
 
-import { logger } from '@quilibrium/quorum-shared';
-import { sha256 } from '@noble/hashes/sha2';
+import { sha256 } from '@noble/hashes/sha2.js';
 import {
   bytesToHex,
   hexToBytes,
@@ -26,6 +25,9 @@ import {
   type ReactionMessage,
   type RemoveMessage,
   type RemoveReactionMessage,
+  type StickerMessage,
+  type SpaceCallStartMessage,
+  type SpaceCallEndMessage,
   // New sync types
   type SyncRequestPayload,
   type SyncInfoPayload,
@@ -41,10 +43,7 @@ import { getSpaceKey } from '../config/spaceStorage';
 import { encryptionStateStorage } from '../crypto/encryption-state-storage';
 import { NativeCryptoProvider } from '../crypto/native-provider';
 
-/**
- * Convert byte array to base64 string without stack overflow
- * Uses a loop instead of spread operator for large arrays
- */
+// Uses a loop instead of spread operator to avoid stack overflow on large arrays.
 function bytesToBase64(bytes: Uint8Array | number[]): string {
   let binary = '';
   for (let i = 0; i < bytes.length; i++) {
@@ -53,25 +52,16 @@ function bytesToBase64(bytes: Uint8Array | number[]): string {
   return btoa(binary);
 }
 
-/**
- * Track sent Triple Ratchet envelope fingerprints
- * This is used to skip decrypting our own echoed messages
- * (Triple Ratchet participants can't decrypt their own messages)
- */
+// Tracks sent TR envelope fingerprints to skip decrypting our own echoed messages
+// (TR participants can't decrypt their own messages).
 const sentEnvelopeFingerprints = new Set<string>();
 const MAX_FINGERPRINTS = 1000; // Limit to prevent memory leaks
 
-/**
- * Generate a fingerprint from a Triple Ratchet envelope for tracking
- */
 function getEnvelopeFingerprint(envelope: string): string {
   // Use first 100 chars as fingerprint (unique enough, fast to compute)
   return envelope.substring(0, 100);
 }
 
-/**
- * Record that we sent this envelope (so we can skip decrypting it when echoed back)
- */
 export function trackSentEnvelope(envelope: string): void {
   const fingerprint = getEnvelopeFingerprint(envelope);
   sentEnvelopeFingerprints.add(fingerprint);
@@ -83,9 +73,6 @@ export function trackSentEnvelope(envelope: string): void {
   }
 }
 
-/**
- * Check if we sent this envelope (and should skip decryption)
- */
 export function isSentEnvelope(envelope: string): boolean {
   const fingerprint = getEnvelopeFingerprint(envelope);
   return sentEnvelopeFingerprints.has(fingerprint);
@@ -105,9 +92,23 @@ export interface SendSpaceMessageParams {
   text: string;
   senderAddress: string;
   repliesToMessageId?: string;
+  replyToAuthorAddress?: string;
 }
 
 export interface SendSpaceMessageResult {
+  message: Message;
+  /** Stringified envelope ready to send via WebSocket */
+  wsEnvelope: string;
+}
+
+export interface SendStickerMessageParams {
+  spaceId: string;
+  channelId: string;
+  stickerId: string;
+  senderAddress: string;
+}
+
+export interface SendStickerMessageResult {
   message: Message;
   /** Stringified envelope ready to send via WebSocket */
   wsEnvelope: string;
@@ -123,18 +124,92 @@ function generateNonce(): string {
 }
 
 /**
- * Generate message ID from content hash
+ * Canonicalize message content for hashing (matches desktop canonicalize function)
+ * For 'post' type: returns the text
+ * For 'sticker' type: returns type + stickerId
+ * For 'embed' type: returns type + dimensions + urls
+ * For 'reaction' type: returns type + messageId + reaction
+ * etc.
  */
-function generateMessageId(
-  spaceId: string,
-  channelId: string,
-  senderId: string,
+function canonicalizeContent(content: MessageContent): string {
+  if (content.type === 'post') {
+    const postContent = content as PostMessage;
+    if (Array.isArray(postContent.text)) {
+      return postContent.text.join('');
+    }
+    return postContent.text ?? '';
+  }
+
+  if (content.type === 'sticker') {
+    const stickerContent = content as StickerMessage;
+    return content.type + stickerContent.stickerId + (stickerContent.repliesToMessageId ?? '');
+  }
+
+  if (content.type === 'embed') {
+    const embedContent = content as EmbedMessage;
+    return (
+      content.type +
+      (embedContent.width ?? '') +
+      (embedContent.height ?? '') +
+      (embedContent.imageUrl ?? '') +
+      (embedContent.repliesToMessageId ?? '') +
+      (embedContent.videoUrl ?? '')
+    );
+  }
+
+  if (content.type === 'reaction') {
+    const reactionContent = content as ReactionMessage;
+    return content.type + reactionContent.messageId + reactionContent.reaction;
+  }
+
+  if (content.type === 'remove-reaction') {
+    const removeReactionContent = content as RemoveReactionMessage;
+    return content.type + removeReactionContent.messageId + removeReactionContent.reaction;
+  }
+
+  if (content.type === 'remove-message') {
+    const removeContent = content as RemoveMessage;
+    return content.type + removeContent.removeMessageId;
+  }
+
+  if (content.type === 'edit-message') {
+    const editContent = content as EditMessage;
+    const editedText = Array.isArray(editContent.editedText)
+      ? editContent.editedText.join('')
+      : editContent.editedText;
+    return content.type + editContent.originalMessageId + editedText + editContent.editNonce;
+  }
+
+  if (content.type === 'space-call-start') {
+    const c = content as SpaceCallStartMessage;
+    return content.type + c.callId + c.mediaType;
+  }
+
+  if (content.type === 'space-call-end') {
+    const c = content as SpaceCallEndMessage;
+    return content.type + c.callId;
+  }
+
+  // Default: stringify the content
+  return JSON.stringify(content);
+}
+
+/**
+ * Generate message ID hash from content (matches desktop implementation)
+ * Hash input: nonce + 'post' + senderAddress + canonicalizedContent
+ * Returns both the hex messageId and the raw hash bytes for signing
+ */
+function generateMessageIdHash(
   nonce: string,
-  timestamp: number
-): string {
-  const content = `${spaceId}:${channelId}:${senderId}:${nonce}:${timestamp}`;
-  const hash = sha256(new TextEncoder().encode(content));
-  return bytesToHex(hash);
+  senderAddress: string,
+  content: MessageContent
+): { messageId: string; messageIdBytes: Uint8Array } {
+  const canonicalContent = canonicalizeContent(content);
+  const input = nonce + content.type + senderAddress + canonicalContent;
+  const inputBytes = new TextEncoder().encode(input);
+  const hashBytes = sha256(inputBytes);
+  const messageId = bytesToHex(hashBytes);
+  return { messageId, messageIdBytes: hashBytes };
 }
 
 /**
@@ -159,26 +234,18 @@ function hexToNumberArray(hex: string): number[] {
 export async function sendSpaceMessage(
   params: SendSpaceMessageParams
 ): Promise<SendSpaceMessageResult> {
-  const { spaceId, channelId, text, senderAddress, repliesToMessageId } = params;
+  const { spaceId, channelId, text, senderAddress, repliesToMessageId, replyToAuthorAddress } = params;
 
   const cryptoProvider = new NativeCryptoProvider();
   const timestamp = Date.now();
   const nonce = generateNonce();
 
-  logger.log('[SpaceMessageService] Sending message to channel:', channelId);
-
   // 1. Get hub key for the space
   const hubKey = getSpaceKey(spaceId, 'hub');
   if (!hubKey) {
-    logger.log('[SpaceMessageService] No hub key found for spaceId:', spaceId);
     throw new Error('Hub key not found for space. Cannot send messages.');
   }
   if (!hubKey.address || !hubKey.privateKey || !hubKey.publicKey) {
-    logger.log('[SpaceMessageService] Hub key incomplete:', {
-      hasAddress: !!hubKey.address,
-      hasPrivateKey: !!hubKey.privateKey,
-      hasPublicKey: !!hubKey.publicKey,
-    });
     throw new Error(`Hub key incomplete for space. Missing: ${!hubKey.address ? 'address ' : ''}${!hubKey.privateKey ? 'privateKey ' : ''}${!hubKey.publicKey ? 'publicKey' : ''}`);
   }
 
@@ -191,10 +258,7 @@ export async function sendSpaceMessage(
     throw new Error('Inbox key not found for space. Cannot sign messages.');
   }
 
-  // 3. Generate message ID
-  const messageId = generateMessageId(spaceId, channelId, senderAddress, nonce, timestamp);
-
-  // 4. Build message content
+  // 3. Build message content first (needed for messageId hash)
   const messageContent: PostMessage = {
     type: 'post',
     senderId: senderAddress,
@@ -202,12 +266,16 @@ export async function sendSpaceMessage(
     repliesToMessageId,
   };
 
+  // 4. Generate message ID using SHA-256 hash (matches desktop implementation)
+  // Hash input: nonce + 'post' + senderAddress + text
+  const { messageId, messageIdBytes } = generateMessageIdHash(nonce, senderAddress, messageContent);
+
   // 5. Build full message object
   const message: Message = {
     channelId,
     spaceId,
     messageId,
-    digestAlgorithm: 'sha256',
+    digestAlgorithm: 'SHA-256',
     nonce,
     createdDate: timestamp,
     modifiedDate: timestamp,
@@ -216,17 +284,23 @@ export async function sendSpaceMessage(
     reactions: [],
     mentions: { memberIds: [], roleIds: [], channelIds: [] },
     publicKey: inboxKey.publicKey,
+    // Add reply metadata if this is a reply (used for display and notifications)
+    ...(repliesToMessageId && replyToAuthorAddress
+      ? {
+          replyMetadata: {
+            parentAuthor: replyToAuthorAddress,
+            parentChannelId: channelId,
+          },
+        }
+      : {}),
   };
 
-  // 6. Sign the message
-  const messageJson = JSON.stringify(message);
-  const messageBytes = new TextEncoder().encode(messageJson);
-  const messageBase64 = bytesToBase64(messageBytes);
-
-  // Sign with inbox key
+  // 6. Sign the messageId hash (NOT the whole message JSON)
+  // This matches desktop implementation for non-repudiability
+  const messageIdBase64 = bytesToBase64(messageIdBytes);
   const inboxPrivateKeyBytes = hexToBytes(inboxKey.privateKey);
   const inboxPrivateKeyBase64 = bytesToBase64(inboxPrivateKeyBytes);
-  const signatureBase64 = await cryptoProvider.signEd448(inboxPrivateKeyBase64, messageBase64);
+  const signatureBase64 = await cryptoProvider.signEd448(inboxPrivateKeyBase64, messageIdBase64);
 
   // Convert signature to hex for message
   const signatureBinary = atob(signatureBase64);
@@ -236,10 +310,9 @@ export async function sendSpaceMessage(
   }
   message.signature = signatureHex;
 
-  // 7. Skip Triple Ratchet encryption - use only hub envelope encryption with config key
-  // The config key provides forward secrecy (rotates on kick) without the complexity
-  // of Triple Ratchet state synchronization across devices
 
+  // Hub-envelope only (no TR): the config key rotates on kick, giving
+  // forward secrecy without cross-device TR state sync.
   // Prepare message for sending (remove ephemeral fields)
   const messageToSend = { ...message };
   delete (messageToSend as Record<string, unknown>).sendStatus;
@@ -250,8 +323,6 @@ export async function sendSpaceMessage(
     type: 'message',
     message: messageToSend,
   });
-
-  logger.log('[SpaceMessageService] Message prepared (envelope-only encryption)');
 
   // 9. Seal the message for hub delivery
   const hubKeypair = {
@@ -271,13 +342,111 @@ export async function sendSpaceMessage(
       : undefined
   );
 
-  logger.log('[SpaceMessageService] Message sealed');
+  const wsEnvelope = JSON.stringify({ type: 'log-append', ...sealedMessage });
 
-  // 10. Wrap with type 'group' for WebSocket delivery
-  // Messages are sent via WebSocket, not HTTP postHub
-  const wsEnvelope = JSON.stringify({ type: 'group', ...sealedMessage });
+  return {
+    message,
+    wsEnvelope,
+  };
+}
 
-  logger.log('[SpaceMessageService] Message prepared for WebSocket:', messageId);
+/**
+ * Send a sticker message to a space channel
+ */
+export async function sendStickerMessage(
+  params: SendStickerMessageParams
+): Promise<SendStickerMessageResult> {
+  const { spaceId, channelId, stickerId, senderAddress } = params;
+
+  const cryptoProvider = new NativeCryptoProvider();
+  const timestamp = Date.now();
+  const nonce = generateNonce();
+
+  // 1. Get hub key for the space
+  const hubKey = getSpaceKey(spaceId, 'hub');
+  if (!hubKey || !hubKey.address || !hubKey.privateKey || !hubKey.publicKey) {
+    throw new Error('Hub key not found or incomplete for space.');
+  }
+
+  // 1b. Get config key for hub envelope encryption
+  const configKey = getSpaceKey(spaceId, 'config');
+
+  // 2. Get inbox key for signing
+  const inboxKey = getSpaceKey(spaceId, 'inbox');
+  if (!inboxKey || !inboxKey.privateKey || !inboxKey.publicKey) {
+    throw new Error('Inbox key not found for space. Cannot sign messages.');
+  }
+
+  // 3. Build sticker message content first (needed for messageId hash)
+  const messageContent: StickerMessage = {
+    type: 'sticker',
+    senderId: senderAddress,
+    stickerId,
+  };
+
+  // 4. Generate message ID using SHA-256 hash (matches desktop implementation)
+  const { messageId, messageIdBytes } = generateMessageIdHash(nonce, senderAddress, messageContent);
+
+  // 5. Build full message object
+  const message: Message = {
+    channelId,
+    spaceId,
+    messageId,
+    digestAlgorithm: 'SHA-256',
+    nonce,
+    createdDate: timestamp,
+    modifiedDate: timestamp,
+    lastModifiedHash: '',
+    content: messageContent,
+    reactions: [],
+    mentions: { memberIds: [], roleIds: [], channelIds: [] },
+    publicKey: inboxKey.publicKey,
+  };
+
+  // 6. Sign the messageId hash (NOT the whole message JSON)
+  const messageIdBase64 = bytesToBase64(messageIdBytes);
+  const inboxPrivateKeyBytes = hexToBytes(inboxKey.privateKey);
+  const inboxPrivateKeyBase64 = bytesToBase64(inboxPrivateKeyBytes);
+  const signatureBase64 = await cryptoProvider.signEd448(inboxPrivateKeyBase64, messageIdBase64);
+
+  const signatureBinary = atob(signatureBase64);
+  let signatureHex = '';
+  for (let i = 0; i < signatureBinary.length; i++) {
+    signatureHex += signatureBinary.charCodeAt(i).toString(16).padStart(2, '0');
+  }
+  message.signature = signatureHex;
+
+
+  // 7. Prepare message for sending
+  const messageToSend = { ...message };
+  delete (messageToSend as Record<string, unknown>).sendStatus;
+  delete (messageToSend as Record<string, unknown>).sendError;
+
+  // Create hub message payload
+  const hubMessagePayload = JSON.stringify({
+    type: 'message',
+    message: messageToSend,
+  });
+
+  // Seal the message for hub delivery
+  const hubKeypair = {
+    publicKey: hexToNumberArray(hubKey.publicKey),
+    privateKey: hexToNumberArray(hubKey.privateKey),
+  };
+
+  const sealedMessage = await cryptoProvider.sealHubEnvelope(
+    hubKey.address,
+    hubKeypair,
+    configKey?.publicKey ? hexToNumberArray(configKey.publicKey) : undefined,
+    hubMessagePayload
+  );
+
+  // Create WebSocket envelope
+  const wsEnvelope = JSON.stringify({
+    type: 'hub',
+    hub_address: hubKey.address,
+    message: sealedMessage,
+  });
 
   return {
     message,
@@ -321,12 +490,9 @@ export async function sendJoinMessage(
 
   const cryptoProvider = new NativeCryptoProvider();
 
-  logger.log('[SpaceMessageService] Sending join control message for participant:', participant.address);
-
   // Get hub key for the space
   const hubKey = getSpaceKey(spaceId, 'hub');
   if (!hubKey) {
-    logger.log('[SpaceMessageService] No hub key found for spaceId:', spaceId);
     throw new Error('Hub key not found for space. Cannot send join message.');
   }
   if (!hubKey.address || !hubKey.privateKey || !hubKey.publicKey) {
@@ -346,7 +512,6 @@ export async function sendJoinMessage(
   };
 
   const hubMessagePayload = JSON.stringify(controlMessage);
-  logger.log('[SpaceMessageService] Join control message payload length:', hubMessagePayload.length);
 
   // Seal the message for hub delivery
   const hubKeypair = {
@@ -366,12 +531,7 @@ export async function sendJoinMessage(
       : undefined
   );
 
-  logger.log('[SpaceMessageService] Join message sealed');
-
-  // Wrap with type 'group' for WebSocket delivery
-  const wsEnvelope = JSON.stringify({ type: 'group', ...sealedMessage });
-
-  logger.log('[SpaceMessageService] Join message prepared for WebSocket');
+  const wsEnvelope = JSON.stringify({ type: 'log-append', ...sealedMessage });
 
   return wsEnvelope;
 }
@@ -380,7 +540,7 @@ export function createOptimisticMessage(
   params: SendSpaceMessageParams,
   tempMessageId: string
 ): Message {
-  const { spaceId, channelId, text, senderAddress, repliesToMessageId } = params;
+  const { spaceId, channelId, text, senderAddress, repliesToMessageId, replyToAuthorAddress } = params;
   const timestamp = Date.now();
 
   return {
@@ -401,10 +561,19 @@ export function createOptimisticMessage(
     reactions: [],
     mentions: { memberIds: [], roleIds: [], channelIds: [] },
     sendStatus: 'sending',
+    // Add reply metadata if this is a reply (for display purposes)
+    ...(repliesToMessageId && replyToAuthorAddress
+      ? {
+          replyMetadata: {
+            parentAuthor: replyToAuthorAddress,
+            parentChannelId: channelId,
+          },
+        }
+      : {}),
   };
 }
 
-// ============ Generic Message Sending ============
+// Generic Message Sending
 
 export interface SendGenericMessageParams {
   spaceId: string;
@@ -418,10 +587,7 @@ export interface SendGenericMessageResult {
   wsEnvelope: string;
 }
 
-/**
- * Generic function to send any type of message content
- * This handles the common flow of signing, encrypting, and sealing
- */
+// Common flow: sign, encrypt, seal.
 async function sendGenericMessage(
   params: SendGenericMessageParams
 ): Promise<SendGenericMessageResult> {
@@ -430,8 +596,6 @@ async function sendGenericMessage(
   const cryptoProvider = new NativeCryptoProvider();
   const timestamp = Date.now();
   const nonce = generateNonce();
-
-  logger.log('[SpaceMessageService] Sending message type:', content.type);
 
   // Get hub key for the space
   const hubKey = getSpaceKey(spaceId, 'hub');
@@ -448,15 +612,15 @@ async function sendGenericMessage(
     throw new Error('Inbox key not found for space. Cannot sign messages.');
   }
 
-  // Generate message ID
-  const messageId = generateMessageId(spaceId, channelId, senderAddress, nonce, timestamp);
+  // Generate message ID using SHA-256 hash (matches desktop implementation)
+  const { messageId, messageIdBytes } = generateMessageIdHash(nonce, senderAddress, content);
 
   // Build full message object
   const message: Message = {
     channelId,
     spaceId,
     messageId,
-    digestAlgorithm: 'sha256',
+    digestAlgorithm: 'SHA-256',
     nonce,
     createdDate: timestamp,
     modifiedDate: timestamp,
@@ -467,14 +631,12 @@ async function sendGenericMessage(
     publicKey: inboxKey.publicKey,
   };
 
-  // Sign the message
-  const messageJson = JSON.stringify(message);
-  const messageBytes = new TextEncoder().encode(messageJson);
-  const messageBase64 = bytesToBase64(messageBytes);
-
+  // Sign the messageId hash (NOT the whole message JSON)
+  // This matches desktop implementation for non-repudiability
+  const messageIdBase64 = bytesToBase64(messageIdBytes);
   const inboxPrivateKeyBytes = hexToBytes(inboxKey.privateKey);
   const inboxPrivateKeyBase64 = bytesToBase64(inboxPrivateKeyBytes);
-  const signatureBase64 = await cryptoProvider.signEd448(inboxPrivateKeyBase64, messageBase64);
+  const signatureBase64 = await cryptoProvider.signEd448(inboxPrivateKeyBase64, messageIdBase64);
 
   const signatureBinary = atob(signatureBase64);
   let signatureHex = '';
@@ -483,10 +645,8 @@ async function sendGenericMessage(
   }
   message.signature = signatureHex;
 
-  // Skip Triple Ratchet encryption - use only hub envelope encryption with config key
-  // The config key provides forward secrecy (rotates on kick) without the complexity
-  // of Triple Ratchet state synchronization across devices
 
+  // Hub-envelope only (no TR): config key rotates on kick.
   // Prepare message for sending (remove ephemeral fields)
   const messageToSend = { ...message };
   delete (messageToSend as Record<string, unknown>).sendStatus;
@@ -496,8 +656,6 @@ async function sendGenericMessage(
     type: 'message',
     message: messageToSend,
   });
-
-  logger.log('[SpaceMessageService] Generic message prepared (envelope-only encryption), type:', content.type);
 
   // Seal for hub delivery
   const hubKeypair = {
@@ -517,12 +675,12 @@ async function sendGenericMessage(
       : undefined
   );
 
-  const wsEnvelope = JSON.stringify({ type: 'group', ...sealedMessage });
+  const wsEnvelope = JSON.stringify({ type: 'log-append', ...sealedMessage });
 
   return { message, wsEnvelope };
 }
 
-// ============ Reaction Messages ============
+// Reaction Messages
 
 export interface SendReactionParams {
   spaceId: string;
@@ -568,7 +726,7 @@ export async function removeReaction(
   return sendGenericMessage({ spaceId, channelId, senderAddress, content });
 }
 
-// ============ Edit Messages ============
+// Edit Messages
 
 export interface SendEditMessageParams {
   spaceId: string;
@@ -601,7 +759,7 @@ export async function sendEditMessage(
   return sendGenericMessage({ spaceId, channelId, senderAddress, content });
 }
 
-// ============ Delete Messages ============
+// Delete Messages
 
 export interface SendDeleteMessageParams {
   spaceId: string;
@@ -627,14 +785,26 @@ export async function sendDeleteMessage(
   return sendGenericMessage({ spaceId, channelId, senderAddress, content });
 }
 
-// ============ Update Profile Messages ============
+// Update Profile Messages
 
 export interface SendUpdateProfileParams {
   spaceId: string;
   channelId: string;
   senderAddress: string;
-  displayName: string;
-  userIcon: string;
+  // All profile fields optional. Empty/undefined values are NOT included
+  // in the broadcast — sending an empty field would clobber the
+  // recipients' stored value (the receiver treats present fields as the
+  // new value, so omission is the only safe way to leave a field
+  // alone). Pass only what you actually want changed.
+  displayName?: string;
+  userIcon?: string;
+  bio?: string;
+  // Farcaster linkage — included automatically when the user has a
+  // linked Farcaster account. Lets other members see "@username · FID"
+  // on the user's profile card and tap through to the Farcaster feed
+  // profile view.
+  farcasterFid?: number;
+  farcasterUsername?: string;
 }
 
 /**
@@ -644,19 +814,137 @@ export interface SendUpdateProfileParams {
 export async function sendUpdateProfileMessage(
   params: SendUpdateProfileParams
 ): Promise<SendGenericMessageResult> {
-  const { spaceId, channelId, senderAddress, displayName, userIcon } = params;
+  const { spaceId, channelId, senderAddress, displayName, userIcon, bio, farcasterFid, farcasterUsername } = params;
 
   const content = {
     type: 'update-profile' as const,
     senderId: senderAddress,
-    displayName,
-    userIcon,
+    ...(displayName ? { displayName } : {}),
+    ...(userIcon ? { userIcon } : {}),
+    ...(bio !== undefined && { bio }),
+    ...(farcasterFid !== undefined && farcasterFid > 0 ? { farcasterFid } : {}),
+    ...(farcasterUsername ? { farcasterUsername } : {}),
   };
 
   return sendGenericMessage({ spaceId, channelId, senderAddress, content });
 }
 
-// ============ Embed Messages ============
+// MMKV-backed gate that records the last profile-update payload broadcast
+// to each (spaceId, senderAddress). The on-connect rebroadcast fires every
+// time WebSocketContext mounts the connected effect (provider remount,
+// auth change, reconnect), and the save-profile handlers fire whenever the
+// user taps save — even when nothing changed. Recipients still apply the
+// payload (the receive handler is upsert-aware), but every broadcast is a
+// message on the wire that generates a push notification for every member
+// of every space. This gate suppresses sends whose payload matches the
+// most recent successful broadcast for that destination.
+import { createMMKV, type MMKV } from 'react-native-mmkv';
+let profileBroadcastStateStore: MMKV | null = null;
+function getProfileBroadcastStore(): MMKV {
+  if (!profileBroadcastStateStore) {
+    profileBroadcastStateStore = createMMKV({ id: 'quorum-profile-broadcast' });
+  }
+  return profileBroadcastStateStore;
+}
+
+function profileBroadcastKey(spaceId: string, senderAddress: string): string {
+  return `${senderAddress}:${spaceId}`;
+}
+
+// Canonical signature of the exact payload that will go on the wire.
+// Field presence matters (avatar-only vs name-only sends have different
+// signatures), and field values matter. Stable JSON: keys sorted.
+function profileBroadcastSignature(p: SendUpdateProfileParams): string {
+  const obj: Record<string, string> = {};
+  if (p.displayName) obj.displayName = p.displayName;
+  if (p.userIcon) obj.userIcon = p.userIcon;
+  if (p.bio !== undefined) obj.bio = p.bio;
+  if (p.farcasterFid !== undefined && p.farcasterFid > 0) {
+    obj.farcasterFid = String(p.farcasterFid);
+  }
+  if (p.farcasterUsername) obj.farcasterUsername = p.farcasterUsername;
+  const sortedKeys = Object.keys(obj).sort();
+  return JSON.stringify(obj, sortedKeys);
+}
+
+/**
+ * Same as sendUpdateProfileMessage, but skips when the exact payload was
+ * already broadcast to this (spaceId, senderAddress). Returns null on skip.
+ * Records the new signature only after a successful send so a failure
+ * leaves the gate open for retry.
+ */
+export async function maybeSendUpdateProfileMessage(
+  params: SendUpdateProfileParams
+): Promise<SendGenericMessageResult | null> {
+  const sig = profileBroadcastSignature(params);
+  // Nothing to broadcast — empty payload would no-op on receivers anyway.
+  if (sig === '{}') return null;
+
+  const store = getProfileBroadcastStore();
+  const key = profileBroadcastKey(params.spaceId, params.senderAddress);
+  const last = store.getString(key);
+  if (last === sig) return null;
+
+  const result = await sendUpdateProfileMessage(params);
+  store.set(key, sig);
+  return result;
+}
+
+/** Clear the gate for a (spaceId, senderAddress) — used when the user
+ *  leaves a space or signs out so a fresh rejoin re-broadcasts. */
+export function clearProfileBroadcastState(spaceId: string, senderAddress: string): void {
+  getProfileBroadcastStore().delete(profileBroadcastKey(spaceId, senderAddress));
+}
+
+/**
+ * One-time migrations of the profile-broadcast cache. Each migration
+ * tag is a string that gets recorded in MMKV once it runs; subsequent
+ * launches see the tag and skip.
+ *
+ * Used today to force every device to re-broadcast its per-space
+ * profile after we extended the update-profile shape with optional
+ * farcasterFid / farcasterUsername. Existing devices have the old
+ * payload signature stored, so without this clear, the gate would
+ * suppress the new broadcast as "same as last time" — even though
+ * the wire payload now carries the new Farcaster fields.
+ *
+ * Implementation: clearing the signature for every (sender, space)
+ * lets the next normal rebroadcast pass through unconditionally and
+ * record the new (richer) signature.
+ */
+const MIGRATIONS_KEY = '__migrations';
+
+export function runProfileBroadcastMigrations(): void {
+  const store = getProfileBroadcastStore();
+  const raw = store.getString(MIGRATIONS_KEY);
+  let done: Record<string, true> = {};
+  if (raw) {
+    try {
+      done = JSON.parse(raw) as Record<string, true>;
+    } catch {
+      done = {};
+    }
+  }
+
+  // Tag bumped whenever the update-profile wire shape gains a field.
+  // Force a one-time re-broadcast on every device so peers learn the
+  // new fields without the user having to manually re-save.
+  const tag = 'add-farcaster-fields-v1';
+  if (done[tag]) return;
+
+  // Wipe every recorded signature. The next on-connect rebroadcast
+  // sees an empty cache and fires for every space, then records the
+  // new signatures (which include Farcaster fields when linked).
+  for (const k of store.getAllKeys()) {
+    if (k === MIGRATIONS_KEY) continue;
+    store.delete(k);
+  }
+
+  done[tag] = true;
+  store.set(MIGRATIONS_KEY, JSON.stringify(done));
+}
+
+// Embed Messages
 
 export interface SendEmbedMessageParams {
   spaceId: string;
@@ -668,6 +956,8 @@ export interface SendEmbedMessageParams {
   width?: string;
   height?: string;
   repliesToMessageId?: string;
+  /** Optional text to accompany the image */
+  text?: string;
 }
 
 /**
@@ -686,9 +976,10 @@ export async function sendEmbedMessage(
     width,
     height,
     repliesToMessageId,
+    text,
   } = params;
 
-  const content: EmbedMessage = {
+  const content: EmbedMessage & { text?: string } = {
     type: 'embed',
     senderId: senderAddress,
     imageUrl,
@@ -697,526 +988,66 @@ export async function sendEmbedMessage(
     width,
     height,
     repliesToMessageId,
+    text,
   };
 
   return sendGenericMessage({ spaceId, channelId, senderAddress, content });
 }
 
-// ============ Sync Control Messages ============
+// Space Call Messages
 
-/**
- * Send a sync-peer-map control message to a specific inbox
- * Now includes critical ratchet state fields for proper decryption sync
- */
-export async function sendSyncPeerMapMessage(
-  spaceId: string,
-  targetInboxAddress: string,
-  peerMap: {
-    id_peer_map: unknown;
-    peer_id_map: unknown;
-    // Additional fields for full ratchet state sync
-    root_key?: unknown;
-    dkg_ratchet?: unknown;
-    receiving_group_key?: unknown;
-    receiving_chain_key?: unknown;
-    current_header_key?: unknown;
-    next_header_key?: unknown;
-    async_dkg_pubkey?: unknown;
-    threshold?: unknown;
-  }
-): Promise<string> {
-  const cryptoProvider = new NativeCryptoProvider();
-
-  const hubKey = getSpaceKey(spaceId, 'hub');
-  if (!hubKey || !hubKey.address || !hubKey.privateKey || !hubKey.publicKey) {
-    throw new Error('Hub key not found or incomplete for space.');
-  }
-
-  const inboxKey = getSpaceKey(spaceId, 'inbox');
-  if (!inboxKey || !inboxKey.privateKey || !inboxKey.publicKey) {
-    throw new Error('Inbox key not found or incomplete for space.');
-  }
-
-  const controlMessage = {
-    type: 'control',
-    message: {
-      type: 'sync-peer-map',
-      peerMap,
-    },
-  };
-
-  const hubKeypair = {
-    publicKey: hexToNumberArray(hubKey.publicKey),
-    privateKey: hexToNumberArray(hubKey.privateKey),
-  };
-
-  const inboxKeypair = {
-    publicKey: hexToNumberArray(inboxKey.publicKey),
-    privateKey: hexToNumberArray(inboxKey.privateKey),
-  };
-
-  const sealedMessage = await cryptoProvider.sealSyncEnvelope(
-    targetInboxAddress,
-    hubKey.address,
-    hubKeypair,
-    inboxKeypair,
-    JSON.stringify(controlMessage)
-  );
-
-  return JSON.stringify({ type: 'sync', ...sealedMessage });
+export interface SendSpaceCallStartParams {
+  spaceId: string;
+  channelId: string;
+  senderAddress: string;
+  mediaType: 'audio' | 'video';
 }
 
 /**
- * Send a sync-members control message to a specific inbox (chunked for large member lists)
+ * Send a space-call-start message to a channel
  */
-export async function sendSyncMembersMessage(
-  spaceId: string,
-  targetInboxAddress: string,
-  members: {
-    user_address: string;
-    display_name?: string;
-    user_icon?: string;
-    inbox_address?: string;
-  }[]
-): Promise<string[]> {
-  const cryptoProvider = new NativeCryptoProvider();
+export async function sendSpaceCallStartMessage(
+  params: SendSpaceCallStartParams
+): Promise<SendGenericMessageResult> {
+  const { spaceId, channelId, senderAddress, mediaType } = params;
+  const callId = `${senderAddress}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-  const hubKey = getSpaceKey(spaceId, 'hub');
-  if (!hubKey || !hubKey.address || !hubKey.privateKey || !hubKey.publicKey) {
-    throw new Error('Hub key not found or incomplete for space.');
-  }
-
-  const inboxKey = getSpaceKey(spaceId, 'inbox');
-  if (!inboxKey || !inboxKey.privateKey || !inboxKey.publicKey) {
-    throw new Error('Inbox key not found or incomplete for space.');
-  }
-
-  const hubKeypair = {
-    publicKey: hexToNumberArray(hubKey.publicKey),
-    privateKey: hexToNumberArray(hubKey.privateKey),
+  const content: SpaceCallStartMessage = {
+    type: 'space-call-start',
+    senderId: senderAddress,
+    callId,
+    mediaType,
   };
 
-  const inboxKeypair = {
-    publicKey: hexToNumberArray(inboxKey.publicKey),
-    privateKey: hexToNumberArray(inboxKey.privateKey),
-  };
+  return sendGenericMessage({ spaceId, channelId, senderAddress, content });
+}
 
-  const envelopes: string[] = [];
-  const chunkSize = 5 * 1024 * 1024; // 5MB chunks
-
-  let currentChunk: typeof members = [];
-  let currentSize = 0;
-
-  for (const member of members) {
-    const memberSize = JSON.stringify(member).length;
-    if (currentSize + memberSize > chunkSize && currentChunk.length > 0) {
-      // Send current chunk
-      const controlMessage = {
-        type: 'control',
-        message: {
-          type: 'sync-members',
-          members: currentChunk,
-        },
-      };
-
-      const sealedMessage = await cryptoProvider.sealSyncEnvelope(
-        targetInboxAddress,
-        hubKey.address,
-        hubKeypair,
-        inboxKeypair,
-        JSON.stringify(controlMessage)
-      );
-
-      envelopes.push(JSON.stringify({ type: 'sync', ...sealedMessage }));
-      currentChunk = [];
-      currentSize = 0;
-    }
-
-    currentChunk.push(member);
-    currentSize += memberSize;
-  }
-
-  // Send remaining chunk
-  if (currentChunk.length > 0) {
-    const controlMessage = {
-      type: 'control',
-      message: {
-        type: 'sync-members',
-        members: currentChunk,
-      },
-    };
-
-    const sealedMessage = await cryptoProvider.sealSyncEnvelope(
-      targetInboxAddress,
-      hubKey.address,
-      hubKeypair,
-      inboxKeypair,
-      JSON.stringify(controlMessage)
-    );
-
-    envelopes.push(JSON.stringify({ type: 'sync', ...sealedMessage }));
-  }
-
-  return envelopes;
+export interface SendSpaceCallEndParams {
+  spaceId: string;
+  channelId: string;
+  senderAddress: string;
+  callId: string;
 }
 
 /**
- * Send a sync-messages control message to a specific inbox (chunked for large message lists)
+ * Send a space-call-end message to a channel
  */
-export async function sendSyncMessagesMessage(
-  spaceId: string,
-  targetInboxAddress: string,
-  channelId: string,
-  messages: Message[]
-): Promise<string[]> {
-  const cryptoProvider = new NativeCryptoProvider();
+export async function sendSpaceCallEndMessage(
+  params: SendSpaceCallEndParams
+): Promise<SendGenericMessageResult> {
+  const { spaceId, channelId, senderAddress, callId } = params;
 
-  const hubKey = getSpaceKey(spaceId, 'hub');
-  if (!hubKey || !hubKey.address || !hubKey.privateKey || !hubKey.publicKey) {
-    throw new Error('Hub key not found or incomplete for space.');
-  }
-
-  const inboxKey = getSpaceKey(spaceId, 'inbox');
-  if (!inboxKey || !inboxKey.privateKey || !inboxKey.publicKey) {
-    throw new Error('Inbox key not found or incomplete for space.');
-  }
-
-  const hubKeypair = {
-    publicKey: hexToNumberArray(hubKey.publicKey),
-    privateKey: hexToNumberArray(hubKey.privateKey),
+  const content: SpaceCallEndMessage = {
+    type: 'space-call-end',
+    senderId: senderAddress,
+    callId,
   };
 
-  const inboxKeypair = {
-    publicKey: hexToNumberArray(inboxKey.publicKey),
-    privateKey: hexToNumberArray(inboxKey.privateKey),
-  };
-
-  const envelopes: string[] = [];
-  const chunkSize = 5 * 1024 * 1024; // 5MB chunks
-
-  let currentChunk: Message[] = [];
-  let currentSize = 0;
-
-  for (const msg of messages) {
-    const msgSize = JSON.stringify(msg).length;
-    if (currentSize + msgSize > chunkSize && currentChunk.length > 0) {
-      // Send current chunk
-      const controlMessage = {
-        type: 'control',
-        message: {
-          type: 'sync-messages',
-          messages: currentChunk,
-        },
-      };
-
-      const sealedMessage = await cryptoProvider.sealSyncEnvelope(
-        targetInboxAddress,
-        hubKey.address,
-        hubKeypair,
-        inboxKeypair,
-        JSON.stringify(controlMessage)
-      );
-
-      envelopes.push(JSON.stringify({ type: 'sync', ...sealedMessage }));
-      currentChunk = [];
-      currentSize = 0;
-    }
-
-    currentChunk.push(msg);
-    currentSize += msgSize;
-  }
-
-  // Send remaining chunk
-  if (currentChunk.length > 0) {
-    const controlMessage = {
-      type: 'control',
-      message: {
-        type: 'sync-messages',
-        messages: currentChunk,
-      },
-    };
-
-    const sealedMessage = await cryptoProvider.sealSyncEnvelope(
-      targetInboxAddress,
-      hubKey.address,
-      hubKeypair,
-      inboxKeypair,
-      JSON.stringify(controlMessage)
-    );
-
-    envelopes.push(JSON.stringify({ type: 'sync', ...sealedMessage }));
-  }
-
-  return envelopes;
+  return sendGenericMessage({ spaceId, channelId, senderAddress, content });
 }
 
-/**
- * Send a sync-info response to a specific inbox
- * This is used to respond to sync-request messages when we have more data
- */
-export async function sendSyncInfoMessage(
-  spaceId: string,
-  targetInboxAddress: string,
-  messageCount: number,
-  memberCount: number
-): Promise<string> {
-  const cryptoProvider = new NativeCryptoProvider();
 
-  const hubKey = getSpaceKey(spaceId, 'hub');
-  if (!hubKey || !hubKey.address || !hubKey.privateKey || !hubKey.publicKey) {
-    throw new Error('Hub key not found or incomplete for space.');
-  }
-
-  const inboxKey = getSpaceKey(spaceId, 'inbox');
-  if (!inboxKey || !inboxKey.address || !inboxKey.privateKey || !inboxKey.publicKey) {
-    throw new Error('Inbox key not found or incomplete for space.');
-  }
-
-  const controlMessage = {
-    type: 'control',
-    message: {
-      type: 'sync-info',
-      inboxAddress: inboxKey.address,
-      messageCount,
-      memberCount,
-    },
-  };
-
-  const hubKeypair = {
-    publicKey: hexToNumberArray(hubKey.publicKey),
-    privateKey: hexToNumberArray(hubKey.privateKey),
-  };
-
-  const inboxKeypair = {
-    publicKey: hexToNumberArray(inboxKey.publicKey),
-    privateKey: hexToNumberArray(inboxKey.privateKey),
-  };
-
-  logger.log('[sendSyncInfoMessage] Creating sync envelope for targetInbox:', targetInboxAddress.substring(0, 12));
-
-  const sealedMessage = await cryptoProvider.sealSyncEnvelope(
-    targetInboxAddress,
-    hubKey.address,
-    hubKeypair,
-    inboxKeypair,
-    JSON.stringify(controlMessage)
-  );
-
-  // Debug: Log the sealed message structure that will be sent over WebSocket
-  logger.log('[sendSyncInfoMessage] === FINAL SEALED MESSAGE ===');
-  logger.log('[sendSyncInfoMessage] sealedMessage keys:', Object.keys(sealedMessage));
-  logger.log('[sendSyncInfoMessage] inbox_address:', sealedMessage.inbox_address?.substring(0, 20));
-  logger.log('[sendSyncInfoMessage] hub_address:', sealedMessage.hub_address?.substring(0, 20));
-  logger.log('[sendSyncInfoMessage] owner_public_key length:', sealedMessage.owner_public_key?.length);
-  logger.log('[sendSyncInfoMessage] ephemeral_public_key length:', sealedMessage.ephemeral_public_key?.length);
-  logger.log('[sendSyncInfoMessage] envelope length:', sealedMessage.envelope?.length);
-  logger.log('[sendSyncInfoMessage] envelope first 100:', sealedMessage.envelope?.substring(0, 100));
-  logger.log('[sendSyncInfoMessage] owner_signature length:', sealedMessage.owner_signature?.length);
-
-  const finalEnvelope = JSON.stringify({ type: 'sync', ...sealedMessage });
-  logger.log('[sendSyncInfoMessage] Final envelope length:', finalEnvelope.length);
-  logger.log('[sendSyncInfoMessage] Final envelope first 300:', finalEnvelope.substring(0, 300));
-
-  return finalEnvelope;
-}
-
-// ============ New Sync Protocol Functions ============
-
-/**
- * Helper to get hub and inbox keypairs for sync operations
- */
-async function getSyncKeypairs(spaceId: string) {
-  const hubKey = getSpaceKey(spaceId, 'hub');
-  if (!hubKey || !hubKey.address || !hubKey.privateKey || !hubKey.publicKey) {
-    throw new Error('Hub key not found or incomplete for space.');
-  }
-
-  const inboxKey = getSpaceKey(spaceId, 'inbox');
-  if (!inboxKey || !inboxKey.address || !inboxKey.privateKey || !inboxKey.publicKey) {
-    throw new Error('Inbox key not found or incomplete for space.');
-  }
-
-  const configKey = getSpaceKey(spaceId, 'config');
-
-  return {
-    hubKey,
-    inboxKey,
-    configKey,
-    hubKeypair: {
-      publicKey: hexToNumberArray(hubKey.publicKey),
-      privateKey: hexToNumberArray(hubKey.privateKey),
-    },
-    inboxKeypair: {
-      publicKey: hexToNumberArray(inboxKey.publicKey),
-      privateKey: hexToNumberArray(inboxKey.privateKey),
-    },
-    configKeypair: configKey
-      ? {
-          publicKey: hexToNumberArray(configKey.publicKey),
-          privateKey: hexToNumberArray(configKey.privateKey),
-        }
-      : undefined,
-  };
-}
-
-/**
- * Send a sync-request broadcast via hub (new protocol)
- * Uses SealHubEnvelope with type: 'group' (matches desktop SyncService)
- */
-export async function sendSyncRequestMessage(
-  spaceId: string,
-  payload: SyncRequestPayload
-): Promise<string> {
-  const cryptoProvider = new NativeCryptoProvider();
-  const { hubKey, hubKeypair, configKeypair } = await getSyncKeypairs(spaceId);
-
-  const controlMessage = {
-    type: 'control',
-    message: payload,
-  };
-
-  // Use sealHubEnvelope for hub broadcast (matches desktop SealHubEnvelope)
-  const sealedMessage = await cryptoProvider.sealHubEnvelope(
-    hubKey.address,
-    hubKeypair,
-    JSON.stringify(controlMessage),
-    configKeypair
-  );
-
-  logger.log('[sendSyncRequestMessage] === SEALED MESSAGE DEBUG ===');
-  logger.log('[sendSyncRequestMessage] sealedMessage keys:', Object.keys(sealedMessage));
-  logger.log('[sendSyncRequestMessage] hub_address:', sealedMessage.hub_address);
-  logger.log('[sendSyncRequestMessage] hub_public_key:', sealedMessage.hub_public_key?.substring(0, 40) + '...');
-  logger.log('[sendSyncRequestMessage] hub_public_key length:', sealedMessage.hub_public_key?.length);
-  logger.log('[sendSyncRequestMessage] ephemeral_public_key length:', sealedMessage.ephemeral_public_key?.length);
-  logger.log('[sendSyncRequestMessage] envelope length:', sealedMessage.envelope?.length);
-  logger.log('[sendSyncRequestMessage] hub_signature length:', sealedMessage.hub_signature?.length);
-
-  // Use 'group' type for WebSocket delivery (matches desktop SyncService)
-  const wsEnvelope = JSON.stringify({ type: 'group', ...sealedMessage });
-  logger.log('[sendSyncRequestMessage] wsEnvelope (first 500):', wsEnvelope.substring(0, 500));
-  return wsEnvelope;
-}
-
-/**
- * Send a sync-info response to a specific inbox (new protocol with summary)
- */
-export async function sendSyncInfoMessageV2(
-  spaceId: string,
-  targetInboxAddress: string,
-  payload: SyncInfoPayload
-): Promise<string> {
-  const cryptoProvider = new NativeCryptoProvider();
-  const { hubKey, hubKeypair, inboxKeypair, configKeypair } = await getSyncKeypairs(spaceId);
-
-  const controlMessage = {
-    type: 'control',
-    message: payload,
-  };
-
-  const sealedMessage = await cryptoProvider.sealSyncEnvelope(
-    targetInboxAddress,
-    hubKey.address,
-    hubKeypair,
-    inboxKeypair,
-    JSON.stringify(controlMessage),
-    configKeypair?.publicKey
-  );
-
-  return JSON.stringify({ type: 'sync', ...sealedMessage });
-}
-
-/**
- * Send a sync-initiate message to a specific peer (new protocol)
- */
-export async function sendSyncInitiateMessage(
-  spaceId: string,
-  targetInboxAddress: string,
-  payload: SyncInitiatePayload
-): Promise<string> {
-  const cryptoProvider = new NativeCryptoProvider();
-  const { hubKey, hubKeypair, inboxKeypair, configKeypair } = await getSyncKeypairs(spaceId);
-
-  const controlMessage = {
-    type: 'control',
-    message: payload,
-  };
-
-  const sealedMessage = await cryptoProvider.sealSyncEnvelope(
-    targetInboxAddress,
-    hubKey.address,
-    hubKeypair,
-    inboxKeypair,
-    JSON.stringify(controlMessage),
-    configKeypair?.publicKey
-  );
-
-  return JSON.stringify({ type: 'sync', ...sealedMessage });
-}
-
-/**
- * Send a sync-manifest response (new protocol)
- */
-export async function sendSyncManifestMessage(
-  spaceId: string,
-  targetInboxAddress: string,
-  payload: SyncManifestPayload
-): Promise<string> {
-  const cryptoProvider = new NativeCryptoProvider();
-  const { hubKey, hubKeypair, inboxKeypair, configKeypair } = await getSyncKeypairs(spaceId);
-
-  const controlMessage = {
-    type: 'control',
-    message: payload,
-  };
-
-  const sealedMessage = await cryptoProvider.sealSyncEnvelope(
-    targetInboxAddress,
-    hubKey.address,
-    hubKeypair,
-    inboxKeypair,
-    JSON.stringify(controlMessage),
-    configKeypair?.publicKey
-  );
-
-  return JSON.stringify({ type: 'sync', ...sealedMessage });
-}
-
-/**
- * Send sync-delta messages (new protocol, may return multiple for chunking)
- */
-export async function sendSyncDeltaMessages(
-  spaceId: string,
-  targetInboxAddress: string,
-  payloads: SyncDeltaPayload[]
-): Promise<string[]> {
-  const cryptoProvider = new NativeCryptoProvider();
-  const { hubKey, hubKeypair, inboxKeypair, configKeypair } = await getSyncKeypairs(spaceId);
-
-  const envelopes: string[] = [];
-
-  for (const payload of payloads) {
-    const controlMessage = {
-      type: 'control',
-      message: payload,
-    };
-
-    const sealedMessage = await cryptoProvider.sealSyncEnvelope(
-      targetInboxAddress,
-      hubKey.address,
-      hubKeypair,
-      inboxKeypair,
-      JSON.stringify(controlMessage),
-      configKeypair?.publicKey
-    );
-
-    envelopes.push(JSON.stringify({ type: 'sync', ...sealedMessage }));
-  }
-
-  return envelopes;
-}
-
-// ============ Space Manifest Control Messages ============
+// Space Manifest Control Messages
 
 export interface SpaceManifest {
   space_address: string;
@@ -1238,12 +1069,9 @@ export async function sendSpaceManifestMessage(
 ): Promise<string> {
   const cryptoProvider = new NativeCryptoProvider();
 
-  logger.log('[SpaceMessageService] Sending space-manifest control message');
-
   // Get hub key for the space
   const hubKey = getSpaceKey(spaceId, 'hub');
   if (!hubKey) {
-    logger.log('[SpaceMessageService] No hub key found for spaceId:', spaceId);
     throw new Error('Hub key not found for space. Cannot send space manifest.');
   }
   if (!hubKey.address || !hubKey.privateKey || !hubKey.publicKey) {
@@ -1263,7 +1091,6 @@ export async function sendSpaceManifestMessage(
   };
 
   const hubMessagePayload = JSON.stringify(controlMessage);
-  logger.log('[SpaceMessageService] Space manifest control message payload length:', hubMessagePayload.length);
 
   // Seal the message for hub delivery
   const hubKeypair = {
@@ -1283,12 +1110,7 @@ export async function sendSpaceManifestMessage(
       : undefined
   );
 
-  logger.log('[SpaceMessageService] Space manifest message sealed');
-
-  // Wrap with type 'group' for WebSocket delivery
-  const wsEnvelope = JSON.stringify({ type: 'group', ...sealedMessage });
-
-  logger.log('[SpaceMessageService] Space manifest message prepared for WebSocket');
+  const wsEnvelope = JSON.stringify({ type: 'log-append', ...sealedMessage });
 
   return wsEnvelope;
 }

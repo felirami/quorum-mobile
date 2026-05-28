@@ -1,6 +1,7 @@
 import { IconSymbol, type IconSymbolName } from '@/components/ui/IconSymbol';
 import { BaseModal } from '@/components/shared';
-import { useTheme } from '@/theme';
+import { useTheme, type AppTheme } from '@/theme';
+import type { EdgeInsets } from 'react-native-safe-area-context';
 import React from 'react';
 import {
   StyleSheet,
@@ -170,7 +171,7 @@ export default function TransactionWarningModal({
   );
 }
 
-const createStyles = (theme: any, isDark: boolean, insets: any, severity: 'low' | 'medium' | 'high') =>
+const createStyles = (theme: AppTheme, isDark: boolean, insets: EdgeInsets, severity: 'low' | 'medium' | 'high') =>
   StyleSheet.create({
     warningHeader: {
       alignItems: 'center',

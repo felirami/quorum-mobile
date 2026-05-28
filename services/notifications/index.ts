@@ -7,7 +7,7 @@
 // Background task registration (must be imported at app startup)
 export {
   BACKGROUND_MESSAGE_TASK,
-  BACKGROUND_FETCH_INTERVAL,
+  BACKGROUND_FETCH_INTERVAL_MINUTES,
   registerBackgroundFetch,
   unregisterBackgroundFetch,
   getBackgroundFetchStatus,
